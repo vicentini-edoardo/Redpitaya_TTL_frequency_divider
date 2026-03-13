@@ -2,227 +2,485 @@
 """
 rp_gui.py — Red Pitaya PLL Remote Control GUI
 
-Connects to rp_pll (running on the board) via TCP, sends SET_PHASE / SET_DUTY
-commands, and displays live status including a rolling phase-error chart.
-
 Requirements: Python 3.8+, standard library only (tkinter, socket, threading,
               json, time, collections).
-
 Usage: python3 rp_gui.py
 """
 
 import tkinter as tk
-from tkinter import ttk
 import socket
 import threading
 import json
 import time
 from collections import deque
 
-# ── Appearance constants ────────────────────────────────────────────────────
-BG          = "#1e1e1e"
-BG2         = "#2a2a2a"
-BG3         = "#333333"
-FG          = "#e0e0e0"
-FG_DIM      = "#888888"
-ACCENT      = "#4fc3f7"
-GREEN       = "#66bb6a"
-ORANGE      = "#ffa726"
-RED         = "#ef5350"
-FONT_MONO   = ("Courier New", 11)
-FONT_LABEL  = ("Segoe UI", 10)
-FONT_TITLE  = ("Segoe UI", 12, "bold")
-FONT_VALUE  = ("Courier New", 14, "bold")
+# ═══════════════════════════════════════════════════════════════════════════
+#  Theme
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ── Chart settings ──────────────────────────────────────────────────────────
-CHART_DURATION_S = 10       # seconds of history shown
-CHART_W          = 700
-CHART_H          = 140
-CHART_PAD        = 10
-CHART_Y_RANGE    = 20.0     # ±Y degrees shown
+BG          = "#1a1a1a"    # window / outer background
+BG_CARD     = "#222222"    # card / panel background
+BG_FIELD    = "#2c2c2c"    # entry field
+BG_TOPBAR   = "#141414"    # top connection bar
+SEP         = "#3a3a3a"    # separator / border
+FG          = "#e2e2e2"    # primary text
+FG_DIM      = "#666666"    # secondary labels
+FG_MID      = "#999999"    # unit / hint text
+ACCENT      = "#4fc3f7"    # light-blue accent (section headers)
+GREEN       = "#4caf50"
+ORANGE      = "#ff9800"
+RED_C       = "#f44336"
+CHART_BG    = "#0d0d0d"
 
-# ── TCP settings ────────────────────────────────────────────────────────────
-TCP_TIMEOUT      = 2.0
-RECONNECT_DELAY  = 3.0
+# Fonts — Segoe UI for labels, Courier New for numeric values
+F_LABEL     = ("Segoe UI",     9)
+F_LABEL_B   = ("Segoe UI",     9,  "bold")
+F_SECTION   = ("Segoe UI",     9,  "bold")
+F_MONO      = ("Courier New", 10)
+F_BIGVAL    = ("Courier New", 28,  "bold")   # prominent value display
+F_UNIT      = ("Segoe UI",    13)
+F_READLBL   = ("Segoe UI",     9)
+F_READVAL   = ("Courier New", 12,  "bold")
+F_STEP      = ("Segoe UI",     8,  "bold")
+F_BTN       = ("Segoe UI",     9)
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Layout
+# ═══════════════════════════════════════════════════════════════════════════
+
+OUTER_PAD   = 10           # window edge padding
+COL_GAP     = 8            # gap between left and right columns
+CTRL_W      = 370          # left column (controls) width
+READ_W      = 360          # right column (readouts) width
+WIN_W       = CTRL_W + COL_GAP + READ_W + OUTER_PAD * 2   # ≈ 728
+
+# Chart
+CHART_H     = 170
+CHART_CL    = 42           # left margin (y-axis labels)
+CHART_CR    = 12           # right margin
+CHART_CT    = 12           # top margin
+CHART_CB    = 22           # bottom margin (x-axis labels)
+CHART_Y_MAX = 20.0         # ±degrees shown
+CHART_DUR_S = 10           # seconds of history
+
+TCP_TIMEOUT = 2.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Small widget helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _sep(parent, **kw):
+    """Horizontal separator line."""
+    return tk.Frame(parent, height=1, bg=SEP, **kw)
+
+
+def _section_header(parent, text):
+    """Coloured all-caps section label."""
+    return tk.Label(parent, text=text.upper(), bg=BG_CARD,
+                    fg=ACCENT, font=F_SECTION, anchor="w")
+
+
+def _step_btn(parent, text, command):
+    """Small ± step button."""
+    return tk.Button(
+        parent, text=text, command=command,
+        bg=BG_FIELD, fg=FG, activebackground=SEP, activeforeground=FG,
+        relief="flat", font=F_STEP, width=5, height=1,
+        cursor="hand2", bd=0, highlightthickness=0,
+    )
+
+
+def _readout_row(parent, label_text, row):
+    """One label + value pair in the readout panel. Returns the value Label."""
+    tk.Label(parent, text=label_text, bg=BG_CARD, fg=FG_DIM,
+             font=F_READLBL, anchor="w").grid(
+        row=row, column=0, sticky="w", padx=(12, 6), pady=3)
+    val = tk.Label(parent, text="—", bg=BG_CARD, fg=FG,
+                   font=F_READVAL, anchor="w", width=16)
+    val.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=3)
+    return val
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main application
+# ═══════════════════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
+
     def __init__(self):
         super().__init__()
-        self.title("Red Pitaya PLL Control")
+        self.title("Red Pitaya PLL")
         self.configure(bg=BG)
         self.resizable(False, False)
 
-        # Connection state
+        # TCP state
         self._sock       = None
         self._conn_lock  = threading.Lock()
         self._running    = True
         self._connected  = False
 
-        # Chart data: deque of (timestamp_s, phase_error_deg)
+        # Chart history: deque of (monotonic_time_s, phase_error_deg)
         self._chart_data = deque()
 
-        # Build UI
         self._build_ui()
 
-        # Start background threads
         threading.Thread(target=self._tcp_loop, daemon=True).start()
-
-        # Periodic UI refresh
-        self._schedule_refresh()
+        self._tick()  # start 100 ms UI refresh loop
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ── UI construction ─────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  UI construction
+    # ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        pad = dict(padx=8, pady=4)
+        self._build_topbar()
 
-        # ── Top bar: connection ──────────────────────────────────────────────
-        conn_frame = tk.Frame(self, bg=BG2, relief="flat", bd=0)
-        conn_frame.pack(fill="x", padx=6, pady=(6, 0))
+        # Two-column middle section
+        mid = tk.Frame(self, bg=BG)
+        mid.pack(fill="x", padx=OUTER_PAD, pady=(8, 0))
+        mid.columnconfigure(0, weight=0)
+        mid.columnconfigure(1, weight=0)
 
-        tk.Label(conn_frame, text="IP:", bg=BG2, fg=FG, font=FONT_LABEL).pack(side="left", padx=(8, 2))
-        self._ip_var = tk.StringVar(value="192.168.1.100")
-        tk.Entry(conn_frame, textvariable=self._ip_var, width=16,
-                 bg=BG3, fg=FG, insertbackground=FG, relief="flat",
-                 font=FONT_MONO).pack(side="left", padx=(0, 8))
+        left  = tk.Frame(mid, bg=BG, width=CTRL_W)
+        right = tk.Frame(mid, bg=BG, width=READ_W)
+        left.grid (row=0, column=0, sticky="n")
+        right.grid(row=0, column=1, sticky="n", padx=(COL_GAP, 0))
+        left.pack_propagate(False)
+        right.pack_propagate(False)
 
-        tk.Label(conn_frame, text="Port:", bg=BG2, fg=FG, font=FONT_LABEL).pack(side="left", padx=(0, 2))
+        self._build_controls(left)
+        self._build_readouts(right)
+        self._build_chart()
+
+    # ── Top bar ────────────────────────────────────────────────────────────
+
+    def _build_topbar(self):
+        bar = tk.Frame(self, bg=BG_TOPBAR)
+        bar.pack(fill="x")
+
+        inner = tk.Frame(bar, bg=BG_TOPBAR)
+        inner.pack(side="left", padx=OUTER_PAD, pady=8)
+
+        tk.Label(inner, text="Board IP", bg=BG_TOPBAR, fg=FG_DIM,
+                 font=F_LABEL).grid(row=0, column=0, sticky="w")
+        tk.Label(inner, text="Port", bg=BG_TOPBAR, fg=FG_DIM,
+                 font=F_LABEL).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        self._ip_var   = tk.StringVar(value="192.168.1.100")
         self._port_var = tk.StringVar(value="5555")
-        tk.Entry(conn_frame, textvariable=self._port_var, width=6,
-                 bg=BG3, fg=FG, insertbackground=FG, relief="flat",
-                 font=FONT_MONO).pack(side="left", padx=(0, 12))
 
-        self._conn_btn = tk.Button(conn_frame, text="Connect",
-                                   command=self._toggle_connect,
-                                   bg="#1565c0", fg="white", relief="flat",
-                                   font=FONT_LABEL, width=10,
-                                   activebackground="#1976d2", activeforeground="white")
-        self._conn_btn.pack(side="left")
+        ip_e = tk.Entry(inner, textvariable=self._ip_var, width=17,
+                        bg=BG_FIELD, fg=FG, insertbackground=FG,
+                        relief="flat", font=F_MONO, bd=4)
+        ip_e.grid(row=1, column=0, sticky="ew")
 
-        self._conn_status = tk.Label(conn_frame, text="● DISCONNECTED",
-                                     bg=BG2, fg=RED, font=FONT_LABEL)
-        self._conn_status.pack(side="left", padx=12)
+        port_e = tk.Entry(inner, textvariable=self._port_var, width=6,
+                          bg=BG_FIELD, fg=FG, insertbackground=FG,
+                          relief="flat", font=F_MONO, bd=4)
+        port_e.grid(row=1, column=1, sticky="ew", padx=(12, 0))
 
-        # ── Controls ─────────────────────────────────────────────────────────
-        ctrl_frame = tk.Frame(self, bg=BG)
-        ctrl_frame.pack(fill="x", padx=6, pady=6)
+        # Bind Enter on either field to connect
+        ip_e.bind("<Return>",   lambda _e: self._toggle_connect())
+        port_e.bind("<Return>", lambda _e: self._toggle_connect())
 
-        # Phase control
-        phase_frame = tk.LabelFrame(ctrl_frame, text="Phase Shift (°)",
-                                    bg=BG, fg=ACCENT, font=FONT_LABEL,
-                                    relief="groove", bd=1)
-        phase_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        # Connect button
+        self._conn_btn = tk.Button(
+            bar, text="Connect",
+            command=self._toggle_connect,
+            bg="#1a4a8a", fg="white",
+            activebackground="#2a5aaa", activeforeground="white",
+            relief="flat", font=F_BTN, width=12, cursor="hand2",
+            bd=0, highlightthickness=0,
+        )
+        self._conn_btn.pack(side="left", padx=(16, 0))
 
-        self._phase_var = tk.DoubleVar(value=0.0)
+        # Status pill
+        self._conn_lbl = tk.Label(
+            bar, text="  ●  DISCONNECTED  ",
+            bg=BG_TOPBAR, fg=RED_C, font=F_LABEL_B,
+        )
+        self._conn_lbl.pack(side="left", padx=14)
+
+    # ── Controls column ────────────────────────────────────────────────────
+
+    def _build_controls(self, parent):
+        self._build_phase_card(parent)
+        tk.Frame(parent, height=8, bg=BG).pack()
+        self._build_duty_card(parent)
+
+    def _build_phase_card(self, parent):
+        card = tk.Frame(parent, bg=BG_CARD, bd=0)
+        card.pack(fill="x")
+
+        # Header
+        hdr = tk.Frame(card, bg=BG_CARD)
+        hdr.pack(fill="x", padx=12, pady=(10, 2))
+        _section_header(hdr, "Phase Shift").pack(side="left")
+        tk.Label(hdr, text="degrees", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="right")
+
+        _sep(card).pack(fill="x")
+
+        # Big value display
+        disp = tk.Frame(card, bg=BG_CARD)
+        disp.pack(pady=(10, 0))
+        self._phase_var     = tk.DoubleVar(value=0.0)
+        self._phase_big_lbl = tk.Label(disp, text="  0.0", bg=BG_CARD, fg=FG,
+                                       font=F_BIGVAL, width=7, anchor="e")
+        self._phase_big_lbl.pack(side="left")
+        tk.Label(disp, text="°", bg=BG_CARD, fg=FG_MID,
+                 font=F_UNIT).pack(side="left", anchor="s", pady=(0, 6))
+
+        # Slider
+        sl_frame = tk.Frame(card, bg=BG_CARD)
+        sl_frame.pack(fill="x", padx=12, pady=(6, 0))
         self._phase_slider = tk.Scale(
-            phase_frame, from_=-360, to=360, resolution=0.1,
+            sl_frame, from_=-360, to=360, resolution=0.1,
             orient="horizontal", variable=self._phase_var,
-            bg=BG, fg=FG, troughcolor=BG3, highlightthickness=0,
-            activebackground=ACCENT, showvalue=0,
-            command=self._on_phase_slider)
-        self._phase_slider.pack(fill="x", padx=4, pady=(0, 2))
+            bg=BG_CARD, fg=FG_DIM, troughcolor=BG_FIELD,
+            highlightthickness=0, activebackground=ACCENT,
+            showvalue=0, sliderlength=18, width=8,
+            command=self._on_phase_slider,
+        )
+        self._phase_slider.pack(fill="x")
 
-        phase_entry_frame = tk.Frame(phase_frame, bg=BG)
-        phase_entry_frame.pack()
-        tk.Label(phase_entry_frame, text="Value:", bg=BG, fg=FG_DIM,
-                 font=FONT_LABEL).pack(side="left")
-        self._phase_entry = tk.Entry(phase_entry_frame, width=8,
-                                     bg=BG3, fg=FG, insertbackground=FG,
-                                     relief="flat", font=FONT_MONO,
-                                     textvariable=self._phase_var)
-        self._phase_entry.pack(side="left", padx=4)
-        self._phase_entry.bind("<Return>", self._on_phase_entry)
+        # Range labels under slider
+        rng = tk.Frame(card, bg=BG_CARD)
+        rng.pack(fill="x", padx=14)
+        tk.Label(rng, text="−360°", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="left")
+        tk.Label(rng, text="+360°", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="right")
 
-        # Duty control
-        duty_frame = tk.LabelFrame(ctrl_frame, text="Duty Cycle (%)",
-                                   bg=BG, fg=ACCENT, font=FONT_LABEL,
-                                   relief="groove", bd=1)
-        duty_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        # Step buttons
+        steps = tk.Frame(card, bg=BG_CARD)
+        steps.pack(pady=(8, 0))
+        for delta, label in [(-90, "−90°"), (-10, "−10°"), (-1, "−1°"),
+                              (+1, "+1°"), (+10, "+10°"), (+90, "+90°")]:
+            _step_btn(steps, label,
+                      lambda d=delta: self._step_phase(d)).pack(
+                side="left", padx=2)
 
-        self._duty_pct_var = tk.DoubleVar(value=50.0)
+        # Direct-entry row
+        entry_row = tk.Frame(card, bg=BG_CARD)
+        entry_row.pack(pady=(8, 12))
+        tk.Label(entry_row, text="Go to:", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="left", padx=(0, 6))
+        self._phase_entry_var = tk.StringVar()
+        e = tk.Entry(entry_row, textvariable=self._phase_entry_var, width=9,
+                     bg=BG_FIELD, fg=FG, insertbackground=FG,
+                     relief="flat", font=F_MONO, bd=4)
+        e.pack(side="left")
+        e.bind("<Return>", lambda _ev: self._apply_phase_entry())
+        tk.Label(entry_row, text="°", bg=BG_CARD, fg=FG_MID,
+                 font=F_LABEL).pack(side="left", padx=(2, 8))
+        tk.Button(
+            entry_row, text="Set", command=self._apply_phase_entry,
+            bg=BG_FIELD, fg=FG, activebackground=SEP, activeforeground=FG,
+            relief="flat", font=F_BTN, width=5, cursor="hand2",
+            bd=0, highlightthickness=0,
+        ).pack(side="left")
+
+    def _build_duty_card(self, parent):
+        card = tk.Frame(parent, bg=BG_CARD, bd=0)
+        card.pack(fill="x")
+
+        # Header
+        hdr = tk.Frame(card, bg=BG_CARD)
+        hdr.pack(fill="x", padx=12, pady=(10, 2))
+        _section_header(hdr, "Duty Cycle").pack(side="left")
+        tk.Label(hdr, text="percent", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="right")
+
+        _sep(card).pack(fill="x")
+
+        # Big value display
+        disp = tk.Frame(card, bg=BG_CARD)
+        disp.pack(pady=(10, 0))
+        self._duty_pct_var  = tk.DoubleVar(value=50.0)
+        self._duty_big_lbl  = tk.Label(disp, text=" 50.0", bg=BG_CARD, fg=FG,
+                                       font=F_BIGVAL, width=7, anchor="e")
+        self._duty_big_lbl.pack(side="left")
+        tk.Label(disp, text="%", bg=BG_CARD, fg=FG_MID,
+                 font=F_UNIT).pack(side="left", anchor="s", pady=(0, 6))
+
+        # Slider
+        sl_frame = tk.Frame(card, bg=BG_CARD)
+        sl_frame.pack(fill="x", padx=12, pady=(6, 0))
         self._duty_slider = tk.Scale(
-            duty_frame, from_=1, to=99, resolution=0.1,
+            sl_frame, from_=1, to=99, resolution=0.1,
             orient="horizontal", variable=self._duty_pct_var,
-            bg=BG, fg=FG, troughcolor=BG3, highlightthickness=0,
-            activebackground=ACCENT, showvalue=0,
-            command=self._on_duty_slider)
-        self._duty_slider.pack(fill="x", padx=4, pady=(0, 2))
+            bg=BG_CARD, fg=FG_DIM, troughcolor=BG_FIELD,
+            highlightthickness=0, activebackground=ACCENT,
+            showvalue=0, sliderlength=18, width=8,
+            command=self._on_duty_slider,
+        )
+        self._duty_slider.pack(fill="x")
 
-        duty_entry_frame = tk.Frame(duty_frame, bg=BG)
-        duty_entry_frame.pack()
-        tk.Label(duty_entry_frame, text="Value:", bg=BG, fg=FG_DIM,
-                 font=FONT_LABEL).pack(side="left")
-        self._duty_entry = tk.Entry(duty_entry_frame, width=8,
-                                    bg=BG3, fg=FG, insertbackground=FG,
-                                    relief="flat", font=FONT_MONO,
-                                    textvariable=self._duty_pct_var)
-        self._duty_entry.pack(side="left", padx=4)
-        self._duty_entry.bind("<Return>", self._on_duty_entry)
+        # Range labels
+        rng = tk.Frame(card, bg=BG_CARD)
+        rng.pack(fill="x", padx=14)
+        tk.Label(rng, text="1%", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="left")
+        tk.Label(rng, text="99%", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="right")
 
-        # ── Live readouts ─────────────────────────────────────────────────────
-        read_frame = tk.LabelFrame(self, text="Live Readouts",
-                                   bg=BG, fg=ACCENT, font=FONT_LABEL,
-                                   relief="groove", bd=1)
-        read_frame.pack(fill="x", padx=6, pady=(0, 6))
+        # Step buttons
+        steps = tk.Frame(card, bg=BG_CARD)
+        steps.pack(pady=(8, 0))
+        for delta, label in [(-10, "−10%"), (-5, "−5%"), (-1, "−1%"),
+                              (+1, "+1%"), (+5, "+5%"), (+10, "+10%")]:
+            _step_btn(steps, label,
+                      lambda d=delta: self._step_duty(d)).pack(
+                side="left", padx=2)
 
-        # Two-column grid of readouts
-        labels = [
-            ("Frequency",     "freq_lbl"),
-            ("Target Phase",  "tgt_lbl"),
-            ("Applied Phase", "app_lbl"),
-            ("Phase Error",   "err_lbl"),
-            ("Duty Cycle",    "duty_lbl"),
-            ("Lock Status",   "lock_lbl"),
-            ("Uptime",        "up_lbl"),
-        ]
-        for i, (text, attr) in enumerate(labels):
-            row, col = divmod(i, 2)
-            tk.Label(read_frame, text=text + ":", bg=BG, fg=FG_DIM,
-                     font=FONT_LABEL, anchor="e", width=14).grid(
-                row=row, column=col * 2, sticky="e", padx=(8, 2), pady=2)
-            lbl = tk.Label(read_frame, text="—", bg=BG, fg=FG,
-                           font=FONT_VALUE, anchor="w", width=16)
-            lbl.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 12), pady=2)
-            setattr(self, "_" + attr, lbl)
+        # Direct-entry row
+        entry_row = tk.Frame(card, bg=BG_CARD)
+        entry_row.pack(pady=(8, 12))
+        tk.Label(entry_row, text="Go to:", bg=BG_CARD, fg=FG_DIM,
+                 font=F_LABEL).pack(side="left", padx=(0, 6))
+        self._duty_entry_var = tk.StringVar()
+        e = tk.Entry(entry_row, textvariable=self._duty_entry_var, width=9,
+                     bg=BG_FIELD, fg=FG, insertbackground=FG,
+                     relief="flat", font=F_MONO, bd=4)
+        e.pack(side="left")
+        e.bind("<Return>", lambda _ev: self._apply_duty_entry())
+        tk.Label(entry_row, text="%", bg=BG_CARD, fg=FG_MID,
+                 font=F_LABEL).pack(side="left", padx=(2, 8))
+        tk.Button(
+            entry_row, text="Set", command=self._apply_duty_entry,
+            bg=BG_FIELD, fg=FG, activebackground=SEP, activeforeground=FG,
+            relief="flat", font=F_BTN, width=5, cursor="hand2",
+            bd=0, highlightthickness=0,
+        ).pack(side="left")
 
-        # ── Phase error chart ─────────────────────────────────────────────────
-        chart_outer = tk.LabelFrame(self, text="Phase Error History (10 s)",
-                                    bg=BG, fg=ACCENT, font=FONT_LABEL,
-                                    relief="groove", bd=1)
-        chart_outer.pack(fill="x", padx=6, pady=(0, 6))
+    # ── Readouts column ────────────────────────────────────────────────────
 
-        self._canvas = tk.Canvas(chart_outer, width=CHART_W, height=CHART_H,
-                                 bg="#111111", highlightthickness=0)
-        self._canvas.pack(padx=4, pady=4)
-        self._draw_chart_axes()
+    def _build_readouts(self, parent):
+        # ── Signal ──────────────────────────────────────────────────────────
+        sig = tk.Frame(parent, bg=BG_CARD)
+        sig.pack(fill="x")
+        _section_header(sig, "Signal").pack(anchor="w", padx=12, pady=(10, 4))
+        _sep(sig).pack(fill="x")
+        sig_grid = tk.Frame(sig, bg=BG_CARD)
+        sig_grid.pack(fill="x", pady=4)
+        self._freq_lbl = _readout_row(sig_grid, "Frequency",   0)
+        self._lock_lbl = _readout_row(sig_grid, "Lock Status", 1)
+        self._up_lbl   = _readout_row(sig_grid, "Uptime",      2)
 
-    # ── Event handlers ───────────────────────────────────────────────────────
+        tk.Frame(parent, height=8, bg=BG).pack()
+
+        # ── Phase ────────────────────────────────────────────────────────────
+        ph = tk.Frame(parent, bg=BG_CARD)
+        ph.pack(fill="x")
+        _section_header(ph, "Phase").pack(anchor="w", padx=12, pady=(10, 4))
+        _sep(ph).pack(fill="x")
+        ph_grid = tk.Frame(ph, bg=BG_CARD)
+        ph_grid.pack(fill="x", pady=4)
+        self._tgt_lbl  = _readout_row(ph_grid, "Target",  0)
+        self._app_lbl  = _readout_row(ph_grid, "Applied", 1)
+
+        # Phase error row with colour indicator dot
+        tk.Label(ph_grid, text="Error", bg=BG_CARD, fg=FG_DIM,
+                 font=F_READLBL, anchor="w").grid(
+            row=2, column=0, sticky="w", padx=(12, 6), pady=3)
+        err_cell = tk.Frame(ph_grid, bg=BG_CARD)
+        err_cell.grid(row=2, column=1, sticky="w", padx=(0, 12), pady=3)
+        self._err_lbl = tk.Label(err_cell, text="—", bg=BG_CARD, fg=FG,
+                                 font=F_READVAL, anchor="w", width=10)
+        self._err_lbl.pack(side="left")
+        self._err_dot = tk.Label(err_cell, text="●", bg=BG_CARD,
+                                 fg=FG_DIM, font=F_READLBL)
+        self._err_dot.pack(side="left", padx=(4, 0))
+
+        tk.Frame(parent, height=8, bg=BG).pack()
+
+        # ── Output ───────────────────────────────────────────────────────────
+        out = tk.Frame(parent, bg=BG_CARD)
+        out.pack(fill="x")
+        _section_header(out, "Output").pack(anchor="w", padx=12, pady=(10, 4))
+        _sep(out).pack(fill="x")
+        out_grid = tk.Frame(out, bg=BG_CARD)
+        out_grid.pack(fill="x", pady=4)
+        self._duty_ro_lbl = _readout_row(out_grid, "Duty Cycle", 0)
+
+    # ── Chart ──────────────────────────────────────────────────────────────
+
+    def _build_chart(self):
+        cw = WIN_W - OUTER_PAD * 2
+
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="x", padx=OUTER_PAD, pady=(8, OUTER_PAD))
+
+        hdr = tk.Frame(outer, bg=BG_CARD)
+        hdr.pack(fill="x")
+        _section_header(hdr, "Phase Error History").pack(
+            side="left", padx=12, pady=(8, 4))
+        tk.Label(hdr, text=f"last {CHART_DUR_S} s", bg=BG_CARD,
+                 fg=FG_DIM, font=F_LABEL).pack(
+            side="right", padx=12, pady=(8, 4))
+        _sep(hdr).pack(fill="x")
+
+        canvas_frame = tk.Frame(outer, bg=BG_CARD)
+        canvas_frame.pack(fill="x")
+
+        self._chart_w = cw
+        self._canvas = tk.Canvas(
+            canvas_frame, width=cw, height=CHART_H,
+            bg=CHART_BG, highlightthickness=0,
+        )
+        self._canvas.pack(padx=0, pady=(4, 8))
+        self._draw_chart_static()
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Control event handlers
+    # ─────────────────────────────────────────────────────────────────────
 
     def _on_phase_slider(self, _val=None):
-        self._send_phase(self._phase_var.get())
+        deg = self._phase_var.get()
+        self._phase_big_lbl.config(text=f"{deg:+.1f}" if deg != 0 else "  0.0")
+        self._send_phase(deg)
 
-    def _on_phase_entry(self, _event=None):
+    def _step_phase(self, delta: float):
+        new = max(-360.0, min(360.0, round(self._phase_var.get() + delta, 1)))
+        self._phase_var.set(new)
+        self._on_phase_slider()
+
+    def _apply_phase_entry(self):
         try:
-            deg = float(self._phase_entry.get())
-            deg = max(-360.0, min(360.0, deg))
-            self._phase_var.set(round(deg, 1))
-            self._send_phase(deg)
+            deg = float(self._phase_entry_var.get())
+            deg = max(-360.0, min(360.0, round(deg, 1)))
+            self._phase_var.set(deg)
+            self._on_phase_slider()
+            self._phase_entry_var.set("")
         except ValueError:
-            pass
+            self._phase_entry_var.set("")
 
     def _on_duty_slider(self, _val=None):
-        self._send_duty(self._duty_pct_var.get() / 100.0)
+        pct = self._duty_pct_var.get()
+        self._duty_big_lbl.config(text=f"{pct:5.1f}")
+        self._send_duty(pct / 100.0)
 
-    def _on_duty_entry(self, _event=None):
+    def _step_duty(self, delta: float):
+        new = max(1.0, min(99.0, round(self._duty_pct_var.get() + delta, 1)))
+        self._duty_pct_var.set(new)
+        self._on_duty_slider()
+
+    def _apply_duty_entry(self):
         try:
-            pct = float(self._duty_entry.get())
-            pct = max(1.0, min(99.0, pct))
-            self._duty_pct_var.set(round(pct, 1))
-            self._send_duty(pct / 100.0)
+            pct = float(self._duty_entry_var.get())
+            pct = max(1.0, min(99.0, round(pct, 1)))
+            self._duty_pct_var.set(pct)
+            self._on_duty_slider()
+            self._duty_entry_var.set("")
         except ValueError:
-            pass
+            self._duty_entry_var.set("")
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  Connection
+    # ─────────────────────────────────────────────────────────────────────
 
     def _toggle_connect(self):
         if self._connected:
@@ -231,12 +489,14 @@ class App(tk.Tk):
             self._connect()
 
     def _connect(self):
-        ip   = self._ip_var.get().strip()
+        ip = self._ip_var.get().strip()
         try:
             port = int(self._port_var.get().strip())
         except ValueError:
             return
-        threading.Thread(target=self._do_connect, args=(ip, port), daemon=True).start()
+        self._conn_lbl.config(text="  ●  CONNECTING…  ", fg=ORANGE)
+        threading.Thread(target=self._do_connect, args=(ip, port),
+                         daemon=True).start()
 
     def _disconnect(self):
         with self._conn_lock:
@@ -253,7 +513,9 @@ class App(tk.Tk):
         self._disconnect()
         self.destroy()
 
-    # ── TCP helpers ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  TCP helpers
+    # ─────────────────────────────────────────────────────────────────────
 
     def _do_connect(self, ip, port):
         try:
@@ -265,8 +527,8 @@ class App(tk.Tk):
                 self._sock = s
             self._connected = True
         except Exception as exc:
-            self.after(0, lambda: self._conn_status.config(
-                text=f"● {exc}", fg=RED))
+            self.after(0, lambda e=exc: self._conn_lbl.config(
+                text=f"  ●  {e}  ", fg=RED_C))
 
     def _send_raw(self, msg: str) -> bool:
         with self._conn_lock:
@@ -286,16 +548,17 @@ class App(tk.Tk):
     def _send_duty(self, duty: float):
         self._send_raw(f"SET_DUTY {duty:.4f}")
 
-    # ── TCP receive loop (background thread) ─────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  TCP receive loop (daemon thread)
+    # ─────────────────────────────────────────────────────────────────────
 
     def _tcp_loop(self):
-        """Background thread: reads STATUS lines from socket."""
         buf = ""
         while self._running:
             with self._conn_lock:
                 s = self._sock
             if s is None:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
             try:
                 s.settimeout(1.0)
@@ -321,83 +584,129 @@ class App(tk.Tk):
             return
         ts = time.monotonic()
         self._chart_data.append((ts, data.get("phase_error", 0.0)))
-        # Trim old data
-        cutoff = ts - CHART_DURATION_S
+        # Evict data older than the chart window
+        cutoff = ts - CHART_DUR_S
         while self._chart_data and self._chart_data[0][0] < cutoff:
             self._chart_data.popleft()
-        # Marshal UI update to main thread
         self.after(0, lambda d=data: self._update_readouts(d))
 
-    # ── UI update ────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  UI refresh (100 ms tick)
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _schedule_refresh(self):
-        self._update_conn_ui()
+    def _tick(self):
+        self._refresh_conn_ui()
         self._redraw_chart()
-        self.after(100, self._schedule_refresh)
+        self.after(100, self._tick)
 
-    def _update_conn_ui(self):
+    def _refresh_conn_ui(self):
         if self._connected:
-            self._conn_status.config(text="● CONNECTED", fg=GREEN)
-            self._conn_btn.config(text="Disconnect")
+            self._conn_lbl.config(text="  ●  CONNECTED  ", fg=GREEN)
+            self._conn_btn.config(text="Disconnect",
+                                  bg="#6a1a1a",
+                                  activebackground="#8a2a2a")
         else:
-            self._conn_status.config(text="● DISCONNECTED", fg=RED)
-            self._conn_btn.config(text="Connect")
+            if "CONNECTING" not in self._conn_lbl.cget("text"):
+                self._conn_lbl.config(text="  ●  DISCONNECTED  ", fg=RED_C)
+            self._conn_btn.config(text="Connect",
+                                  bg="#1a4a8a",
+                                  activebackground="#2a5aaa")
 
     def _update_readouts(self, d: dict):
-        freq  = d.get("freq", 0.0)
-        tgt   = d.get("phase_target", 0.0)
-        app   = d.get("phase_applied", 0.0)
-        err   = d.get("phase_error", 0.0)
-        duty  = d.get("duty", 0.5) * 100.0
-        locked = d.get("locked", False)
-        uptime = d.get("uptime_s", 0)
+        freq   = d.get("freq",          0.0)
+        tgt    = d.get("phase_target",  0.0)
+        app    = d.get("phase_applied", 0.0)
+        err    = d.get("phase_error",   0.0)
+        duty   = d.get("duty",          0.5) * 100.0
+        locked = d.get("locked",        False)
+        uptime = d.get("uptime_s",      0)
 
         self._freq_lbl.config(text=f"{freq:.2f} Hz")
-        self._tgt_lbl.config(text=f"{tgt:.1f}°")
-        self._app_lbl.config(text=f"{app:.1f}°")
+        self._tgt_lbl.config(text=f"{tgt:+.1f}°")
+        self._app_lbl.config(text=f"{app:+.1f}°")
 
-        # Phase error with colour coding
+        # Phase error: colour both the value and the indicator dot
         abs_err = abs(err)
         if abs_err < 2.0:
-            err_color = GREEN
+            err_col = GREEN
         elif abs_err < 5.0:
-            err_color = ORANGE
+            err_col = ORANGE
         else:
-            err_color = RED
-        self._err_lbl.config(text=f"{err:.2f}°", fg=err_color)
+            err_col = RED_C
+        self._err_lbl.config(text=f"{err:+.2f}°", fg=err_col)
+        self._err_dot.config(fg=err_col)
 
-        self._duty_lbl.config(text=f"{duty:.1f}%")
+        self._duty_ro_lbl.config(text=f"{duty:.1f}%")
+
         if locked:
             self._lock_lbl.config(text="LOCKED", fg=GREEN)
         else:
-            self._lock_lbl.config(text="NO SIGNAL", fg=RED)
-        self._up_lbl.config(text=f"{uptime} s")
+            self._lock_lbl.config(text="NO SIGNAL", fg=RED_C)
 
-    # ── Chart drawing ─────────────────────────────────────────────────────────
+        mins, secs = divmod(uptime, 60)
+        self._up_lbl.config(text=f"{mins:02d}:{secs:02d}")
 
-    def _draw_chart_axes(self):
+    # ─────────────────────────────────────────────────────────────────────
+    #  Chart
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _draw_chart_static(self):
+        """Draw fixed chart elements: grid, axes, labels."""
         c = self._canvas
-        c.delete("axes")
-        w, h = CHART_W, CHART_H
-        px, py = CHART_PAD, CHART_PAD
+        c.delete("static")
+        cw = self._chart_w
 
-        # Zero line
-        cy = h // 2
-        c.create_line(px, cy, w - px, cy, fill="#444444", dash=(4, 4), tags="axes")
+        cl, cr, ct, cb = CHART_CL, CHART_CR, CHART_CT, CHART_CB
+        plot_x0 = cl
+        plot_x1 = cw - cr
+        plot_y0 = ct
+        plot_y1 = CHART_H - cb
+        cy = (plot_y0 + plot_y1) // 2
 
-        # Y labels
-        c.create_text(px - 2, cy, text="0°", fill=FG_DIM,
-                      font=("Courier New", 9), anchor="e", tags="axes")
-        c.create_text(px - 2, py, text=f"+{CHART_Y_RANGE:.0f}°",
-                      fill=FG_DIM, font=("Courier New", 9), anchor="e", tags="axes")
-        c.create_text(px - 2, h - py, text=f"-{CHART_Y_RANGE:.0f}°",
-                      fill=FG_DIM, font=("Courier New", 9), anchor="e", tags="axes")
+        def y_for(deg):
+            return cy - (deg / CHART_Y_MAX) * (cy - plot_y0)
 
-        # X labels
-        c.create_text(px, h - 2, text=f"-{CHART_DURATION_S}s",
-                      fill=FG_DIM, font=("Courier New", 9), anchor="sw", tags="axes")
-        c.create_text(w - px, h - 2, text="now",
-                      fill=FG_DIM, font=("Courier New", 9), anchor="se", tags="axes")
+        # ── Horizontal grid lines ──
+        grid_spec = [
+            (CHART_Y_MAX,   FG_DIM,   1, ()),
+            (5.0,           "#3a2a2a", 1, (4, 4)),
+            (2.0,           "#2a3a2a", 1, (4, 4)),
+            (0.0,           "#444444", 1, ()),
+            (-2.0,          "#2a3a2a", 1, (4, 4)),
+            (-5.0,          "#3a2a2a", 1, (4, 4)),
+            (-CHART_Y_MAX,  FG_DIM,   1, ()),
+        ]
+        for deg, col, w, dash in grid_spec:
+            y = y_for(deg)
+            kw = dict(fill=col, width=w, tags="static")
+            if dash:
+                c.create_line(plot_x0, y, plot_x1, y, dash=dash, **kw)
+            else:
+                c.create_line(plot_x0, y, plot_x1, y, **kw)
+
+        # ── Y-axis labels ──
+        for deg, label in [(CHART_Y_MAX, f"+{CHART_Y_MAX:.0f}"),
+                           (5.0,  "+5"), (2.0, "+2"),
+                           (0.0,  "0"),
+                           (-2.0, "−2"), (-5.0, "−5"),
+                           (-CHART_Y_MAX, f"−{CHART_Y_MAX:.0f}")]:
+            c.create_text(cl - 4, y_for(deg),
+                          text=label, fill=FG_DIM,
+                          font=("Courier New", 8), anchor="e", tags="static")
+
+        # ── X-axis labels ──
+        c.create_text(plot_x0, CHART_H - 4,
+                      text=f"−{CHART_DUR_S}s", fill=FG_DIM,
+                      font=("Courier New", 8), anchor="sw", tags="static")
+        c.create_text(plot_x1, CHART_H - 4,
+                      text="now", fill=FG_DIM,
+                      font=("Courier New", 8), anchor="se", tags="static")
+
+        # ── Threshold zone tints (subtle fill between ±2) ──
+        y_pos2 = y_for(2.0)
+        y_neg2 = y_for(-2.0)
+        c.create_rectangle(plot_x0, y_pos2, plot_x1, y_neg2,
+                            fill="#0d1a0d", outline="", tags="static")
 
     def _redraw_chart(self):
         c = self._canvas
@@ -407,27 +716,45 @@ class App(tk.Tk):
         if len(data) < 2:
             return
 
-        now   = time.monotonic()
-        w, h  = CHART_W, CHART_H
-        px, py = CHART_PAD, CHART_PAD
-        chart_w = w - 2 * px
-        chart_h = h - 2 * py
-        cy = py + chart_h // 2
+        cw   = self._chart_w
+        now  = time.monotonic()
+        cl, cr, ct, cb = CHART_CL, CHART_CR, CHART_CT, CHART_CB
+        plot_x0 = cl
+        plot_x1 = cw - cr
+        plot_y0 = ct
+        plot_y1 = CHART_H - cb
+        cy      = (plot_y0 + plot_y1) / 2
+        pw      = plot_x1 - plot_x0
+        ph_half = cy - plot_y0
+
+        t_start = now - CHART_DUR_S
 
         def to_xy(ts, err):
-            x = px + (ts - (now - CHART_DURATION_S)) / CHART_DURATION_S * chart_w
-            y = cy - (err / CHART_Y_RANGE) * (chart_h / 2)
-            y = max(py, min(h - py, y))
+            x = plot_x0 + (ts - t_start) / CHART_DUR_S * pw
+            y = cy - (err / CHART_Y_MAX) * ph_half
+            y = max(plot_y0, min(plot_y1, y))
             return x, y
 
-        # Draw segments coloured by error magnitude
+        # Draw each segment coloured by error at the end point
         for i in range(1, len(data)):
             t0, e0 = data[i - 1]
             t1, e1 = data[i]
             x0, y0 = to_xy(t0, e0)
             x1, y1 = to_xy(t1, e1)
-            color = GREEN if abs(e1) < 2.0 else RED
+            abs_e = abs(e1)
+            color = GREEN if abs_e < 2.0 else (ORANGE if abs_e < 5.0 else RED_C)
             c.create_line(x0, y0, x1, y1, fill=color, width=2, tags="trace")
+
+        # Live value annotation at the right edge
+        if data:
+            _, last_err = data[-1]
+            abs_e = abs(last_err)
+            col = GREEN if abs_e < 2.0 else (ORANGE if abs_e < 5.0 else RED_C)
+            _, ly = to_xy(now, last_err)
+            c.create_text(plot_x1 + cr - 2, ly,
+                          text=f"{last_err:+.1f}°", fill=col,
+                          font=("Courier New", 8, "bold"),
+                          anchor="e", tags="trace")
 
 
 def main():
