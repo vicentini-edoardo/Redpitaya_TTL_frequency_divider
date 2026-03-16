@@ -65,6 +65,12 @@ typedef struct {
 static Status          g_status;
 static pthread_mutex_t g_status_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── Scope buffer (last ADC snapshot, served by GET_SCOPE) ───────────────── */
+#define SCOPE_BUF_MAX   1024
+static float           g_scope_buf[SCOPE_BUF_MAX];
+static int             g_scope_n   = 0;
+static pthread_mutex_t g_scope_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── TCP server port (set from argv) ──────────────────────────────────────── */
 static int g_tcp_port = DEFAULT_PORT;
 
@@ -232,6 +238,34 @@ static void handle_client(int fd)
                 } else {
                     atomic_store(&g_duty_cycle, duty);
                     send(fd, "OK\n", 3, MSG_NOSIGNAL);
+                }
+            } else if (strcmp(line, "GET_SCOPE") == 0) {
+                pthread_mutex_lock(&g_scope_mutex);
+                int sn = g_scope_n;
+                float lbuf[SCOPE_BUF_MAX];
+                if (sn > 0) memcpy(lbuf, g_scope_buf, sn * sizeof(float));
+                pthread_mutex_unlock(&g_scope_mutex);
+
+                Status ss;
+                pthread_mutex_lock(&g_status_mutex);
+                ss = g_status;
+                pthread_mutex_unlock(&g_status_mutex);
+
+                int rbsz = 256 + sn * 12;
+                char *rb = malloc(rbsz);
+                if (!rb) { send(fd, "ERR out of memory\n", 18, MSG_NOSIGNAL); }
+                else {
+                    int pos = snprintf(rb, rbsz,
+                        "SCOPE {\"dt_us\":%.4f,\"freq\":%.2f,"
+                        "\"phase\":%.1f,\"duty\":%.3f,\"v\":[",
+                        1e6 / SAMPLE_RATE_HZ, ss.freq,
+                        ss.phase_applied, ss.duty);
+                    for (int i = 0; i < sn && pos < rbsz - 16; i++)
+                        pos += snprintf(rb + pos, rbsz - pos,
+                                        i < sn - 1 ? "%.3f," : "%.3f", lbuf[i]);
+                    pos += snprintf(rb + pos, rbsz - pos, "]}\n");
+                    send(fd, rb, pos, MSG_NOSIGNAL);
+                    free(rb);
                 }
             } else if (strcmp(line, "GET_STATUS") == 0) {
                 int len = build_status_json(txbuf, sizeof(txbuf));
@@ -403,6 +437,13 @@ int main(int argc, char *argv[])
         uint32_t n = BUF_SIZE;
         rp_AcqGetOldestDataV(RP_CH_1, &n, buf);
         rp_AcqStop();
+
+        /* Save scope snapshot (first SCOPE_BUF_MAX samples) */
+        int snap = (int)n < SCOPE_BUF_MAX ? (int)n : SCOPE_BUF_MAX;
+        pthread_mutex_lock(&g_scope_mutex);
+        memcpy(g_scope_buf, buf, snap * sizeof(float));
+        g_scope_n = snap;
+        pthread_mutex_unlock(&g_scope_mutex);
 
         /* Measure frequency */
         double meas_freq = measure_freq(buf, (int)n);
