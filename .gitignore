@@ -1,0 +1,6 @@
+VIVADO/
+__pycache__/
+*.pyc
+*.bin
+*.bit.bin
+.DS_Store
