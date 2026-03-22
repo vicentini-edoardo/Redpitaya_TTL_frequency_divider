@@ -37,8 +37,8 @@ F_LABEL     = ("Segoe UI",     9)
 F_LABEL_B   = ("Segoe UI",     9,  "bold")
 F_SECTION   = ("Segoe UI",     9,  "bold")
 F_MONO      = ("Courier New", 10)
-F_BIGVAL    = ("Courier New", 28,  "bold")   # prominent value display
-F_UNIT      = ("Segoe UI",    13)
+F_BIGVAL    = ("Courier New", 20,  "bold")   # prominent value display
+F_UNIT      = ("Segoe UI",    11)
 F_READLBL   = ("Segoe UI",     9)
 F_READVAL   = ("Courier New", 12,  "bold")
 F_STEP      = ("Segoe UI",     8,  "bold")
@@ -55,7 +55,7 @@ READ_W      = 360          # right column (readouts) width
 WIN_W       = CTRL_W + COL_GAP + READ_W + OUTER_PAD * 2   # ≈ 728
 
 # Chart
-CHART_H     = 170
+CHART_H     = 110
 CHART_CL    = 42           # left margin (y-axis labels)
 CHART_CR    = 12           # right margin
 CHART_CT    = 12           # top margin
@@ -139,16 +139,12 @@ class App(tk.Tk):
 
         # Two-column middle section
         mid = tk.Frame(self, bg=BG)
-        mid.pack(fill="x", padx=OUTER_PAD, pady=(8, 0))
-        mid.columnconfigure(0, weight=0)
-        mid.columnconfigure(1, weight=0)
+        mid.pack(fill="x", padx=OUTER_PAD, pady=(4, 0))
 
-        left  = tk.Frame(mid, bg=BG, width=CTRL_W)
-        right = tk.Frame(mid, bg=BG, width=READ_W)
-        left.grid (row=0, column=0, sticky="n")
-        right.grid(row=0, column=1, sticky="n", padx=(COL_GAP, 0))
-        left.pack_propagate(False)
-        right.pack_propagate(False)
+        left  = tk.Frame(mid, bg=BG)
+        right = tk.Frame(mid, bg=BG)
+        left.pack(side="left", fill="y", padx=(0, COL_GAP))
+        right.pack(side="left", fill="both", expand=True)
 
         self._build_controls(left)
         self._build_readouts(right)
@@ -168,7 +164,7 @@ class App(tk.Tk):
         tk.Label(inner, text="Port", bg=BG_TOPBAR, fg=FG_DIM,
                  font=F_LABEL).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
-        self._ip_var   = tk.StringVar(value="192.168.1.100")
+        self._ip_var   = tk.StringVar(value="rp-f06a51.local")
         self._port_var = tk.StringVar(value="5555")
 
         ip_e = tk.Entry(inner, textvariable=self._ip_var, width=17,
@@ -216,7 +212,7 @@ class App(tk.Tk):
 
         # Header
         hdr = tk.Frame(card, bg=BG_CARD)
-        hdr.pack(fill="x", padx=12, pady=(10, 2))
+        hdr.pack(fill="x", padx=12, pady=(6, 2))
         _section_header(hdr, "Phase Shift").pack(side="left")
         tk.Label(hdr, text="degrees", bg=BG_CARD, fg=FG_DIM,
                  font=F_LABEL).pack(side="right")
@@ -225,7 +221,7 @@ class App(tk.Tk):
 
         # Big value display
         disp = tk.Frame(card, bg=BG_CARD)
-        disp.pack(pady=(10, 0))
+        disp.pack(pady=(6, 0))
         self._phase_var     = tk.DoubleVar(value=0.0)
         self._phase_big_lbl = tk.Label(disp, text="  0.0", bg=BG_CARD, fg=FG,
                                        font=F_BIGVAL, width=7, anchor="e")
@@ -256,7 +252,7 @@ class App(tk.Tk):
 
         # Step buttons
         steps = tk.Frame(card, bg=BG_CARD)
-        steps.pack(pady=(8, 0))
+        steps.pack(pady=(4, 0))
         for delta, label in [(-90, "−90°"), (-10, "−10°"), (-1, "−1°"),
                               (+1, "+1°"), (+10, "+10°"), (+90, "+90°")]:
             _step_btn(steps, label,
@@ -265,7 +261,7 @@ class App(tk.Tk):
 
         # Direct-entry row
         entry_row = tk.Frame(card, bg=BG_CARD)
-        entry_row.pack(pady=(8, 12))
+        entry_row.pack(pady=(4, 8))
         tk.Label(entry_row, text="Go to:", bg=BG_CARD, fg=FG_DIM,
                  font=F_LABEL).pack(side="left", padx=(0, 6))
         self._phase_entry_var = tk.StringVar()
@@ -289,7 +285,7 @@ class App(tk.Tk):
 
         # Header
         hdr = tk.Frame(card, bg=BG_CARD)
-        hdr.pack(fill="x", padx=12, pady=(10, 2))
+        hdr.pack(fill="x", padx=12, pady=(6, 2))
         _section_header(hdr, "Duty Cycle").pack(side="left")
         tk.Label(hdr, text="percent", bg=BG_CARD, fg=FG_DIM,
                  font=F_LABEL).pack(side="right")
@@ -298,7 +294,7 @@ class App(tk.Tk):
 
         # Big value display
         disp = tk.Frame(card, bg=BG_CARD)
-        disp.pack(pady=(10, 0))
+        disp.pack(pady=(6, 0))
         self._duty_pct_var  = tk.DoubleVar(value=50.0)
         self._duty_big_lbl  = tk.Label(disp, text=" 50.0", bg=BG_CARD, fg=FG,
                                        font=F_BIGVAL, width=7, anchor="e")
@@ -329,7 +325,7 @@ class App(tk.Tk):
 
         # Step buttons
         steps = tk.Frame(card, bg=BG_CARD)
-        steps.pack(pady=(8, 0))
+        steps.pack(pady=(4, 0))
         for delta, label in [(-10, "−10%"), (-5, "−5%"), (-1, "−1%"),
                               (+1, "+1%"), (+5, "+5%"), (+10, "+10%")]:
             _step_btn(steps, label,
@@ -338,7 +334,7 @@ class App(tk.Tk):
 
         # Direct-entry row
         entry_row = tk.Frame(card, bg=BG_CARD)
-        entry_row.pack(pady=(8, 12))
+        entry_row.pack(pady=(4, 8))
         tk.Label(entry_row, text="Go to:", bg=BG_CARD, fg=FG_DIM,
                  font=F_LABEL).pack(side="left", padx=(0, 6))
         self._duty_entry_var = tk.StringVar()
@@ -362,7 +358,7 @@ class App(tk.Tk):
         # ── Signal ──────────────────────────────────────────────────────────
         sig = tk.Frame(parent, bg=BG_CARD)
         sig.pack(fill="x")
-        _section_header(sig, "Signal").pack(anchor="w", padx=12, pady=(10, 4))
+        _section_header(sig, "Signal").pack(anchor="w", padx=12, pady=(6, 4))
         _sep(sig).pack(fill="x")
         sig_grid = tk.Frame(sig, bg=BG_CARD)
         sig_grid.pack(fill="x", pady=4)
@@ -375,7 +371,7 @@ class App(tk.Tk):
         # ── Phase ────────────────────────────────────────────────────────────
         ph = tk.Frame(parent, bg=BG_CARD)
         ph.pack(fill="x")
-        _section_header(ph, "Phase").pack(anchor="w", padx=12, pady=(10, 4))
+        _section_header(ph, "Phase").pack(anchor="w", padx=12, pady=(6, 4))
         _sep(ph).pack(fill="x")
         ph_grid = tk.Frame(ph, bg=BG_CARD)
         ph_grid.pack(fill="x", pady=4)
@@ -400,7 +396,7 @@ class App(tk.Tk):
         # ── Output ───────────────────────────────────────────────────────────
         out = tk.Frame(parent, bg=BG_CARD)
         out.pack(fill="x")
-        _section_header(out, "Output").pack(anchor="w", padx=12, pady=(10, 4))
+        _section_header(out, "Output").pack(anchor="w", padx=12, pady=(6, 4))
         _sep(out).pack(fill="x")
         out_grid = tk.Frame(out, bg=BG_CARD)
         out_grid.pack(fill="x", pady=4)

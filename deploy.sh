@@ -22,8 +22,8 @@ echo "==> Deploying to root@${BOARD}:${REMOTE_DIR}"
 ssh $SSH_OPTS "root@${BOARD}" "mkdir -p ${REMOTE_DIR}"
 
 # 2. Copy source files
-echo "==> Copying rp_pll.c and Makefile..."
-scp $SSH_OPTS rp_pll.c Makefile "root@${BOARD}:${REMOTE_DIR}/"
+echo "==> Copying source files and Makefile..."
+scp $SSH_OPTS rp_pll.c gen_pwm.cpp Makefile "root@${BOARD}:${REMOTE_DIR}/"
 
 # 3. Compile on board
 echo "==> Building on board..."
