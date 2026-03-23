@@ -27,16 +27,20 @@ DIV_MAX   = 32
 WIDTH_MIN = 1    # minimum hardware cycle count
 DELAY_MIN = 1    # minimum hardware cycle count
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-CLR_BG       = "#1e1e2e"
-CLR_SURFACE  = "#2a2a3d"
-CLR_ACCENT   = "#89b4fa"
-CLR_SUCCESS  = "#a6e3a1"
-CLR_WARN     = "#f38ba8"
-CLR_TEXT     = "#cdd6f4"
-CLR_MUTED    = "#6c7086"
-CLR_ENTRY_BG = "#313244"
-CLR_BORDER   = "#45475a"
+# ── Cyberpunk Palette ─────────────────────────────────────────────────────────
+CLR_BG         = "#050a0f"   # Near-black with blue tint
+CLR_SURFACE    = "#0d1117"   # Panel background
+CLR_BORDER     = "#00f5ff"   # Neon cyan — glow color for brackets
+CLR_BORDER_DIM = "#006b72"   # Dimmed cyan — glow effect on waveform
+CLR_ACCENT     = "#00f5ff"   # Neon cyan — active elements
+CLR_ACCENT2    = "#b000ff"   # Electric violet — duty cycle tile
+CLR_SUCCESS    = "#00ff9f"   # Neon green — connected/output freq
+CLR_WARN       = "#ff2d55"   # Hot pink — warnings/disconnected
+CLR_TEXT       = "#e0f0ff"   # Cool white — primary text
+CLR_MUTED      = "#3a5068"   # Steel blue-grey — secondary/INPUT wave
+CLR_ENTRY_BG   = "#0a1520"   # Entry field background
+CLR_GRID       = "#0a1e2a"   # Waveform canvas grid lines
+CLR_STAT_BG    = "#060d14"   # Big stats tile background
 
 
 def _best_font(families, size, weight=""):
@@ -166,7 +170,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Red Pitaya Pulse Control")
-        self.root.geometry("900x620")
+        self.root.geometry("960x780")
+        self.root.minsize(800, 680)
         self.root.configure(bg=CLR_BG)
 
         self.remote = RemoteCtl()
@@ -195,6 +200,12 @@ class App:
         self.delay_deg_var = tk.DoubleVar(value=0.0)
         self.delay_deg_entry_var = tk.StringVar(value="0.0")
         self.delay_ns_var = tk.StringVar(value="")
+
+        # Live stats display vars
+        self.stat_input_freq_var  = tk.StringVar(value="—")
+        self.stat_output_freq_var = tk.StringVar(value="—")
+        self.stat_duty_var        = tk.StringVar(value="—")
+        self.stat_phase_var       = tk.StringVar(value="—")
 
         # Internal cycle tracking — updated from hardware filt_period
         self._period_cycles = 1
@@ -226,6 +237,11 @@ class App:
     # ── Styles ────────────────────────────────────────────────────────────────
 
     def _setup_styles(self):
+        # Set up fonts first (needed for cyber frame labels)
+        self._font_label       = _best_font(["JetBrains Mono", "Menlo", "Consolas", "Courier New"], 9, "bold")
+        self._font_stat_header = _best_font(["JetBrains Mono", "Menlo", "Consolas", "Courier New"], 8)
+        self._font_stat_value  = _best_font(["JetBrains Mono", "Menlo", "Consolas", "Courier New"], 20, "bold")
+
         FONT_MAIN  = _best_font(["Inter", "Segoe UI", "Helvetica", "TkDefaultFont"], 10)
         FONT_LABEL = _best_font(["Inter", "Segoe UI", "Helvetica", "TkDefaultFont"], 10, "bold")
         FONT_SMALL = _best_font(["Inter", "Segoe UI", "Helvetica", "TkDefaultFont"], 9)
@@ -291,97 +307,164 @@ class App:
 
         s.configure("TSeparator", background=CLR_BORDER)
 
+    # ── Cyberpunk Frame Helper ─────────────────────────────────────────────────
+
+    def _make_cyber_frame(self, parent, title, padding=12):
+        """Create a frame with corner bracket decorations."""
+        outer = tk.Frame(parent, bg=CLR_SURFACE, bd=0)
+        c = tk.Canvas(outer, bg=CLR_SURFACE, highlightthickness=0)
+        c.place(x=0, y=0, relwidth=1, relheight=1)
+        c.bind("<Configure>", lambda e, cv=c: self._redraw_bracket(cv))
+        tk.Label(outer, text=title, bg=CLR_SURFACE,
+                 fg=CLR_ACCENT, font=self._font_label).place(x=14, y=2, anchor="w")
+        inner = tk.Frame(outer, bg=CLR_SURFACE, bd=0)
+        inner.place(x=padding, y=20, relwidth=1, relheight=1,
+                    width=-2*padding, height=-(20+padding))
+        return outer, inner
+
+    def _redraw_bracket(self, canvas):
+        """Draw L-corner brackets on a canvas."""
+        canvas.delete("bracket")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 4 or h < 4:
+            return
+        sz, th = 16, 2
+        for x1, y1, x2, y2 in [
+            (0, 0, sz, 0), (0, 0, 0, sz),              # top-left
+            (w-sz, 0, w, 0), (w, 0, w, sz),            # top-right
+            (0, h-sz, 0, h), (0, h, sz, h),            # bottom-left
+            (w, h-sz, w, h), (w-sz, h, w, h),          # bottom-right
+        ]:
+            canvas.create_line(x1, y1, x2, y2,
+                               fill=CLR_BORDER, width=th, tags="bracket")
+
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build(self):
         self._setup_styles()
 
-        outer = ttk.Frame(self.root, padding=14, style="TFrame")
-        outer.pack(fill="both", expand=True)
+        outer = tk.Frame(self.root, bg=CLR_BG)
+        outer.pack(fill="both", expand=True, padx=12, pady=10)
 
         self._build_connection(outer)
+        self._build_stats(outer)
         self._build_controls(outer)
         self._build_waveform(outer)
         self._build_readback(outer)
 
     def _build_connection(self, outer):
-        conn = ttk.LabelFrame(outer, text="Connection", padding=10)
-        conn.pack(fill="x", pady=(0, 10))
+        conn_outer, conn = self._make_cyber_frame(outer, "CONNECTION")
+        conn_outer.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(conn, text="Host").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        ttk.Entry(conn, textvariable=self.host_var, width=20).grid(row=0, column=1, sticky="w", padx=(0, 10))
+        # Row 0: Main connection row
+        ttk.Label(conn, text="Host", background=CLR_SURFACE, foreground=CLR_TEXT).grid(
+            row=0, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+        ttk.Entry(conn, textvariable=self.host_var, width=22).grid(
+            row=0, column=1, sticky="w", padx=(0, 10), pady=(6, 0))
 
-        btn_connect = ttk.Button(conn, text="Connect",      command=self.connect)
-        btn_connect.grid(row=0, column=2, padx=3)
+        btn_connect = ttk.Button(conn, text="Connect", command=self.connect, style="Accent.TButton")
+        btn_connect.grid(row=0, column=2, padx=3, pady=(6, 0))
         _Tooltip(btn_connect, "SSH-connect and load FPGA bitstream")
 
-        btn_rb = ttk.Button(conn, text="Read back", command=self.read_back)
-        btn_rb.grid(row=0, column=3, padx=3)
-        _Tooltip(btn_rb, "Read current register values from hardware")
-
-        btn_sr = ttk.Button(conn, text="Soft reset", command=self.soft_reset)
-        btn_sr.grid(row=0, column=4, padx=3)
-        _Tooltip(btn_sr, "Send a soft-reset pulse to the FPGA core")
-
-        btn_uc = ttk.Button(conn, text="Upload & compile", command=self.upload_and_compile)
-        btn_uc.grid(row=0, column=5, padx=3)
-        _Tooltip(btn_uc, "SCP rp_pulse_ctl.c to the board and compile it")
-
-        btn_ub = ttk.Button(conn, text="Upload bitfile", command=self.upload_bitfile)
-        btn_ub.grid(row=1, column=2, columnspan=2, padx=3, pady=(6, 0), sticky="w")
-        _Tooltip(btn_ub, "Upload red_pitaya_top.bit.bin and reprogram the FPGA")
-
-        ttk.Checkbutton(conn, text="Auto apply", variable=self.auto_apply_var).grid(row=0, column=6, padx=(10, 0))
-
-        self._adv_toggle_btn = ttk.Button(conn, text="▼ Advanced", command=self._toggle_advanced)
-        self._adv_toggle_btn.grid(row=0, column=7, padx=(10, 0), sticky="e")
-        conn.grid_columnconfigure(7, weight=1)
-
-        status_row = ttk.Frame(conn, style="Surface.TFrame")
-        status_row.grid(row=1, column=0, columnspan=8, sticky="w", pady=(8, 0))
-        self._conn_dot = tk.Label(status_row, text="●", fg=CLR_WARN,
-                                  bg=CLR_SURFACE, font=("", 11))
+        status_frame = tk.Frame(conn, bg=CLR_SURFACE)
+        status_frame.grid(row=0, column=3, sticky="ew", pady=(6, 0), padx=(20, 0))
+        conn.grid_columnconfigure(3, weight=1)
+        self._conn_dot = tk.Label(status_frame, text="●", fg=CLR_WARN,
+                                  bg=CLR_SURFACE, font=("", 12))
         self._conn_dot.pack(side="left", padx=(0, 6))
-        ttk.Label(status_row, textvariable=self.status_text,
-                  style="Status.TLabel").pack(side="left")
+        ttk.Label(status_frame, textvariable=self.status_text,
+                  background=CLR_SURFACE, foreground=CLR_ACCENT, font=("", 8)).pack(side="left")
 
-        ttk.Label(conn, textvariable=self.info_text, style="Info.TLabel", justify="left").grid(
-            row=2, column=0, columnspan=7, sticky="w", pady=(4, 0))
-        ttk.Button(conn, text="Force freq update", command=self._force_freq_update).grid(
-            row=2, column=7, sticky="e", pady=(4, 0))
-
-        ttk.Label(conn, textvariable=self.freq_warning_text, style="Warning.TLabel").grid(
-            row=3, column=0, columnspan=8, sticky="w", pady=(2, 0))
+        self._adv_toggle_btn = tk.Button(conn, text="▼ ADVANCED", command=self._toggle_advanced,
+                                         bg=CLR_SURFACE, fg=CLR_BORDER_DIM, relief="flat",
+                                         font=("", 9), padx=8, pady=4)
+        self._adv_toggle_btn.grid(row=0, column=4, sticky="e", pady=(6, 0))
 
         # Advanced sub-frame (hidden by default)
-        self._adv_frame = ttk.Frame(conn, style="Surface.TFrame", padding=(0, 8, 0, 0))
-        self._adv_frame.grid(row=4, column=0, columnspan=8, sticky="ew")
+        self._adv_frame = tk.Frame(conn, bg=CLR_SURFACE)
+        self._adv_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         self._adv_frame.grid_remove()
 
         sep = ttk.Separator(self._adv_frame, orient="horizontal")
-        sep.grid(row=0, column=0, columnspan=6, sticky="ew", pady=(0, 8))
+        sep.grid(row=0, column=0, columnspan=8, sticky="ew", pady=(0, 8))
 
-        ttk.Label(self._adv_frame, text="Port").grid(row=1, column=0, sticky="w", padx=(0, 4))
-        ttk.Entry(self._adv_frame, textvariable=self.port_var, width=8).grid(row=1, column=1, sticky="w", padx=(0, 16))
+        # Port / User / Base addr
+        ttk.Label(self._adv_frame, text="Port", background=CLR_SURFACE, foreground=CLR_TEXT).grid(
+            row=1, column=0, sticky="w", padx=(0, 4))
+        ttk.Entry(self._adv_frame, textvariable=self.port_var, width=8).grid(
+            row=1, column=1, sticky="w", padx=(0, 16))
 
-        ttk.Label(self._adv_frame, text="User").grid(row=1, column=2, sticky="w", padx=(0, 4))
-        ttk.Entry(self._adv_frame, textvariable=self.user_var, width=12).grid(row=1, column=3, sticky="w", padx=(0, 16))
+        ttk.Label(self._adv_frame, text="User", background=CLR_SURFACE, foreground=CLR_TEXT).grid(
+            row=1, column=2, sticky="w", padx=(0, 4))
+        ttk.Entry(self._adv_frame, textvariable=self.user_var, width=12).grid(
+            row=1, column=3, sticky="w", padx=(0, 16))
 
-        ttk.Label(self._adv_frame, text="Base address").grid(row=1, column=4, sticky="w", padx=(0, 4))
-        ttk.Entry(self._adv_frame, textvariable=self.base_var, width=16).grid(row=1, column=5, sticky="w")
+        ttk.Label(self._adv_frame, text="Base address", background=CLR_SURFACE, foreground=CLR_TEXT).grid(
+            row=1, column=4, sticky="w", padx=(0, 4))
+        ttk.Entry(self._adv_frame, textvariable=self.base_var, width=16).grid(
+            row=1, column=5, sticky="w")
+
+        # Advanced buttons: Read back, Soft reset, Upload & compile, Upload bitfile, Force freq update
+        btn_rb = ttk.Button(self._adv_frame, text="Read back", command=self.read_back)
+        btn_rb.grid(row=2, column=0, padx=3, pady=(8, 0), sticky="w")
+        _Tooltip(btn_rb, "Read current register values from hardware")
+
+        btn_sr = ttk.Button(self._adv_frame, text="Soft reset", command=self.soft_reset)
+        btn_sr.grid(row=2, column=1, padx=3, pady=(8, 0), sticky="w")
+        _Tooltip(btn_sr, "Send a soft-reset pulse to the FPGA core")
+
+        btn_uc = ttk.Button(self._adv_frame, text="Upload & compile", command=self.upload_and_compile)
+        btn_uc.grid(row=2, column=2, padx=3, pady=(8, 0), sticky="w")
+        _Tooltip(btn_uc, "SCP rp_pulse_ctl.c to the board and compile it")
+
+        btn_ub = ttk.Button(self._adv_frame, text="Upload bitfile", command=self.upload_bitfile)
+        btn_ub.grid(row=2, column=3, padx=3, pady=(8, 0), sticky="w")
+        _Tooltip(btn_ub, "Upload red_pitaya_top.bit.bin and reprogram the FPGA")
+
+        btn_ffu = ttk.Button(self._adv_frame, text="Force freq update", command=self._force_freq_update)
+        btn_ffu.grid(row=2, column=4, padx=3, pady=(8, 0), sticky="w")
+
+        # Info and warning text
+        ttk.Label(self._adv_frame, textvariable=self.info_text,
+                  background=CLR_SURFACE, foreground=CLR_TEXT, font=("", 8),
+                  justify="left").grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+
+        ttk.Label(self._adv_frame, textvariable=self.freq_warning_text,
+                  background=CLR_SURFACE, foreground=CLR_WARN, font=("", 8, "bold")).grid(
+                  row=4, column=0, columnspan=5, sticky="ew", pady=(2, 0))
 
     def _toggle_advanced(self):
         if self._adv_visible:
             self._adv_frame.grid_remove()
-            self._adv_toggle_btn.configure(text="▼ Advanced")
+            self._adv_toggle_btn.configure(text="▼ ADVANCED")
         else:
             self._adv_frame.grid()
-            self._adv_toggle_btn.configure(text="▲ Advanced")
+            self._adv_toggle_btn.configure(text="▲ ADVANCED")
         self._adv_visible = not self._adv_visible
 
+    def _build_stats(self, outer):
+        stats_outer, stats_inner = self._make_cyber_frame(outer, "LIVE STATS")
+        stats_outer.pack(fill="x", pady=(0, 10))
+        stats_inner.configure(height=80)
+
+        for col, (header, var, color) in enumerate([
+            ("INPUT FREQ",  self.stat_input_freq_var,  CLR_ACCENT),
+            ("OUTPUT FREQ", self.stat_output_freq_var, CLR_SUCCESS),
+            ("DUTY CYCLE",  self.stat_duty_var,        CLR_ACCENT2),
+            ("PHASE SHIFT", self.stat_phase_var,       CLR_TEXT),
+        ]):
+            tile = tk.Frame(stats_inner, bg=CLR_STAT_BG, padx=16, pady=8)
+            tile.grid(row=0, column=col, sticky="nsew", padx=(0, 4 if col < 3 else 0))
+            stats_inner.grid_columnconfigure(col, weight=1)
+            tk.Label(tile, text=header, bg=CLR_STAT_BG,
+                     fg=CLR_MUTED, font=self._font_stat_header).pack(anchor="w")
+            tk.Label(tile, textvariable=var, bg=CLR_STAT_BG,
+                     fg=color, font=self._font_stat_value).pack(anchor="w")
+
     def _build_controls(self, outer):
-        ctrl = ttk.LabelFrame(outer, text="Controls", padding=10)
-        ctrl.pack(fill="both", expand=True, pady=(0, 10))
+        ctrl_outer, ctrl = self._make_cyber_frame(outer, "CONTROLS")
+        ctrl_outer.pack(fill="both", expand=True, pady=(0, 10))
 
         self._add_param_row(ctrl, 0,
                             label="Divider",
@@ -410,20 +493,22 @@ class App:
                             ns_var=self.delay_ns_var,
                             scale_attr="delay_scale")
 
-        btn_frame = ttk.Frame(ctrl, style="Surface.TFrame")
+        btn_frame = tk.Frame(ctrl, bg=CLR_SURFACE)
         btn_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(14, 0))
 
         ttk.Checkbutton(btn_frame, text="Enable output", variable=self.enable_var,
                         command=self.maybe_auto_apply).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(btn_frame, text="Auto apply", variable=self.auto_apply_var).pack(
+            side="left", padx=(0, 12))
         btn_apply = ttk.Button(btn_frame, text="Apply now (Ctrl+↵)",
                                command=self.apply_now, style="Accent.TButton")
         btn_apply.pack(side="left", padx=(0, 6))
         _Tooltip(btn_apply, "Write divider/width/delay to hardware (Ctrl+Enter)")
-        ttk.Button(btn_frame, text="Read registers", command=self.read_back).pack(side="left")
 
     def _add_param_row(self, parent, row, label, float_var, int_var,
                        entry_var, minv, maxv, callback, ns_var, scale_attr):
-        ttk.Label(parent, text=label, width=20, anchor="w").grid(
+        ttk.Label(parent, text=label, width=22, anchor="w",
+                  background=CLR_SURFACE, foreground=CLR_TEXT).grid(
             row=row, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
 
         var = float_var if float_var is not None else int_var
@@ -446,13 +531,15 @@ class App:
         scale.set(var.get())
 
     def _build_waveform(self, outer):
-        wf = ttk.LabelFrame(outer, text="Waveform Preview", padding=10)
-        wf.pack(fill="x", pady=(0, 10))
-        self._wf_canvas = tk.Canvas(wf, height=90, bg=CLR_BG, highlightthickness=0)
+        wf_outer, wf_inner = self._make_cyber_frame(outer, "WAVEFORM PREVIEW")
+        wf_outer.pack(fill="x", pady=(0, 10))
+        self._wf_canvas = tk.Canvas(wf_inner, height=195, bg=CLR_BG, highlightthickness=0)
         self._wf_canvas.pack(fill="x", expand=True)
         self._wf_canvas.bind("<Configure>", lambda e: self._draw_waveform())
 
     def _draw_waveform(self):
+        if not hasattr(self, '_wf_canvas'):
+            return  # Canvas not yet created
         c = self._wf_canvas
         c.delete("all")
         cw = c.winfo_width()
@@ -460,20 +547,26 @@ class App:
         if cw < 20 or ch < 20:
             return
 
-        margin_l = 52
+        margin_l = 72
         margin_r = 10
         tw = cw - margin_l - margin_r  # track width in pixels
 
-        # Two horizontal tracks
-        y_in_hi  = 8;  y_in_lo  = 26
-        y_out_hi = 52; y_out_lo = 78
+        # Two horizontal tracks (bigger, more prominent)
+        y_in_hi  = 14;  y_in_lo  = 48    # INPUT: 34px tall
+        y_out_hi = 80;  y_out_lo = 140   # OUTPUT: 60px tall
 
-        def _label(text, y_hi, y_lo, color):
+        def _label(text, y_hi, y_lo, color, bold=False):
+            font_spec = ("", 9, "bold") if bold else ("", 9)
             c.create_text(margin_l - 4, (y_hi + y_lo) // 2,
-                          text=text, anchor="e", fill=color, font=("", 8))
+                          text=text, anchor="e", fill=color, font=font_spec)
 
-        _label("In",  y_in_hi,  y_in_lo,  CLR_MUTED)
-        _label("Out", y_out_hi, y_out_lo, CLR_ACCENT)
+        # Grid lines at track boundaries
+        for y in (y_in_hi, y_in_lo, y_out_hi, y_out_lo):
+            c.create_line(margin_l, y, margin_l + tw, y,
+                          fill=CLR_GRID, dash=(4, 4), width=1)
+
+        _label("INPUT",  y_in_hi,  y_in_lo,  CLR_MUTED, bold=True)
+        _label("OUTPUT", y_out_hi, y_out_lo, CLR_ACCENT, bold=True)
 
         divider = max(1, self.divider_var.get())
         frac    = max(0.001, min(0.999, self.width_frac_var.get()))
@@ -493,7 +586,7 @@ class App:
                               fill=CLR_MUTED, width=1)
             x += in_pw
 
-        # ── Output: show 2 output cycles ───────────────────────────────────
+        # ── Output: show 2 output cycles with glow effect ─────────────────
         out_pw = tw / 2.0
         x = float(margin_l)
         for _ in range(2):
@@ -508,21 +601,33 @@ class App:
                 x + d_px + h_px, y_out_lo,
                 x + out_pw,    y_out_lo,
             ]
+            # Glow effect: draw thicker line first in dimmed color
+            for i in range(0, len(pts) - 2, 2):
+                c.create_line(pts[i], pts[i+1], pts[i+2], pts[i+3],
+                              fill=CLR_BORDER_DIM, width=4)
+            # Main line
             for i in range(0, len(pts) - 2, 2):
                 c.create_line(pts[i], pts[i+1], pts[i+2], pts[i+3],
                               fill=CLR_ACCENT, width=2)
             x += out_pw
 
         # ── Annotations ────────────────────────────────────────────────────
-        c.create_text(margin_l + tw / 2, ch - 4,
-                      text=f"÷{divider}  |  duty {frac*100:.1f}%  |  delay {deg:.1f}°",
-                      fill=CLR_MUTED, font=("", 8))
+        sep_y = ch - 18
+        c.create_line(margin_l, sep_y, margin_l + tw, sep_y,
+                      fill=CLR_GRID, width=1)
+
+        out_duty = (frac / divider) * 100
+        c.create_text(margin_l + tw / 2, ch - 8,
+                      text=f"÷{divider}  |  out duty {out_duty:.1f}%  |  delay {deg:.1f}°",
+                      fill=CLR_TEXT, font=("", 9))
 
     def _build_readback(self, outer):
-        rb = ttk.LabelFrame(outer, text="Readback", padding=10)
-        rb.pack(fill="x")
-        ttk.Label(rb, textvariable=self.readback_text,
-                  style="Mono.TLabel", justify="left").pack(anchor="w")
+        rb_outer, rb_inner = self._make_cyber_frame(outer, "REGISTER READBACK")
+        rb_outer.pack(fill="x")
+        ttk.Label(rb_inner, textvariable=self.readback_text,
+                  background=CLR_SURFACE, foreground=CLR_TEXT,
+                  font=_best_font(["JetBrains Mono", "Menlo", "Consolas", "Courier New"], 8),
+                  justify="left").pack(anchor="w")
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -650,6 +755,9 @@ class App:
         self.divider_scale.set(new_val)
         self.updating_widgets = False
         self._update_info_text()
+        # Update stat duty cycle
+        div = max(1, new_val)
+        self.stat_duty_var.set(f"{(self.width_frac_var.get() / div) * 100:.1f} %")
         self._draw_waveform()
         self.maybe_auto_apply()
 
@@ -670,6 +778,9 @@ class App:
         self.width_scale.set(new_val)
         w_cyc = frac_to_cycles(new_val, self._period_cycles)
         self.width_ns_var.set(f"{new_val*100:.1f}%  {fmt_time_s(w_cyc / CLOCK_HZ)}")
+        # Update stat duty cycle
+        div = max(1, self.divider_var.get())
+        self.stat_duty_var.set(f"{(new_val / div) * 100:.1f} %")
         self.updating_widgets = False
         self._draw_waveform()
         self.maybe_auto_apply()
@@ -691,6 +802,8 @@ class App:
         self.delay_scale.set(new_val)
         d_cyc = deg_to_cycles(new_val, self._period_cycles)
         self.delay_ns_var.set(fmt_time_s(d_cyc / CLOCK_HZ))
+        # Update stat phase
+        self.stat_phase_var.set(f"{new_val:.1f} °")
         self.updating_widgets = False
         self._draw_waveform()
         self.maybe_auto_apply()
@@ -782,6 +895,15 @@ class App:
 
         raw_freq  = CLOCK_HZ / raw_period  if raw_period  > 0 else 0.0
         filt_freq = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
+
+        # Update live stats from hardware data
+        divider_hw = max(1, divider)
+        out_freq   = filt_freq / divider_hw if filt_freq > 0 else 0.0
+        self.stat_input_freq_var.set(fmt_freq_hz(filt_freq) if filt_period > 0 else "—")
+        self.stat_output_freq_var.set(fmt_freq_hz(out_freq)  if filt_period > 0 else "—")
+        frac = self.width_frac_var.get()
+        self.stat_duty_var.set(f"{(frac / divider_hw) * 100:.1f} %")
+        self.stat_phase_var.set(f"{self.delay_deg_var.get():.1f} °")
 
         width_frac = cycles_to_frac(width, self._period_cycles)
         delay_deg  = cycles_to_deg(delay,  self._period_cycles)
