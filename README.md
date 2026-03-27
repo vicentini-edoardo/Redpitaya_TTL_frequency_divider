@@ -34,10 +34,12 @@ External signal ──► DIO0_P ──► [FPGA: freq divider + pulse gen] ─�
 | 0x14   | period          | Last raw measured input period (cycles)              |
 | 0x18   | period_avg      | Averaged trigger period (cycles)                     |
 | 0x1C   | phase_freq      | DDS phase increment word for modulation frequency    |
+| 0x20   | phase_amp_q15   | Q15 amplitude word for modulation sweep amplitude    |
 
 Input frequency is measured directly from the hardware — no manual entry needed.
 Frequency from period: `freq_hz = 125_000_000 / period_cycles`
 Modulation word from frequency: `phase_freq_word = int(f_mod * 2**32 / 125e6)`
+Amplitude word from sweep fraction: `phase_mod_amp_q15 = int(sweep_fraction * 32767)`
 
 ## Repository Contents
 
@@ -112,6 +114,7 @@ Port, user, and base address can be changed under **▼ Advanced**.
 | Delay     | phase 0–180°  | Pulse delay as phase of the **input** period |
 | Phase modulation | on/off | When enabled, delay is driven by an internal DDS-synthesized sinusoid |
 | Modulation frequency | Hz, 0–5 kHz | Converted to `PHASE_FREQ`; DIO2 outputs a 50% duty TTL at the same frequency |
+| Modulation amplitude | sweep / T, 0–1 | Converted to `PHASE_MOD_AMP_Q15`; practical values: `0.7T = 22937`, `0.8T = 26214`, full sweep `32767` |
 
 The muted label next to each slider shows the equivalent absolute time (e.g. `4 us`).
 

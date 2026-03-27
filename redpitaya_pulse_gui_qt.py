@@ -46,6 +46,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
         QTextEdit,
         QVBoxLayout,
@@ -70,6 +71,9 @@ WIDTH_MIN = 1
 DELAY_MIN = 1
 MOD_FREQ_MIN_HZ = 0.0
 MOD_FREQ_MAX_HZ = 5_000.0
+MOD_AMP_MIN = 0.0
+MOD_AMP_MAX = 1.0
+MOD_AMP_Q15_MAX = 32767
 
 CONTROL_PULSE_ENABLE = 0x1
 CONTROL_SOFT_RESET = 0x2
@@ -137,12 +141,25 @@ def mod_freq_to_word(freq_hz: float) -> int:
     return int(clamp_mod_freq_hz(freq_hz) * (2**32) / CLOCK_HZ)
 
 
+def clamp_mod_amp(value: float) -> float:
+    return max(MOD_AMP_MIN, min(MOD_AMP_MAX, value))
+
+
+def mod_amp_to_q15(value: float) -> int:
+    return int(round(clamp_mod_amp(value) * MOD_AMP_Q15_MAX))
+
+
+def q15_to_mod_amp(value: int) -> float:
+    return clamp_mod_amp(value / MOD_AMP_Q15_MAX) if MOD_AMP_Q15_MAX > 0 else 0.0
+
+
 @dataclass
 class ApplyState:
     divider: int
     width_cycles: int
     delay_cycles: int
     phase_freq_word: int
+    phase_amp_q15: int
     control_word: int
 
 
@@ -297,7 +314,7 @@ class StatCard(QFrame):
         super().__init__(parent)
         self.accent = accent
         self.setObjectName("statCard")
-        self.setMinimumHeight(170)
+        self.setMinimumHeight(150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 16)
@@ -553,7 +570,8 @@ class ParameterSlider(QWidget):
 class WaveformPreview(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(270)
+        self.setMinimumHeight(180)
+        self.setMaximumHeight(220)
         self.divider = 1
         self.width_frac = 0.5
         self.delay_deg = 0.0
@@ -675,8 +693,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Red Pitaya Pulse Control")
-        self.resize(1320, 880)
-        self.setMinimumSize(1120, 760)
+        self.resize(1240, 760)
+        self.setMinimumSize(980, 620)
 
         self.remote = RemoteCtl()
         self.connected = False
@@ -697,7 +715,8 @@ class MainWindow(QMainWindow):
         self._period_valid = False
         self._timeout_flag = False
         self._phase_freq_clamped = False
-        self._phase_mod_requested = False
+        self._mod_freq_dirty = False
+        self._mod_amp_dirty = False
         self.waveform: WaveformPreview | None = None
 
         self.poll_timer = QTimer(self)
@@ -715,12 +734,19 @@ class MainWindow(QMainWindow):
         self._refresh_preview_and_stats()
 
     def _build_ui(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setCentralWidget(scroll)
+
         bg = BackgroundWidget()
-        self.setCentralWidget(bg)
+        scroll.setWidget(bg)
 
         root = QVBoxLayout(bg)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(16)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(14)
         root.setAlignment(Qt.AlignTop)
 
         top_row = QHBoxLayout()
@@ -730,18 +756,30 @@ class MainWindow(QMainWindow):
 
         self.connection_panel = self._build_connection_panel()
         self.stats_panel = self._build_stats_panel()
-        top_row.addWidget(self.connection_panel, 4)
-        top_row.addWidget(self.stats_panel, 5)
+        top_row.addWidget(self.connection_panel, 1)
+        top_row.addWidget(self.stats_panel, 1)
 
         mid_row = QHBoxLayout()
         mid_row.setSpacing(16)
         mid_row.setAlignment(Qt.AlignTop)
         root.addLayout(mid_row)
 
-        self.controls_panel = self._build_controls_panel()
+        controls_col = QVBoxLayout()
+        controls_col.setSpacing(16)
+        self.pulse_controls_panel = self._build_pulse_controls_panel()
+        self.modulation_panel = self._build_modulation_panel()
         self.wave_panel = self._build_waveform_panel()
-        mid_row.addWidget(self.controls_panel, 4)
-        mid_row.addWidget(self.wave_panel, 6)
+        controls_col.addWidget(self.pulse_controls_panel, 1)
+        controls_col.addWidget(self.modulation_panel, 1)
+        mid_row.addLayout(controls_col, 11)
+        mid_row.addWidget(self.wave_panel, 10)
+
+        # Initialize control defaults only after every dependent widget exists.
+        self.divider_control.setValue(1)
+        self.width_control.setValue(0.5)
+        self.delay_control.setValue(0.0)
+        self.mod_freq_control.setValue(10.0)
+        self.mod_amp_control.setValue(0.7)
 
         root.addStretch(1)
 
@@ -842,8 +880,8 @@ class MainWindow(QMainWindow):
 
         return panel
 
-    def _build_controls_panel(self) -> CyberPanel:
-        panel = CyberPanel("CONTROLS")
+    def _build_pulse_controls_panel(self) -> CyberPanel:
+        panel = CyberPanel("PULSE CONTROLS")
         layout = panel.content_layout
 
         divider_row = QWidget()
@@ -866,6 +904,37 @@ class MainWindow(QMainWindow):
             display_suffix="%",
         )
         self.delay_control = ParameterSlider("Delay (phase 0–180°)", 0.0, 180.0, 5.0, 1)
+        layout.addWidget(self.width_control)
+        layout.addWidget(self.delay_control)
+
+        toggles = QHBoxLayout()
+        toggles.setSpacing(12)
+        self.enable_toggle = ToggleButton("Enable output")
+        self.enable_toggle.setChecked(True)
+        toggles.addWidget(self.enable_toggle)
+        self.auto_apply_toggle = ToggleButton("Auto apply")
+        toggles.addWidget(self.auto_apply_toggle)
+        toggles.addStretch(1)
+        layout.addLayout(toggles)
+
+        layout.addStretch(1)
+
+        self.divider_control.valueChanged.connect(self.on_divider_changed)
+        self.width_control.valueChanged.connect(self.on_width_changed)
+        self.delay_control.valueChanged.connect(self.on_delay_changed)
+        self.width_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
+        self.delay_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
+        self.enable_toggle.toggled.connect(lambda _checked: self.maybe_auto_apply())
+
+        return panel
+
+    def _build_modulation_panel(self) -> CyberPanel:
+        panel = CyberPanel("MODULATION")
+        layout = panel.content_layout
+
+        self.phase_mod_toggle = ToggleButton("Enable phase modulation")
+        layout.addWidget(self.phase_mod_toggle)
+
         self.mod_freq_control = ParameterSlider(
             "Modulation frequency",
             MOD_FREQ_MIN_HZ,
@@ -874,21 +943,25 @@ class MainWindow(QMainWindow):
             0,
             display_suffix=" Hz",
         )
-        layout.addWidget(self.width_control)
-        layout.addWidget(self.delay_control)
+        self.mod_amp_control = ParameterSlider(
+            "Modulation amplitude (sweep / T)",
+            MOD_AMP_MIN,
+            MOD_AMP_MAX,
+            0.05,
+            2,
+            display_factor=100.0,
+            display_suffix="%",
+        )
         layout.addWidget(self.mod_freq_control)
+        layout.addWidget(self.mod_amp_control)
 
-        toggles = QHBoxLayout()
-        toggles.setSpacing(12)
-        self.enable_toggle = ToggleButton("Enable output")
-        self.enable_toggle.setChecked(True)
-        self.phase_mod_toggle = ToggleButton("Enable phase modulation")
-        self.auto_apply_toggle = ToggleButton("Auto apply")
-        toggles.addWidget(self.enable_toggle)
-        toggles.addWidget(self.phase_mod_toggle)
-        toggles.addWidget(self.auto_apply_toggle)
-        toggles.addStretch(1)
-        layout.addLayout(toggles)
+        presets = QHBoxLayout()
+        presets.setSpacing(10)
+        for label, amp in (("0.7T", 0.7), ("0.8T", 0.8), ("1.0T", 1.0)):
+            btn = self._make_small_button(label, lambda _checked=False, value=amp: self.mod_amp_control.setValue(value))
+            presets.addWidget(btn)
+        presets.addStretch(1)
+        layout.addLayout(presets)
 
         self.apply_btn = QPushButton("APPLY NOW")
         self.apply_btn.setObjectName("accentButton")
@@ -898,26 +971,19 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        self.divider_control.valueChanged.connect(self.on_divider_changed)
-        self.width_control.valueChanged.connect(self.on_width_changed)
-        self.delay_control.valueChanged.connect(self.on_delay_changed)
         self.mod_freq_control.valueChanged.connect(self.on_mod_freq_changed)
-        self.width_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
-        self.delay_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
+        self.mod_amp_control.valueChanged.connect(self.on_mod_amp_changed)
         self.mod_freq_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
-        self.enable_toggle.toggled.connect(lambda _checked: self.maybe_auto_apply())
+        self.mod_amp_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
         self.phase_mod_toggle.toggled.connect(self.on_phase_mod_toggled)
 
-        self.divider_control.setValue(1)
-        self.width_control.setValue(0.5)
-        self.delay_control.setValue(0.0)
-        self.mod_freq_control.setValue(100.0)
         return panel
 
     def _build_waveform_panel(self) -> CyberPanel:
         panel = CyberPanel("WAVEFORM PREVIEW")
         self.waveform = WaveformPreview()
-        panel.content_layout.addWidget(self.waveform)
+        panel.content_layout.addWidget(self.waveform, 0, Qt.AlignTop)
+        panel.content_layout.addStretch(1)
         return panel
 
     def _wire_shortcuts(self):
@@ -1114,17 +1180,21 @@ class MainWindow(QMainWindow):
     def _effective_phase_mod_enabled(self) -> bool:
         return self.phase_mod_toggle.isChecked() and self._period_valid and not self._timeout_flag
 
+    def _phase_mod_requested_state(self) -> bool:
+        return self.phase_mod_toggle.isChecked()
+
     def _update_modulation_controls(self):
         effective_phase_mod = self._effective_phase_mod_enabled()
         self.delay_control.setEnabled(not effective_phase_mod)
-        self.mod_freq_control.setEnabled(self.phase_mod_toggle.isChecked())
-        self.phase_mod_toggle.setEnabled(self._period_valid)
+        self.mod_freq_control.setEnabled(self._phase_mod_requested_state())
+        self.mod_amp_control.setEnabled(self._phase_mod_requested_state())
 
     def _refresh_preview_and_stats(self):
         divider = self.divider_control.value()
         width = self.width_control.value()
         delay = self.delay_control.value()
         mod_freq_hz = clamp_mod_freq_hz(self.mod_freq_control.value())
+        mod_amp = clamp_mod_amp(self.mod_amp_control.value())
         effective_phase_mod = self._effective_phase_mod_enabled()
         if self.waveform is not None:
             self.waveform.set_state(divider, width, delay, effective_phase_mod, mod_freq_hz)
@@ -1139,12 +1209,14 @@ class MainWindow(QMainWindow):
         width_cycles = frac_to_cycles(width, self._period_cycles)
         delay_cycles = deg_to_cycles(delay, self._period_cycles)
         phase_word = mod_freq_to_word(mod_freq_hz)
+        phase_amp_q15 = mod_amp_to_q15(mod_amp)
         self.width_control.set_detail(f"{width * 100:.1f}%   {fmt_time_s(width_cycles / CLOCK_HZ)}")
         if effective_phase_mod:
             self.delay_control.set_detail("ignored while phase modulation is active")
         else:
             self.delay_control.set_detail(fmt_time_s(delay_cycles / CLOCK_HZ))
         self.mod_freq_control.set_detail(f"DDS word 0x{phase_word:08X}   TTL out {fmt_freq_hz(mod_freq_hz)}")
+        self.mod_amp_control.set_detail(f"Q15 {phase_amp_q15}   sweep {mod_amp:.2f}T")
         self._update_modulation_controls()
         self._update_info_text()
 
@@ -1171,16 +1243,18 @@ class MainWindow(QMainWindow):
         frac = max(0.0, min(1.0, self.width_control.value()))
         deg = max(0.0, min(180.0, self.delay_control.value()))
         mod_freq_hz = clamp_mod_freq_hz(self.mod_freq_control.value())
+        mod_amp = clamp_mod_amp(self.mod_amp_control.value())
         control_word = 0
         if self.enable_toggle.isChecked():
             control_word |= CONTROL_PULSE_ENABLE
-        if self._effective_phase_mod_enabled():
+        if self._phase_mod_requested_state():
             control_word |= CONTROL_PHASE_MOD_ENABLE
         return ApplyState(
             divider=divider,
             width_cycles=frac_to_cycles(frac, self._period_cycles),
             delay_cycles=deg_to_cycles(deg, self._period_cycles),
             phase_freq_word=mod_freq_to_word(mod_freq_hz),
+            phase_amp_q15=mod_amp_to_q15(mod_amp),
             control_word=control_word,
         )
 
@@ -1355,12 +1429,22 @@ class MainWindow(QMainWindow):
         if was_clamped:
             self.mod_freq_control.setValue(clamped)
             return
+        self._mod_freq_dirty = True
         self._refresh_preview_and_stats()
         if not self.mod_freq_control.value_box.hasFocus():
             self.maybe_auto_apply()
 
+    def on_mod_amp_changed(self, value: float):
+        clamped = clamp_mod_amp(value)
+        if abs(clamped - value) > 1e-9:
+            self.mod_amp_control.setValue(clamped)
+            return
+        self._mod_amp_dirty = True
+        self._refresh_preview_and_stats()
+        if not self.mod_amp_control.value_box.hasFocus():
+            self.maybe_auto_apply()
+
     def on_phase_mod_toggled(self, checked: bool):
-        self._phase_mod_requested = checked
         self._refresh_preview_and_stats()
         self.maybe_auto_apply()
 
@@ -1406,6 +1490,7 @@ class MainWindow(QMainWindow):
                 state.width_cycles,
                 state.delay_cycles,
                 state.phase_freq_word,
+                state.phase_amp_q15,
                 state.control_word,
             )
             return state, data
@@ -1413,6 +1498,10 @@ class MainWindow(QMainWindow):
         def on_result(payload):
             apply_state, data = payload
             self._update_readback(data)
+            if int(data.get("phase_freq", -1)) == apply_state.phase_freq_word:
+                self._mod_freq_dirty = False
+            if int(data.get("phase_amp_q15", -1)) == apply_state.phase_amp_q15:
+                self._mod_amp_dirty = False
             mode_text = "phase mod ON" if (apply_state.control_word & CONTROL_PHASE_MOD_ENABLE) else "phase mod OFF"
             self.status_label.setText(
                 f"Applied — width {apply_state.width_cycles} cyc, delay {apply_state.delay_cycles} cyc, {mode_text}."
@@ -1439,6 +1528,7 @@ class MainWindow(QMainWindow):
         raw_period = int(data.get("period", data.get("raw_period", 0)))
         filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
         phase_freq = int(data.get("phase_freq", 0))
+        phase_amp_q15 = int(data.get("phase_amp_q15", 0))
 
         busy = (status >> 0) & 0x1
         period_valid = (status >> 1) & 0x1
@@ -1462,6 +1552,7 @@ class MainWindow(QMainWindow):
         current_width = self.width_control.value()
         current_delay = self.delay_control.value()
         mod_freq_hz = phase_freq * CLOCK_HZ / (2**32)
+        mod_amp = q15_to_mod_amp(phase_amp_q15)
 
         self.stat_input.set_value(fmt_freq_hz(filt_freq) if filt_period > 0 else "—")
         self.stat_output.set_value(fmt_freq_hz(out_freq) if filt_period > 0 else "—")
@@ -1476,33 +1567,31 @@ class MainWindow(QMainWindow):
             self.stat_phase.set_value(f"{current_delay:.1f} °")
             self.stat_phase.set_footer("input referenced")
 
-        blocked_phase_mod = (phase_mod_enable or self.phase_mod_toggle.isChecked()) and (not period_valid or timeout_flag)
-        if blocked_phase_mod:
-            self.phase_mod_toggle.blockSignals(True)
-            self.phase_mod_toggle.setChecked(False)
-            self.phase_mod_toggle.blockSignals(False)
-            self._phase_mod_requested = False
+        blocked_phase_mod = self.phase_mod_toggle.isChecked() and (not period_valid or timeout_flag)
 
         self.enable_toggle.blockSignals(True)
         self.enable_toggle.setChecked(bool(enable))
         self.enable_toggle.blockSignals(False)
 
-        if not blocked_phase_mod and self.phase_mod_toggle.isChecked() != phase_mod_enable:
-            self.phase_mod_toggle.blockSignals(True)
-            self.phase_mod_toggle.setChecked(phase_mod_enable)
-            self.phase_mod_toggle.blockSignals(False)
-            self._phase_mod_requested = phase_mod_enable
-
-        if abs(self.mod_freq_control.value() - clamp_mod_freq_hz(mod_freq_hz)) > 0.5:
+        should_sync_mod_freq = (phase_mod_enable or phase_freq != 0) and not self._mod_freq_dirty
+        if should_sync_mod_freq and abs(self.mod_freq_control.value() - clamp_mod_freq_hz(mod_freq_hz)) > 0.5:
             self.mod_freq_control.blockSignals(True)
             self.mod_freq_control.setValue(clamp_mod_freq_hz(mod_freq_hz))
             self.mod_freq_control.blockSignals(False)
 
+        should_sync_mod_amp = (phase_mod_enable or phase_amp_q15 != 0) and not self._mod_amp_dirty
+        if should_sync_mod_amp and abs(self.mod_amp_control.value() - clamp_mod_amp(mod_amp)) > 0.01:
+            self.mod_amp_control.blockSignals(True)
+            self.mod_amp_control.setValue(clamp_mod_amp(mod_amp))
+            self.mod_amp_control.blockSignals(False)
+
         self._refresh_preview_and_stats()
 
         warnings: list[str] = []
+        if blocked_phase_mod:
+            warnings.append("Phase modulation requested, but blocked by trigger status. Static delay is active.")
         if not period_valid:
-            warnings.append("No valid trigger period. Phase modulation disabled; static delay is active.")
+            warnings.append("No valid trigger period.")
         if timeout_flag:
             warnings.append("Trigger timeout detected on STATUS.bit2.")
         if self._phase_freq_clamped:

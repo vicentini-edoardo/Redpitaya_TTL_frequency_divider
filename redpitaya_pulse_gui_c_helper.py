@@ -29,6 +29,9 @@ WIDTH_MIN = 1    # minimum hardware cycle count
 DELAY_MIN = 1    # minimum hardware cycle count
 MOD_FREQ_MIN_HZ = 0.0
 MOD_FREQ_MAX_HZ = 5_000.0
+MOD_AMP_MIN = 0.0
+MOD_AMP_MAX = 1.0
+MOD_AMP_Q15_MAX = 32767
 
 CONTROL_PULSE_ENABLE     = 0x1
 CONTROL_SOFT_RESET       = 0x2
@@ -103,6 +106,18 @@ def clamp_mod_freq_hz(freq_hz: float) -> float:
 
 def mod_freq_to_word(freq_hz: float) -> int:
     return int(clamp_mod_freq_hz(freq_hz) * (2**32) / CLOCK_HZ)
+
+
+def clamp_mod_amp(value: float) -> float:
+    return max(MOD_AMP_MIN, min(MOD_AMP_MAX, value))
+
+
+def mod_amp_to_q15(value: float) -> int:
+    return int(round(clamp_mod_amp(value) * MOD_AMP_Q15_MAX))
+
+
+def q15_to_mod_amp(value: int) -> float:
+    return clamp_mod_amp(value / MOD_AMP_Q15_MAX) if MOD_AMP_Q15_MAX > 0 else 0.0
 
 
 class _Tooltip:
@@ -217,9 +232,12 @@ class App:
         self.delay_deg_entry_var = tk.StringVar(value="0.0")
         self.delay_ns_var = tk.StringVar(value="")
 
-        self.mod_freq_var = tk.DoubleVar(value=100.0)
-        self.mod_freq_entry_var = tk.StringVar(value="100")
+        self.mod_freq_var = tk.DoubleVar(value=10.0)
+        self.mod_freq_entry_var = tk.StringVar(value="10")
         self.mod_freq_word_var = tk.StringVar(value="")
+        self.mod_amp_var = tk.DoubleVar(value=0.7)
+        self.mod_amp_entry_var = tk.StringVar(value="0.70")
+        self.mod_amp_word_var = tk.StringVar(value="")
 
         # Live stats display vars
         self.stat_input_freq_var  = tk.StringVar(value="—")
@@ -232,6 +250,8 @@ class App:
         self._period_valid = False
         self._timeout_flag = False
         self._phase_freq_clamped = False
+        self._mod_freq_dirty = False
+        self._mod_amp_dirty = False
         self._force_period_update = False
         self._auto_apply_job = None
         self._poll_job = None
@@ -249,6 +269,7 @@ class App:
         self.width_scale = None
         self.delay_scale = None
         self.mod_freq_scale = None
+        self.mod_amp_scale = None
 
         self.updating_widgets = False
 
@@ -260,6 +281,7 @@ class App:
 
         self._build()
         self.on_mod_freq_change(self.mod_freq_var.get())
+        self.on_mod_amp_change(self.mod_amp_var.get())
         self._update_modulation_controls()
         self.root.bind("<Control-Return>", lambda e: self.apply_now())
 
@@ -540,8 +562,17 @@ class App:
                             ns_var=self.mod_freq_word_var,
                             scale_attr="mod_freq_scale")
 
+        self._add_param_row(ctrl, 4,
+                            label="Modulation amplitude (sweep / T)",
+                            float_var=self.mod_amp_var, int_var=None,
+                            entry_var=self.mod_amp_entry_var,
+                            minv=MOD_AMP_MIN, maxv=MOD_AMP_MAX,
+                            callback=self.on_mod_amp_change,
+                            ns_var=self.mod_amp_word_var,
+                            scale_attr="mod_amp_scale")
+
         btn_frame = tk.Frame(ctrl, bg=CLR_SURFACE)
-        btn_frame.grid(row=4, column=0, columnspan=4, sticky="w", pady=(14, 0))
+        btn_frame.grid(row=5, column=0, columnspan=4, sticky="w", pady=(14, 0))
 
         ttk.Checkbutton(btn_frame, text="Enable output", variable=self.enable_var,
                         command=self.maybe_auto_apply).pack(side="left", padx=(0, 12))
@@ -789,14 +820,18 @@ class App:
     def _effective_phase_mod_enabled(self):
         return self.phase_mod_enable_var.get() and self._period_valid and not self._timeout_flag
 
+    def _phase_mod_requested(self):
+        return self.phase_mod_enable_var.get()
+
     def _update_modulation_controls(self):
         delay_state = "disabled" if self._effective_phase_mod_enabled() else "normal"
-        toggle_state = "normal" if self._period_valid else "disabled"
         self.delay_scale.configure(state=delay_state)
         self.delay_scale_entry.configure(state=delay_state)
-        self.mod_freq_scale.configure(state="normal" if self.phase_mod_enable_var.get() else "disabled")
-        self.mod_freq_scale_entry.configure(state="normal" if self.phase_mod_enable_var.get() else "disabled")
-        self.phase_mod_check.configure(state=toggle_state)
+        self.mod_freq_scale.configure(state="normal" if self._phase_mod_requested() else "disabled")
+        self.mod_freq_scale_entry.configure(state="normal" if self._phase_mod_requested() else "disabled")
+        self.mod_amp_scale.configure(state="normal" if self._phase_mod_requested() else "disabled")
+        self.mod_amp_scale_entry.configure(state="normal" if self._phase_mod_requested() else "disabled")
+        self.phase_mod_check.configure(state="normal")
 
     def _update_info_text(self):
         if self._period_cycles <= 1:
@@ -821,16 +856,18 @@ class App:
         frac = max(0.0, min(1.0, self.width_frac_var.get()))
         deg = max(0.0, min(180.0, self.delay_deg_var.get()))
         mod_freq_hz = clamp_mod_freq_hz(self.mod_freq_var.get())
+        mod_amp = clamp_mod_amp(self.mod_amp_var.get())
         control_word = 0
         if self.enable_var.get():
             control_word |= CONTROL_PULSE_ENABLE
-        if self._effective_phase_mod_enabled():
+        if self._phase_mod_requested():
             control_word |= CONTROL_PHASE_MOD_ENABLE
         return {
             "divider": divider,
             "width_cycles": frac_to_cycles(frac, self._period_cycles),
             "delay_cycles": deg_to_cycles(deg, self._period_cycles),
             "phase_freq_word": mod_freq_to_word(mod_freq_hz),
+            "phase_amp_q15": mod_amp_to_q15(mod_amp),
             "control_word": control_word,
         }
 
@@ -869,6 +906,7 @@ class App:
                     state["width_cycles"],
                     state["delay_cycles"],
                     state["phase_freq_word"],
+                    state["phase_amp_q15"],
                     state["control_word"],
                 )
             except Exception as exc:
@@ -879,6 +917,10 @@ class App:
 
     def _finish_apply(self, state, data):
         self._update_readback(data)
+        if int(data.get("phase_freq", -1)) == state["phase_freq_word"]:
+            self._mod_freq_dirty = False
+        if int(data.get("phase_amp_q15", -1)) == state["phase_amp_q15"]:
+            self._mod_amp_dirty = False
         mode_text = "phase mod ON" if (state["control_word"] & CONTROL_PHASE_MOD_ENABLE) else "phase mod OFF"
         self.status_text.set(
             f"Applied — width {state['width_cycles']} cyc, delay {state['delay_cycles']} cyc, {mode_text}."
@@ -971,11 +1013,34 @@ class App:
             new_val = float(value)
         clamped = clamp_mod_freq_hz(new_val)
         self._phase_freq_clamped = abs(clamped - new_val) > 1e-9
+        self._mod_freq_dirty = True
         self.updating_widgets = True
         self.mod_freq_var.set(clamped)
         self.mod_freq_entry_var.set(f"{clamped:.0f}")
         self.mod_freq_scale.set(clamped)
         self.mod_freq_word_var.set(f"DDS 0x{mod_freq_to_word(clamped):08X}")
+        self.updating_widgets = False
+        self._update_info_text()
+        self._draw_waveform()
+        self.maybe_auto_apply()
+
+    def on_mod_amp_change(self, value):
+        if self.updating_widgets:
+            return
+        if value is None:
+            try:
+                new_val = float(self.mod_amp_entry_var.get().strip())
+            except ValueError:
+                new_val = self.mod_amp_var.get()
+        else:
+            new_val = float(value)
+        clamped = clamp_mod_amp(new_val)
+        self._mod_amp_dirty = True
+        self.updating_widgets = True
+        self.mod_amp_var.set(clamped)
+        self.mod_amp_entry_var.set(f"{clamped:.2f}")
+        self.mod_amp_scale.set(clamped)
+        self.mod_amp_word_var.set(f"Q15 {mod_amp_to_q15(clamped)}")
         self.updating_widgets = False
         self._update_info_text()
         self._draw_waveform()
@@ -1046,6 +1111,7 @@ class App:
         raw_period  = int(data.get("period", data.get("raw_period", 0)))
         filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
         phase_freq  = int(data.get("phase_freq", 0))
+        phase_amp_q15 = int(data.get("phase_amp_q15", 0))
 
         busy         = (status >> 0) & 0x1
         period_valid = (status >> 1) & 0x1
@@ -1075,6 +1141,7 @@ class App:
         raw_freq  = CLOCK_HZ / raw_period  if raw_period  > 0 else 0.0
         filt_freq = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
         mod_freq_hz = phase_freq * CLOCK_HZ / (2**32)
+        mod_amp = q15_to_mod_amp(phase_amp_q15)
 
         # Update live stats from hardware data
         divider_hw = max(1, divider)
@@ -1091,26 +1158,31 @@ class App:
         width_frac = cycles_to_frac(width, self._period_cycles)
         delay_deg  = cycles_to_deg(delay,  self._period_cycles)
 
-        blocked_phase_mod = (phase_mod_enable or self.phase_mod_enable_var.get()) and (not period_valid or timeout_flag)
+        blocked_phase_mod = self.phase_mod_enable_var.get() and (not period_valid or timeout_flag)
         self.enable_var.set(bool(enable))
-        if blocked_phase_mod:
-            self.phase_mod_enable_var.set(False)
-        elif self.phase_mod_enable_var.get() != phase_mod_enable:
-            self.phase_mod_enable_var.set(phase_mod_enable)
-
         clamped_mod_freq_hz = clamp_mod_freq_hz(mod_freq_hz)
-        if abs(self.mod_freq_var.get() - clamped_mod_freq_hz) > 0.5:
+        should_sync_mod_freq = (phase_mod_enable or phase_freq != 0) and not self._mod_freq_dirty
+        if should_sync_mod_freq and abs(self.mod_freq_var.get() - clamped_mod_freq_hz) > 0.5:
             self.mod_freq_var.set(clamped_mod_freq_hz)
             self.mod_freq_entry_var.set(f"{clamped_mod_freq_hz:.0f}")
             self.mod_freq_scale.set(clamped_mod_freq_hz)
         self.mod_freq_word_var.set(f"DDS 0x{mod_freq_to_word(self.mod_freq_var.get()):08X}")
+        clamped_mod_amp = clamp_mod_amp(mod_amp)
+        should_sync_mod_amp = (phase_mod_enable or phase_amp_q15 != 0) and not self._mod_amp_dirty
+        if should_sync_mod_amp and abs(self.mod_amp_var.get() - clamped_mod_amp) > 0.01:
+            self.mod_amp_var.set(clamped_mod_amp)
+            self.mod_amp_entry_var.set(f"{clamped_mod_amp:.2f}")
+            self.mod_amp_scale.set(clamped_mod_amp)
+        self.mod_amp_word_var.set(f"Q15 {mod_amp_to_q15(self.mod_amp_var.get())}")
         self._update_modulation_controls()
         self._update_info_text()
         self._draw_waveform()
 
         warnings = []
+        if blocked_phase_mod:
+            warnings.append("Phase modulation requested, but blocked by trigger status. Static delay is active.")
         if not period_valid:
-            warnings.append("No valid trigger period. Phase modulation disabled; static delay is active.")
+            warnings.append("No valid trigger period.")
         if timeout_flag:
             warnings.append("Trigger timeout detected on STATUS.bit2.")
         if self._phase_freq_clamped:
@@ -1125,6 +1197,7 @@ class App:
             f"width    = {width:6d} cycles  ({fmt_time_s(width / CLOCK_HZ):>10})  →  {width_frac:.3f} duty\n"
             f"delay    = {delay:6d} cycles  ({fmt_time_s(delay / CLOCK_HZ):>10})  →  {delay_deg:.1f}°\n"
             f"phase_fr = 0x{phase_freq:08X}  ({fmt_freq_hz(mod_freq_hz):>12})\n"
+            f"phase_amp= {phase_amp_q15:6d}  ({mod_amp:.2f}T sweep)\n"
             f"status   = 0x{status:08X}    {status_str}\n"
             f"raw  f   = {fmt_freq_hz(raw_freq):>12}  ({raw_period} cycles)\n"
             f"filt f   = {fmt_freq_hz(filt_freq):>12}  ({filt_period} cycles)"

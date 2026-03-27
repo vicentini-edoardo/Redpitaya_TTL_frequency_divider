@@ -16,6 +16,7 @@
  *   0x14  period       last raw measured input period (cycles)
  *   0x18  period_avg   filtered measured input period (cycles)
  *   0x1C  phase_freq   DDS phase increment word
+ *   0x20  phase_amp    Q15 sweep amplitude word
  *
  * Frequency from period: freq_hz = 125000000.0 / period_cycles
  */
@@ -36,15 +37,17 @@
 #define REG_RAW_PERIOD  0x14
 #define REG_FILT_PERIOD 0x18
 #define REG_PHASE_FREQ  0x1C
+#define REG_PHASE_AMP   0x20
 
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s <base_addr> read\n"
+        "  %s <base_addr> write <divider> <width> <delay> <phase_freq> <phase_amp_q15> <control>\n"
         "  %s <base_addr> write <divider> <width> <delay> <phase_freq> <control>\n"
         "  %s <base_addr> write <divider> <width> <delay> <enable>\n"
         "  %s <base_addr> soft_reset\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog);
 }
 
 static uint32_t rd32(volatile uint8_t *base, off_t off) {
@@ -60,7 +63,8 @@ static void print_json(volatile uint8_t *base) {
     const uint32_t raw_period = rd32(base, REG_RAW_PERIOD);
     const uint32_t filt_period = rd32(base, REG_FILT_PERIOD);
     printf("{\"control\":%u,\"divider\":%u,\"width\":%u,\"delay\":%u,\"status\":%u,"
-           "\"period\":%u,\"raw_period\":%u,\"period_avg\":%u,\"filt_period\":%u,\"phase_freq\":%u}\n",
+           "\"period\":%u,\"raw_period\":%u,\"period_avg\":%u,\"filt_period\":%u,"
+           "\"phase_freq\":%u,\"phase_amp_q15\":%u}\n",
            rd32(base, REG_CONTROL),
            rd32(base, REG_DIVIDER),
            rd32(base, REG_WIDTH),
@@ -70,7 +74,8 @@ static void print_json(volatile uint8_t *base) {
            raw_period,
            filt_period,
            filt_period,
-           rd32(base, REG_PHASE_FREQ));
+           rd32(base, REG_PHASE_FREQ),
+           rd32(base, REG_PHASE_AMP));
 }
 
 int main(int argc, char **argv) {
@@ -112,8 +117,8 @@ int main(int argc, char **argv) {
         print_json(base);
 
     } else if (strcmp(argv[2], "write") == 0) {
-        uint32_t divider, width, delay, phase_freq, control;
-        if (argc != 7 && argc != 8) {
+        uint32_t divider, width, delay, phase_freq, phase_amp_q15, control;
+        if (argc != 7 && argc != 8 && argc != 9) {
             usage(argv[0]);
             munmap((void *)((uintptr_t)base - page_off), page_size);
             close(fd);
@@ -122,11 +127,17 @@ int main(int argc, char **argv) {
         divider = (uint32_t)strtoul(argv[3], NULL, 0);
         width   = (uint32_t)strtoul(argv[4], NULL, 0);
         delay   = (uint32_t)strtoul(argv[5], NULL, 0);
-        if (argc == 8) {
+        if (argc == 9) {
             phase_freq = (uint32_t)strtoul(argv[6], NULL, 0);
+            phase_amp_q15 = (uint32_t)strtoul(argv[7], NULL, 0);
+            control    = (uint32_t)strtoul(argv[8], NULL, 0);
+        } else if (argc == 8) {
+            phase_freq = (uint32_t)strtoul(argv[6], NULL, 0);
+            phase_amp_q15 = rd32(base, REG_PHASE_AMP);
             control    = (uint32_t)strtoul(argv[7], NULL, 0);
         } else {
             phase_freq = rd32(base, REG_PHASE_FREQ);
+            phase_amp_q15 = rd32(base, REG_PHASE_AMP);
             control    = ((uint32_t)strtoul(argv[6], NULL, 0) & 0x1u);
         }
 
@@ -136,6 +147,7 @@ int main(int argc, char **argv) {
         wr32(base, REG_WIDTH, width);
         wr32(base, REG_DELAY, delay);
         wr32(base, REG_PHASE_FREQ, phase_freq);
+        wr32(base, REG_PHASE_AMP, phase_amp_q15);
         wr32(base, REG_CONTROL, control & 0x5u);
 
         print_json(base);
