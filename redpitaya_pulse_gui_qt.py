@@ -79,22 +79,28 @@ CONTROL_PULSE_ENABLE = 0x1
 CONTROL_SOFT_RESET = 0x2
 CONTROL_PHASE_MOD_ENABLE = 0x4
 
-CLR_BG = "#050a0f"
-CLR_BG_2 = "#09121d"
-CLR_SURFACE = "#0d1117"
-CLR_PANEL = "#09111d"
-CLR_BORDER = "#11c6de"
-CLR_BORDER_MAGENTA = "#ff2dcb"
-CLR_BORDER_DIM = "#0b7d92"
-CLR_ACCENT = "#24d5e8"
-CLR_ACCENT2 = "#ff37d8"
-CLR_SUCCESS = "#2cffc7"
-CLR_WARN = "#ff4d85"
-CLR_TEXT = "#dff3ff"
-CLR_MUTED = "#97adc6"
-CLR_SOFT = "#243248"
-CLR_ENTRY_BG = "#09131e"
-CLR_GRID = "#183445"
+# 60% dominant — dark navy backgrounds
+CLR_BG = "#060c17"
+CLR_BG_2 = "#09131f"
+CLR_SURFACE = "#0c1826"
+CLR_PANEL = "#081220"
+
+# 30% secondary — structural elements, borders, text hierarchy
+CLR_BORDER = "#1b4a62"        # panel chamfer borders (muted teal, not accent-bright)
+CLR_BORDER_MAGENTA = "#3d1535"  # decorative only, very dim magenta
+CLR_BORDER_DIM = "#0c4a5e"    # waveform output track shadow fill
+CLR_SOFT = "#1e3a52"          # inactive borders, slider track bg
+CLR_GRID = "#0e2030"          # background scan-line grid
+CLR_MUTED = "#6a9ab0"         # secondary labels, captions
+CLR_TEXT = "#8ab8d0"          # body text
+
+# 10% accent — used sparingly on primary interactive / output elements
+CLR_ACCENT = "#0ecce0"        # primary cyan (OUTPUT waveform, key values, main buttons)
+CLR_ACCENT2 = "#b84098"       # secondary magenta (phase mod toggle only)
+CLR_SUCCESS = "#0dbb90"       # connected / ok state
+CLR_WARN = "#dd3355"          # error / disconnected state
+
+CLR_ENTRY_BG = "#060f1a"      # input field backgrounds
 MONO_FONT_FAMILY = "Menlo"
 
 
@@ -228,20 +234,20 @@ class BackgroundWidget(QWidget):
         grad.setColorAt(1.0, QColor("#04070d"))
         painter.fillRect(rect, grad)
 
-        painter.setOpacity(0.22)
+        painter.setOpacity(0.15)
         pen = QPen(QColor(CLR_GRID), 1)
         painter.setPen(pen)
         for y in range(16, rect.height(), 28):
             painter.drawLine(0, y, rect.width(), y)
 
-        painter.setOpacity(0.14)
+        painter.setOpacity(0.08)
         painter.setPen(QPen(QColor(CLR_BORDER), 1))
         for i in range(8):
             y = 40 + i * 112
             painter.drawLine(30, y, rect.width() - 40, y + (i % 2) * 6)
 
-        painter.setPen(QPen(QColor(CLR_BORDER_MAGENTA), 2))
-        painter.setOpacity(0.35)
+        painter.setPen(QPen(QColor("#2a4a60"), 2))
+        painter.setOpacity(0.20)
         for x, y, w in [(80, 54, 120), (rect.width() - 240, 84, 140), (140, rect.height() - 110, 180)]:
             painter.drawLine(x, y, x + w, y)
 
@@ -294,17 +300,19 @@ class CyberPanel(QWidget):
         path.closeSubpath()
 
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(CLR_BORDER), 2.0))
+        painter.setPen(QPen(QColor(CLR_BORDER), 1.5))
         painter.drawPath(path)
 
-        painter.setPen(QPen(QColor(CLR_BORDER_MAGENTA), 1.4))
-        painter.drawLine(rect.right() - 120, rect.top() + 10, rect.right() - 18, rect.top() + 10)
-        painter.drawLine(rect.left() + 18, rect.bottom() - 14, rect.left() + 120, rect.bottom() - 14)
+        # Subtle decorative accent lines — 30% colour, low opacity
+        painter.setOpacity(0.55)
+        painter.setPen(QPen(QColor("#2a6880"), 1.2))
+        painter.drawLine(rect.right() - 100, rect.top() + 10, rect.right() - 20, rect.top() + 10)
+        painter.drawLine(rect.left() + 20, rect.bottom() - 12, rect.left() + 100, rect.bottom() - 12)
 
-        painter.setOpacity(0.38)
-        painter.setPen(QPen(QColor(CLR_BORDER), 6))
-        painter.drawLine(rect.left() + 8, rect.top() + 18, rect.left() + 60, rect.top() + 18)
-        painter.drawLine(rect.right() - 42, rect.bottom() - 18, rect.right() - 18, rect.bottom() - 18)
+        painter.setOpacity(0.30)
+        painter.setPen(QPen(QColor(CLR_BORDER), 5))
+        painter.drawLine(rect.left() + 8, rect.top() + 18, rect.left() + 50, rect.top() + 18)
+        painter.drawLine(rect.right() - 38, rect.bottom() - 16, rect.right() - 18, rect.bottom() - 16)
 
         painter.setOpacity(1.0)
 
@@ -314,23 +322,26 @@ class StatCard(QFrame):
         super().__init__(parent)
         self.accent = accent
         self.setObjectName("statCard")
-        self.setMinimumHeight(150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(110)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(5)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("statTitle")
+        self.title_label.setWordWrap(False)
         layout.addWidget(self.title_label)
 
         self.value_label = QLabel("—")
         self.value_label.setObjectName("statValue")
         self.value_label.setStyleSheet(f"color: {accent};")
+        self.value_label.setWordWrap(False)
         layout.addWidget(self.value_label)
 
         self.footer_label = QLabel("")
         self.footer_label.setObjectName("statFooter")
+        self.footer_label.setWordWrap(False)
         layout.addWidget(self.footer_label)
         layout.addStretch(1)
 
@@ -596,43 +607,60 @@ class WaveformPreview(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect().adjusted(14, 10, -14, -22)
+        rect = self.rect().adjusted(12, 8, -12, -8)
+        h = rect.height()
 
         panel_grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        panel_grad.setColorAt(0.0, QColor(6, 11, 19, 210))
-        panel_grad.setColorAt(1.0, QColor(7, 9, 15, 230))
+        panel_grad.setColorAt(0.0, QColor(8, 14, 24, 215))
+        panel_grad.setColorAt(1.0, QColor(6, 10, 18, 230))
         painter.fillRect(rect, panel_grad)
 
-        painter.setPen(QPen(QColor(CLR_SOFT), 1))
+        painter.setPen(QPen(QColor(CLR_GRID), 1))
         for i in range(10):
             x = rect.left() + int(i * rect.width() / 10)
-            painter.drawLine(x, rect.top() + 12, x, rect.bottom() - 30)
-        for i in range(5):
-            y = rect.top() + 20 + int(i * (rect.height() - 60) / 4)
-            painter.drawLine(rect.left() + 20, y, rect.right() - 10, y)
+            painter.drawLine(x, rect.top() + 6, x, rect.bottom() - 20)
+        for i in range(4):
+            y = rect.top() + 6 + int(i * (h - 30) / 3)
+            painter.drawLine(rect.left() + 14, y, rect.right() - 8, y)
 
-        left = rect.left() + 98
-        right = rect.right() - 18
-        top = rect.top() + 26
-        mid = rect.top() + 108
-        bot = rect.top() + 194
+        label_col_w = 82
+        left = rect.left() + label_col_w + 8
+        right = rect.right() - 10
         track_w = max(40, right - left)
-        n_in = 32
-        in_pw = track_w / n_in
+
+        # Proportional Y zones: INPUT 8-36%, OUTPUT 52-80%, caption 88%
+        y_in_hi  = rect.top() + int(h * 0.08)
+        y_in_lo  = rect.top() + int(h * 0.36)
+        y_out_hi = rect.top() + int(h * 0.52)
+        y_out_lo = rect.top() + int(h * 0.80)
+        caption_y = rect.top() + int(h * 0.90)
+
+        in_center  = (y_in_hi + y_in_lo) // 2
+        out_center = (y_out_hi + y_out_lo) // 2
+
+        sig_font = QFont(MONO_FONT_FAMILY, 9)
+        sig_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
+        painter.setFont(sig_font)
 
         painter.setPen(QPen(QColor(CLR_MUTED), 1))
-        input_font = QFont(MONO_FONT_FAMILY, 10)
-        input_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
-        painter.setFont(input_font)
-        painter.drawText(QRectF(rect.left() + 8, top + 12, 80, 24), "INPUT")
+        painter.drawText(
+            QRectF(rect.left() + 2, in_center - 10, label_col_w - 6, 20),
+            Qt.AlignRight | Qt.AlignVCenter,
+            "INPUT",
+        )
         painter.setPen(QPen(QColor(CLR_ACCENT), 1))
-        painter.drawText(QRectF(rect.left() + 2, mid + 16, 86, 24), "OUTPUT")
+        painter.drawText(
+            QRectF(rect.left() + 2, out_center - 10, label_col_w - 6, 20),
+            Qt.AlignRight | Qt.AlignVCenter,
+            "OUTPUT",
+        )
 
-        y_in_hi, y_in_lo = top + 4, top + 52
-        y_out_hi, y_out_lo = mid + 2, mid + 58
         for y in (y_in_hi, y_in_lo, y_out_hi, y_out_lo):
             painter.setPen(QPen(QColor(CLR_GRID), 1, Qt.DashLine))
             painter.drawLine(left, y, right, y)
+
+        n_in = 32
+        in_pw = track_w / n_in
 
         painter.setPen(QPen(QColor(CLR_MUTED), 1.4))
         x = float(left)
@@ -672,19 +700,18 @@ class WaveformPreview(QWidget):
                 painter.drawLine(p1, p2)
             x += out_pw
 
-        caption_y = rect.bottom() - 6
-        painter.setPen(QPen(QColor(CLR_TEXT), 1))
-        caption_font = QFont(MONO_FONT_FAMILY, 10)
-        caption_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
+        painter.setPen(QPen(QColor(CLR_MUTED), 1))
+        caption_font = QFont(MONO_FONT_FAMILY, 9)
+        caption_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.6)
         painter.setFont(caption_font)
         painter.drawText(
-            QRectF(left, caption_y - 20, track_w, 20),
+            QRectF(left, caption_y - 14, track_w, 16),
             Qt.AlignCenter,
             (
-                f"÷{self.divider}    |    duty {self.width_frac * 100:.1f}% of input period"
-                f"    |    phase mod {fmt_freq_hz(self.mod_freq_hz)} sweep 0..T"
+                f"÷{self.divider}  |  duty {self.width_frac * 100:.1f}% of input period"
+                f"  |  phase mod {fmt_freq_hz(self.mod_freq_hz)} sweep 0..T"
                 if self.phase_mod_enabled
-                else f"÷{self.divider}    |    duty {self.width_frac * 100:.1f}% of input period    |    delay {self.delay_deg:.1f}°"
+                else f"÷{self.divider}  |  duty {self.width_frac * 100:.1f}% of input period  |  delay {self.delay_deg:.1f}°"
             ),
         )
 
@@ -802,9 +829,8 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("CONNECT")
         self.connect_btn.setObjectName("accentButton")
-        self.connect_btn.setFixedWidth(230)
         self.connect_btn.clicked.connect(self.connect_to_board)
-        row.addWidget(self.connect_btn, 1, 0, 1, 2)
+        row.addWidget(self.connect_btn, 1, 0, 1, 4)
 
         self.advanced_toggle = QPushButton("▾ ADVANCED")
         self.advanced_toggle.setCheckable(True)
@@ -869,10 +895,10 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(12)
         panel.content_layout.addLayout(grid)
 
-        self.stat_input = StatCard("INPUT FREQ", CLR_ACCENT)
-        self.stat_output = StatCard("OUTPUT FREQ", CLR_SUCCESS)
-        self.stat_duty = StatCard("DUTY CYCLE", CLR_ACCENT2)
-        self.stat_phase = StatCard("PHASE SHIFT", CLR_TEXT)
+        self.stat_input = StatCard("INPUT FREQ", CLR_TEXT)
+        self.stat_output = StatCard("OUTPUT FREQ", CLR_ACCENT)
+        self.stat_duty = StatCard("DUTY CYCLE", CLR_TEXT)
+        self.stat_phase = StatCard("PHASE SHIFT", CLR_MUTED)
 
         for col, widget in enumerate([self.stat_input, self.stat_output, self.stat_duty, self.stat_phase]):
             grid.addWidget(widget, 0, col)
@@ -965,7 +991,6 @@ class MainWindow(QMainWindow):
 
         self.apply_btn = QPushButton("APPLY NOW")
         self.apply_btn.setObjectName("accentButton")
-        self.apply_btn.setFixedWidth(230)
         self.apply_btn.clicked.connect(self.apply_now)
         layout.addWidget(self.apply_btn)
 
@@ -1000,112 +1025,124 @@ class MainWindow(QMainWindow):
                 font-family: Menlo, Monaco, 'Courier New', monospace;
                 font-size: 13px;
             }}
+            QScrollArea, QScrollArea > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
             QLabel#panelTitle {{
-                color: {CLR_ACCENT};
-                font-size: 22px;
+                color: #4a9ab5;
+                font-size: 18px;
                 font-weight: 700;
                 letter-spacing: 3px;
             }}
             QLabel#fieldLabel {{
                 color: {CLR_MUTED};
-                font-size: 13px;
-                letter-spacing: 1.2px;
+                font-size: 12px;
+                letter-spacing: 1px;
             }}
             QLabel#infoLabel {{
                 color: {CLR_MUTED};
-                font-size: 12px;
+                font-size: 11px;
             }}
             QLabel#warnStatus {{
                 color: {CLR_WARN};
-                font-size: 14px;
+                font-size: 13px;
             }}
             QLabel#okStatus {{
                 color: {CLR_SUCCESS};
-                font-size: 14px;
+                font-size: 13px;
             }}
             QLineEdit#neonEntry, QLineEdit#valueBox {{
-                background: rgba(9, 19, 30, 220);
-                border: 1px solid {CLR_BORDER};
+                background: {CLR_ENTRY_BG};
+                border: 1px solid {CLR_SOFT};
                 border-radius: 4px;
-                padding: 8px 10px;
+                padding: 7px 10px;
                 color: {CLR_TEXT};
                 selection-background-color: {CLR_ACCENT};
                 selection-color: {CLR_BG};
             }}
+            QLineEdit#neonEntry:focus, QLineEdit#valueBox:focus {{
+                border-color: {CLR_BORDER};
+            }}
             QPushButton#accentButton, QPushButton#wideAccentButton {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #129db2, stop:1 {CLR_ACCENT});
-                color: #e8fbff;
+                    stop:0 #0a8da0, stop:1 {CLR_ACCENT});
+                color: #d8f8ff;
                 border: 1px solid {CLR_ACCENT};
-                border-radius: 7px;
-                padding: 9px 20px;
-                min-height: 42px;
-                font-size: 17px;
+                border-radius: 6px;
+                padding: 8px 18px;
+                min-height: 38px;
+                font-size: 15px;
                 font-weight: 700;
                 letter-spacing: 2px;
             }}
+            QPushButton#accentButton:hover, QPushButton#wideAccentButton:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #0ca8c0, stop:1 #30e8f8);
+            }}
             QPushButton#wideAccentButton {{
-                min-height: 48px;
+                min-height: 44px;
             }}
             QPushButton#ghostButton, QPushButton#stepButton {{
-                background: rgba(10, 17, 29, 180);
+                background: {CLR_PANEL};
                 border: 1px solid {CLR_SOFT};
-                border-radius: 6px;
-                padding: 8px 12px;
-                color: {CLR_ACCENT};
+                border-radius: 5px;
+                padding: 6px 10px;
+                color: {CLR_TEXT};
             }}
             QPushButton#ghostButton:checked {{
                 border-color: {CLR_BORDER};
-                color: {CLR_TEXT};
+                color: {CLR_ACCENT};
             }}
             QPushButton#smallButton {{
-                background: rgba(8, 15, 24, 200);
+                background: {CLR_PANEL};
                 border: 1px solid {CLR_SOFT};
-                border-radius: 6px;
-                padding: 8px 12px;
-                color: {CLR_TEXT};
+                border-radius: 5px;
+                padding: 6px 10px;
+                color: {CLR_MUTED};
             }}
             QPushButton#smallButton:hover, QPushButton#ghostButton:hover, QPushButton#stepButton:hover {{
                 border-color: {CLR_BORDER};
+                color: {CLR_TEXT};
             }}
             QPushButton#toggleButton {{
                 text-align: left;
-                background: rgba(7, 12, 18, 180);
+                background: {CLR_PANEL};
                 border: 1px solid {CLR_SOFT};
-                border-radius: 6px;
-                padding: 8px 14px;
+                border-radius: 5px;
+                padding: 7px 12px;
                 color: {CLR_MUTED};
             }}
             QPushButton#toggleButton:checked {{
-                background: rgba(0, 229, 255, 40);
+                background: rgba(14, 204, 224, 20);
                 border-color: {CLR_BORDER};
                 color: {CLR_TEXT};
             }}
             QFrame#statCard {{
-                background: rgba(7, 13, 21, 210);
+                background: rgba(8, 16, 28, 200);
                 border: 1px solid {CLR_SOFT};
-                border-radius: 8px;
+                border-radius: 6px;
             }}
             QLabel#statTitle {{
                 color: {CLR_MUTED};
-                font-size: 13px;
-                letter-spacing: 1.4px;
+                font-size: 11px;
+                letter-spacing: 0.5px;
             }}
             QLabel#statValue {{
-                font-size: 26px;
+                font-size: 22px;
                 font-weight: 700;
             }}
             QLabel#statFooter {{
                 color: {CLR_MUTED};
-                font-size: 12px;
+                font-size: 11px;
             }}
             QLabel#paramTitle {{
                 color: {CLR_TEXT};
-                font-size: 16px;
+                font-size: 13px;
             }}
             QLabel#paramDetail {{
                 color: {CLR_MUTED};
-                font-size: 12px;
+                font-size: 11px;
             }}
             """
         )
