@@ -965,8 +965,8 @@ class MainWindow(QMainWindow):
             "Modulation frequency",
             MOD_FREQ_MIN_HZ,
             MOD_FREQ_MAX_HZ,
-            10.0,
-            0,
+            0.1,
+            1,
             display_suffix=" Hz",
         )
         self.mod_amp_control = ParameterSlider(
