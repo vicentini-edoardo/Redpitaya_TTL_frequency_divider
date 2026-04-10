@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
@@ -41,6 +42,7 @@ try:
         QFrame,
         QGridLayout,
         QHBoxLayout,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -169,11 +171,176 @@ class ApplyState:
     control_word: int
 
 
+_SSH_KEY_CANDIDATES = [
+    os.path.expanduser("~/.ssh/id_ed25519"),
+    os.path.expanduser("~/.ssh/id_rsa"),
+    os.path.expanduser("~/.ssh/id_ecdsa"),
+    os.path.expanduser("~/.ssh/id_dsa"),
+]
+
+
+class SshKeyHelper:
+    """One-time SSH key setup: generate a key pair and install it on the board.
+
+    All methods block and are intended to be called from a background thread.
+    """
+
+    @staticmethod
+    def default_key_path() -> str | None:
+        """Return the first existing default private key path, or None."""
+        for path in _SSH_KEY_CANDIDATES:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    @staticmethod
+    def key_installed_on_board(
+        host: str, user: str, port: int, key_path: str
+    ) -> bool:
+        """Return True when key-based auth to the board succeeds."""
+        cmd = [
+            "ssh",
+            "-p", str(port),
+            "-i", key_path,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=8",
+            "-o", "PubkeyAuthentication=yes",
+            "-o", "PasswordAuthentication=no",
+            f"{user}@{host}",
+            "echo ok",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        return result.returncode == 0
+
+    @staticmethod
+    def generate_key(key_path: str = _SSH_KEY_CANDIDATES[0]) -> None:
+        """Generate an ed25519 key pair if none exists at key_path."""
+        if os.path.isfile(key_path):
+            return
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        result = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "", "-q"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
+
+    @staticmethod
+    def _copy_key_sshpass(
+        host: str, user: str, port: int, key_path: str, password: str
+    ) -> None:
+        """Install public key via sshpass + ssh-copy-id. Raises RuntimeError."""
+        if not shutil.which("sshpass"):
+            raise RuntimeError("sshpass_unavailable")
+        pub_path = key_path + ".pub"
+        cmd = [
+            "sshpass", "-e",
+            "ssh-copy-id",
+            "-i", pub_path,
+            "-p", str(port),
+            "-o", "StrictHostKeyChecking=accept-new",
+            f"{user}@{host}",
+        ]
+        env = os.environ.copy()
+        env["SSHPASS"] = password
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, env=env
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip() or result.stdout.strip()
+                or "ssh-copy-id failed."
+            )
+
+    @staticmethod
+    def _copy_key_askpass(
+        host: str, user: str, port: int, key_path: str, password: str
+    ) -> None:
+        """Fallback: install public key via SSH_ASKPASS Python wrapper."""
+        pub_path = key_path + ".pub"
+        with open(pub_path) as fh:
+            pubkey = fh.read().strip()
+
+        # Write a tiny Python askpass script that prints the password.
+        # repr() handles all special characters safely.
+        script = (
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"sys.stdout.write({repr(password)})\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, prefix="rp_askpass_"
+        ) as tf:
+            askpass_path = tf.name
+            tf.write(script)
+        os.chmod(askpass_path, 0o700)
+
+        remote_cmd = (
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+            f"echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys && "
+            "chmod 600 ~/.ssh/authorized_keys"
+        )
+        env = os.environ.copy()
+        env["SSH_ASKPASS"] = askpass_path
+        env["SSH_ASKPASS_REQUIRE"] = "force"  # OpenSSH 8.4+
+        if "DISPLAY" not in env:
+            env["DISPLAY"] = ":0"
+
+        cmd = [
+            "ssh",
+            "-p", str(port),
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PasswordAuthentication=yes",
+            "-o", "ConnectTimeout=15",
+            f"{user}@{host}",
+            remote_cmd,
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30, env=env
+            )
+        finally:
+            os.unlink(askpass_path)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip() or result.stdout.strip()
+                or "Key installation failed."
+            )
+
+    @classmethod
+    def install_key(
+        cls,
+        host: str,
+        user: str,
+        port: int,
+        password: str,
+        key_path: str = _SSH_KEY_CANDIDATES[0],
+    ) -> None:
+        """Generate key if needed, then install it on the board (one-time)."""
+        cls.generate_key(key_path)
+        try:
+            cls._copy_key_sshpass(host, user, port, key_path, password)
+        except RuntimeError as exc:
+            if "sshpass_unavailable" in str(exc):
+                cls._copy_key_askpass(host, user, port, key_path, password)
+            else:
+                raise
+
+
 class RemoteCtl:
     def __init__(self):
         self.host = ""
         self.user = ""
         self.port = 22
+
+    # ControlMaster socket path — %h/%p/%r are OpenSSH escape sequences,
+    # NOT Python format placeholders. Pass this string verbatim to -o ControlPath=
+    _CONTROL_PATH = os.path.join(
+        tempfile.gettempdir(), "rp_ssh_%h_%p_%r.sock"
+    )
 
     def connect(self, host: str, user: str, port: int):
         if not shutil.which("ssh"):
@@ -182,16 +349,53 @@ class RemoteCtl:
         self.user = user
         self.port = port
 
+    def _ssh_base_args(self) -> list[str]:
+        """Common SSH/SCP flags: non-interactive, fast-fail, connection reuse."""
+        args = [
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=8",
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={self._CONTROL_PATH}",
+            "-o", "ControlPersist=120",
+        ]
+        key_path = SshKeyHelper.default_key_path()
+        if key_path:
+            args += ["-i", key_path]
+        return args
+
+    @staticmethod
+    def _is_auth_error(message: str) -> bool:
+        lowered = message.lower()
+        return any(
+            phrase in lowered for phrase in (
+                "permission denied",
+                "publickey",
+                "authentication failed",
+                "no supported authentication methods",
+            )
+        )
+
     def run(self, cmd: str):
-        ssh_cmd = ["ssh", "-p", str(self.port), f"{self.user}@{self.host}", cmd]
-        proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+        ssh_cmd = (
+            ["ssh", "-p", str(self.port)]
+            + self._ssh_base_args()
+            + [f"{self.user}@{self.host}", cmd]
+        )
+        proc = subprocess.run(
+            ssh_cmd, capture_output=True, text=True, timeout=10
+        )
         if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "SSH command failed.")
+            raise RuntimeError(
+                proc.stderr.strip() or proc.stdout.strip()
+                or "SSH command failed."
+            )
         return proc.stdout.strip()
 
     def helper(self, base_addr: int, command: str, *args: int):
         remote_cmd = " ".join(
-            [shlex.quote(REMOTE_BIN), shlex.quote(hex(base_addr)), shlex.quote(command)]
+            [shlex.quote(REMOTE_BIN), shlex.quote(hex(base_addr)),
+             shlex.quote(command)]
             + [shlex.quote(str(a)) for a in args]
         )
         return json.loads(self.run(remote_cmd))
@@ -199,20 +403,40 @@ class RemoteCtl:
     def upload_bitfile(self, local_path: str):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        scp_cmd = ["scp", "-P", str(self.port), local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
-        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
+        scp_cmd = (
+            ["scp", "-P", str(self.port)]
+            + self._ssh_base_args()
+            + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
+        )
+        proc = subprocess.run(
+            scp_cmd, capture_output=True, text=True, timeout=60
+        )
         if proc.returncode != 0:
-            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
+            raise RuntimeError(
+                f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}"
+            )
         self.run(f"{REMOTE_FPGAUTIL} -b {REMOTE_BITFILE}")
 
-    def upload_and_compile(self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"):
+    def upload_and_compile(
+        self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"
+    ):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        scp_cmd = ["scp", "-P", str(self.port), local_src, f"{self.user}@{self.host}:{remote_src}"]
-        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+        scp_cmd = (
+            ["scp", "-P", str(self.port)]
+            + self._ssh_base_args()
+            + [local_src, f"{self.user}@{self.host}:{remote_src}"]
+        )
+        proc = subprocess.run(
+            scp_cmd, capture_output=True, text=True, timeout=30
+        )
         if proc.returncode != 0:
-            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        compile_cmd = f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
+            raise RuntimeError(
+                f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        compile_cmd = (
+            f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
+        )
         return self.run(compile_cmd)
 
 
@@ -832,6 +1056,16 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self.connect_to_board)
         row.addWidget(self.connect_btn, 1, 0, 1, 4)
 
+        self.ssh_setup_btn = QPushButton("SETUP SSH KEY")
+        self.ssh_setup_btn.setObjectName("ghostButton")
+        self.ssh_setup_btn.setToolTip(
+            "One-time setup: generates an SSH key pair and installs it on the "
+            "board.\nRun this once from each new computer to avoid password "
+            "prompts."
+        )
+        self.ssh_setup_btn.clicked.connect(self._on_setup_ssh_key)
+        row.addWidget(self.ssh_setup_btn, 2, 0, 1, 4)
+
         self.advanced_toggle = QPushButton("▾ ADVANCED")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.setObjectName("ghostButton")
@@ -1332,9 +1566,107 @@ class MainWindow(QMainWindow):
             self._stop_poll()
             self._set_connected(False)
             self.status_label.setText("Connection failed.")
-            self._show_error("Connection error", message)
+            if RemoteCtl._is_auth_error(message):
+                reply = QMessageBox.question(
+                    self,
+                    "Authentication Failed",
+                    "SSH authentication failed — the board rejected the "
+                    "connection.\n\nThis usually means no SSH key is installed "
+                    "from this computer.\n\nRun SSH Key Setup now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply == QMessageBox.Yes:
+                    self._on_setup_ssh_key()
+            else:
+                self._show_error("Connection error", message)
 
-        self._submit_job(task, on_result=on_result, on_error=on_error, on_finished=lambda: self.connect_btn.setEnabled(True))
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_error=on_error,
+            on_finished=lambda: self.connect_btn.setEnabled(True),
+        )
+
+    def _on_setup_ssh_key(self):
+        """One-time SSH key installation wizard (runs from GUI thread)."""
+        try:
+            host, user, port, _base = self._parse_connect_params()
+        except Exception as exc:
+            self._show_error("Setup SSH key", f"Fix connection fields first:\n{exc}")
+            return
+
+        key_path = SshKeyHelper.default_key_path() or _SSH_KEY_CANDIDATES[0]
+        self.ssh_setup_btn.setEnabled(False)
+        self.status_label.setText("Checking SSH key…")
+
+        def probe_task():
+            return SshKeyHelper.key_installed_on_board(host, user, port, key_path)
+
+        def probe_done(already_works: bool):
+            if already_works:
+                self.ssh_setup_btn.setEnabled(True)
+                self.status_label.setText("SSH key already installed.")
+                QMessageBox.information(
+                    self,
+                    "SSH Key",
+                    f"Key-based auth to {user}@{host} is already working.\n"
+                    "No setup needed.",
+                )
+                return
+            _ask_password()
+
+        def probe_error(_message: str):
+            # Board may be unreachable but auth setup can still proceed.
+            _ask_password()
+
+        def _ask_password():
+            password, ok = QInputDialog.getText(
+                self,
+                "SSH Key Setup",
+                f"Enter the SSH password for {user}@{host}:\n"
+                "(used only once to install your public key)",
+                QLineEdit.Password,
+            )
+            if not ok or not password:
+                self.ssh_setup_btn.setEnabled(True)
+                self.status_label.setText("SSH key setup cancelled.")
+                return
+            _run_install(password)
+
+        def _run_install(password: str):
+            self.status_label.setText("Installing SSH key on board…")
+
+            def install_task():
+                SshKeyHelper.install_key(host, user, port, password, key_path)
+
+            def install_done(_result):
+                self.status_label.setText(
+                    "SSH key installed — click CONNECT to log in without a password."
+                )
+                QMessageBox.information(
+                    self,
+                    "SSH Key Setup Complete",
+                    f"Your public key has been installed on {user}@{host}.\n\n"
+                    "Click CONNECT — no password will be required.",
+                )
+
+            def install_error(message: str):
+                self.status_label.setText("SSH key installation failed.")
+                self._show_error("SSH Key Setup Failed", message)
+
+            self._submit_job(
+                install_task,
+                on_result=install_done,
+                on_error=install_error,
+                on_finished=lambda: self.ssh_setup_btn.setEnabled(True),
+            )
+
+        self._submit_job(
+            probe_task,
+            on_result=probe_done,
+            on_error=probe_error,
+        )
 
     def _start_poll(self):
         self.poll_timer.start()
@@ -1638,6 +1970,21 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._stop_poll()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        # Best-effort: close the SSH ControlMaster socket so the board's
+        # sshd doesn't hold an idle connection after the app exits.
+        if self.connected and self.remote.host:
+            try:
+                subprocess.run(
+                    [
+                        "ssh", "-O", "exit",
+                        "-o", f"ControlPath={RemoteCtl._CONTROL_PATH}",
+                        f"{self.remote.user}@{self.remote.host}",
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
         super().closeEvent(event)
 
 

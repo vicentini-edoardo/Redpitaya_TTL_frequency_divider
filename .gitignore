@@ -1,8 +1,45 @@
+# FPGA build artifacts
 VIVADO/
+*.bit.bin
+*.bin
+
+# Python
 __pycache__/
 *.pyc
-*.bin
-*.bit.bin
-.DS_Store
-gui.log
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
 .venv/
+venv/
+env/
+
+# Logs
+*.log
+gui.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# C build artifacts
+*.o
+*.out
+rp_pulse_ctl
+
+# Distribution / packaging
+*.tar.gz
+*.zip
