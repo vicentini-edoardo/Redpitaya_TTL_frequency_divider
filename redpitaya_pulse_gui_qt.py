@@ -338,9 +338,15 @@ class RemoteCtl:
 
     # ControlMaster socket path — %h/%p/%r are OpenSSH escape sequences,
     # NOT Python format placeholders. Pass this string verbatim to -o ControlPath=
-    _CONTROL_PATH = os.path.join(
-        tempfile.gettempdir(), "rp_ssh_%h_%p_%r.sock"
-    )
+    # Use forward slashes even on Windows so OpenSSH can parse the path.
+    _CONTROL_PATH = "/".join([
+        tempfile.gettempdir().replace("\\", "/"), "rp_ssh_%h_%p_%r.sock"
+    ])
+
+    # SSH ControlMaster relies on Unix domain sockets, which Windows OpenSSH
+    # does not support.  Skip the mux options entirely on Windows to avoid
+    # hangs caused by the unsupported socket path.
+    _USE_CONTROL_MASTER = sys.platform != "win32"
 
     def connect(self, host: str, user: str, port: int):
         if not shutil.which("ssh"):
@@ -355,10 +361,13 @@ class RemoteCtl:
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
-            "-o", "ControlMaster=auto",
-            "-o", f"ControlPath={self._CONTROL_PATH}",
-            "-o", "ControlPersist=120",
         ]
+        if self._USE_CONTROL_MASTER:
+            args += [
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={self._CONTROL_PATH}",
+                "-o", "ControlPersist=120",
+            ]
         key_path = SshKeyHelper.default_key_path()
         if key_path:
             args += ["-i", key_path]
@@ -383,7 +392,7 @@ class RemoteCtl:
             + [f"{self.user}@{self.host}", cmd]
         )
         proc = subprocess.run(
-            ssh_cmd, capture_output=True, text=True, timeout=10
+            ssh_cmd, capture_output=True, text=True, timeout=45
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -1972,7 +1981,8 @@ class MainWindow(QMainWindow):
         self.executor.shutdown(wait=False, cancel_futures=True)
         # Best-effort: close the SSH ControlMaster socket so the board's
         # sshd doesn't hold an idle connection after the app exits.
-        if self.connected and self.remote.host:
+        # ControlMaster is only used on non-Windows platforms.
+        if self.connected and self.remote.host and RemoteCtl._USE_CONTROL_MASTER:
             try:
                 subprocess.run(
                     [
