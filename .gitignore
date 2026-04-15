@@ -1,6 +1,5 @@
 # FPGA build artifacts
 VIVADO/
-*.bit.bin
 *.bin
 
 # Python
