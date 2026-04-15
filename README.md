@@ -49,6 +49,7 @@ Amplitude word from sweep fraction: `phase_mod_amp_q15 = int(sweep_fraction * 32
 | `redpitaya_pulse_gui_c_helper.py` | Desktop GUI — run on your PC |
 | `rp_pulse_ctl.c` | C helper binary — compiled on the board via the GUI |
 | `red_pitaya_top.bit.bin` | FPGA bitfile — download from [Releases](../../releases) and place next to the GUI script |
+| `rp_logbook.log` | Runtime operation/error log written by the GUI; ignored by git |
 
 ## Requirements
 
@@ -136,6 +137,14 @@ Typical write order used by the GUI:
 2. Write `PHASE_FREQ`
 3. Enable pulse output
 4. Enable phase modulation when trigger period is valid
+
+## Logbook
+
+The preferred PySide6 GUI includes a **Logbook** panel at the bottom of the window.
+It records hardware operations, skipped operations, and errors with timestamps.
+The same entries are appended to `rp_logbook.log` next to `redpitaya_pulse_gui_qt.py`
+so failed SSH, SCP, readback, apply, reset, and upload attempts can be reviewed after
+the GUI closes.
 
 ## Architecture
 

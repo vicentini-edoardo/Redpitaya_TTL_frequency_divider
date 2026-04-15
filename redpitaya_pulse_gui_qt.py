@@ -21,6 +21,7 @@ import sys
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 try:
@@ -36,6 +37,7 @@ try:
         QPainter,
         QPainterPath,
         QPen,
+        QTextCursor,
     )
     from PySide6.QtWidgets import (
         QApplication,
@@ -66,6 +68,7 @@ BASE_ADDR = 0x40600000
 REMOTE_BIN = "/root/rp_pulse_ctl"
 REMOTE_FPGAUTIL = "/opt/redpitaya/bin/fpgautil"
 REMOTE_BITFILE = "/root/red_pitaya_top.bit.bin"
+LOGBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_logbook.log")
 
 DIV_MIN = 1
 DIV_MAX = 32
@@ -978,6 +981,9 @@ class MainWindow(QMainWindow):
         self._mod_freq_dirty = False
         self._mod_amp_dirty = False
         self.waveform: WaveformPreview | None = None
+        self.logbook_view: QTextEdit | None = None
+        self._logbook_entries: list[str] = []
+        self._logbook_path = LOGBOOK_FILE
 
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(2000)
@@ -992,6 +998,8 @@ class MainWindow(QMainWindow):
         self._wire_shortcuts()
         self._apply_styles()
         self._refresh_preview_and_stats()
+        self._load_existing_logbook()
+        self._record_logbook("INFO", "Application started.")
 
     def _build_ui(self):
         scroll = QScrollArea()
@@ -1041,6 +1049,8 @@ class MainWindow(QMainWindow):
         self.mod_freq_control.setValue(10.0)
         self.mod_amp_control.setValue(0.7)
 
+        self.logbook_panel = self._build_logbook_panel()
+        root.addWidget(self.logbook_panel)
         root.addStretch(1)
 
     def _build_connection_panel(self) -> CyberPanel:
@@ -1254,6 +1264,20 @@ class MainWindow(QMainWindow):
         panel.content_layout.addStretch(1)
         return panel
 
+    def _build_logbook_panel(self) -> CyberPanel:
+        panel = CyberPanel("LOGBOOK")
+        self.logbook_view = QTextEdit()
+        self.logbook_view.setReadOnly(True)
+        self.logbook_view.setMinimumHeight(150)
+        self.logbook_view.setObjectName("logbookView")
+        panel.content_layout.addWidget(self.logbook_view)
+
+        hint = QLabel(f"Persistent log: {self._logbook_path}")
+        hint.setObjectName("infoLabel")
+        hint.setWordWrap(True)
+        panel.content_layout.addWidget(hint)
+        return panel
+
     def _wire_shortcuts(self):
         action = QAction(self)
         action.setShortcut(QKeySequence("Ctrl+Return"))
@@ -1387,6 +1411,14 @@ class MainWindow(QMainWindow):
                 color: {CLR_MUTED};
                 font-size: 11px;
             }}
+            QTextEdit#logbookView {{
+                background: {CLR_ENTRY_BG};
+                border: 1px solid {CLR_SOFT};
+                border-radius: 6px;
+                color: {CLR_TEXT};
+                padding: 8px;
+                font-size: 11px;
+            }}
             """
         )
 
@@ -1405,14 +1437,59 @@ class MainWindow(QMainWindow):
         self.advanced_widget.setVisible(checked)
         self.advanced_toggle.setText("▴ ADVANCED" if checked else "▾ ADVANCED")
 
-    def _submit_job(self, fn, on_result=None, on_error=None, on_finished=None):
+    def _record_logbook(self, level: str, message: str, details: str | None = None):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{timestamp} [{level}] {message}"
+        if details:
+            detail_text = " ".join(str(details).splitlines()).strip()
+            if detail_text:
+                line = f"{line} | {detail_text}"
+
+        self._logbook_entries.append(line)
+        self._logbook_entries = self._logbook_entries[-500:]
+
+        try:
+            with open(self._logbook_path, "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except OSError:
+            # Logging must never break hardware control.
+            pass
+
+        if self.logbook_view is not None:
+            self.logbook_view.setPlainText("\n".join(self._logbook_entries[-200:]))
+            self.logbook_view.moveCursor(QTextCursor.End)
+
+    def _load_existing_logbook(self):
+        try:
+            with open(self._logbook_path, "r", encoding="utf-8") as log_file:
+                self._logbook_entries = log_file.read().splitlines()[-200:]
+        except OSError:
+            self._logbook_entries = []
+
+        if self.logbook_view is not None and self._logbook_entries:
+            self.logbook_view.setPlainText("\n".join(self._logbook_entries))
+            self.logbook_view.moveCursor(QTextCursor.End)
+
+    def _submit_job(
+        self,
+        fn,
+        on_result=None,
+        on_error=None,
+        on_finished=None,
+        operation: str = "Background operation",
+        log_success: bool = True,
+    ):
         job_id = self._next_job_id
         self._next_job_id += 1
         self._job_handlers[job_id] = {
             "result": on_result,
             "error": on_error,
             "finished": on_finished,
+            "operation": operation,
+            "log_success": log_success,
         }
+        if log_success:
+            self._record_logbook("INFO", f"{operation} started.")
 
         future = self.executor.submit(fn)
         self._job_futures[job_id] = future
@@ -1430,12 +1507,17 @@ class MainWindow(QMainWindow):
         future.add_done_callback(_done_callback)
 
     def _handle_job_result(self, job_id: int, payload):
-        handler = self._job_handlers.get(job_id, {}).get("result")
+        job = self._job_handlers.get(job_id, {})
+        if job.get("log_success", True):
+            self._record_logbook("INFO", f"{job.get('operation', 'Background operation')} completed.")
+        handler = job.get("result")
         if handler is not None:
             handler(payload)
 
     def _handle_job_error(self, job_id: int, message: str):
-        handler = self._job_handlers.get(job_id, {}).get("error")
+        job = self._job_handlers.get(job_id, {})
+        self._record_logbook("ERROR", f"{job.get('operation', 'Background operation')} failed.", message)
+        handler = job.get("error")
         if handler is not None:
             handler(message)
 
@@ -1454,7 +1536,9 @@ class MainWindow(QMainWindow):
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
 
-    def _show_error(self, title: str, message: str):
+    def _show_error(self, title: str, message: str, *, log: bool = True):
+        if log:
+            self._record_logbook("ERROR", title, message)
         QMessageBox.critical(self, title, message)
 
     def _effective_phase_mod_enabled(self) -> bool:
@@ -1588,13 +1672,14 @@ class MainWindow(QMainWindow):
                 if reply == QMessageBox.Yes:
                     self._on_setup_ssh_key()
             else:
-                self._show_error("Connection error", message)
+                self._show_error("Connection error", message, log=False)
 
         self._submit_job(
             task,
             on_result=on_result,
             on_error=on_error,
             on_finished=lambda: self.connect_btn.setEnabled(True),
+            operation=f"Connect to {user}@{host}:{port}",
         )
 
     def _on_setup_ssh_key(self):
@@ -1640,6 +1725,7 @@ class MainWindow(QMainWindow):
             if not ok or not password:
                 self.ssh_setup_btn.setEnabled(True)
                 self.status_label.setText("SSH key setup cancelled.")
+                self._record_logbook("INFO", f"SSH key setup cancelled for {user}@{host}:{port}.")
                 return
             _run_install(password)
 
@@ -1662,19 +1748,21 @@ class MainWindow(QMainWindow):
 
             def install_error(message: str):
                 self.status_label.setText("SSH key installation failed.")
-                self._show_error("SSH Key Setup Failed", message)
+                self._show_error("SSH Key Setup Failed", message, log=False)
 
             self._submit_job(
                 install_task,
                 on_result=install_done,
                 on_error=install_error,
                 on_finished=lambda: self.ssh_setup_btn.setEnabled(True),
+                operation=f"Install SSH key on {user}@{host}:{port}",
             )
 
         self._submit_job(
             probe_task,
             on_result=probe_done,
             on_error=probe_error,
+            operation=f"Check SSH key for {user}@{host}:{port}",
         )
 
     def _start_poll(self):
@@ -1694,7 +1782,13 @@ class MainWindow(QMainWindow):
         def on_result(data):
             self._update_readback(data)
 
-        self._submit_job(task, on_result=on_result, on_finished=lambda: setattr(self, "_poll_in_flight", False))
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_finished=lambda: setattr(self, "_poll_in_flight", False),
+            operation="Poll register readback",
+            log_success=False,
+        )
 
     def upload_bitfile(self):
         if not self.connected:
@@ -1718,9 +1812,14 @@ class MainWindow(QMainWindow):
 
         def on_error(message):
             self.status_label.setText("Bitfile upload failed.")
-            self._show_error("Upload bitfile failed", message)
+            self._show_error("Upload bitfile failed", message, log=False)
 
-        self._submit_job(task, on_result=on_result, on_error=on_error)
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_error=on_error,
+            operation=f"Upload FPGA bitfile {os.path.basename(local_path)}",
+        )
 
     def upload_and_compile(self):
         if not self.connected:
@@ -1740,16 +1839,23 @@ class MainWindow(QMainWindow):
 
         def on_error(message):
             self.status_label.setText("Upload/compile failed.")
-            self._show_error("Upload/compile failed", message)
+            self._show_error("Upload/compile failed", message, log=False)
 
-        self._submit_job(task, on_result=lambda _none: self.status_label.setText("Upload & compile successful."), on_error=on_error)
+        self._submit_job(
+            task,
+            on_result=lambda _none: self.status_label.setText("Upload & compile successful."),
+            on_error=on_error,
+            operation=f"Upload and compile {os.path.basename(local_src)}",
+        )
 
     def force_freq_update(self):
         self._force_period_update = True
+        self._record_logbook("INFO", "Force frequency update requested.")
         self.read_back()
 
     def read_back(self):
         if not self.connected:
+            self._record_logbook("WARN", "Readback skipped because the board is not connected.")
             return
         self.status_label.setText("Reading registers…")
 
@@ -1762,12 +1868,18 @@ class MainWindow(QMainWindow):
 
         def on_error(message):
             self.status_label.setText("Readback failed.")
-            self._show_error("Readback failed", message)
+            self._show_error("Readback failed", message, log=False)
 
-        self._submit_job(task, on_result=on_result, on_error=on_error)
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_error=on_error,
+            operation="Read hardware registers",
+        )
 
     def soft_reset(self):
         if not self.connected:
+            self._record_logbook("WARN", "Soft reset skipped because the board is not connected.")
             return
         self.status_label.setText("Sending soft reset…")
 
@@ -1780,9 +1892,14 @@ class MainWindow(QMainWindow):
 
         def on_error(message):
             self.status_label.setText("Soft reset failed.")
-            self._show_error("Soft reset failed", message)
+            self._show_error("Soft reset failed", message, log=False)
 
-        self._submit_job(task, on_result=on_result, on_error=on_error)
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_error=on_error,
+            operation="Send soft reset",
+        )
 
     def on_divider_changed(self, value: int):
         if self.divider_control.entry.hasFocus():
@@ -1835,6 +1952,7 @@ class MainWindow(QMainWindow):
 
     def apply_now(self):
         if not self.connected:
+            self._record_logbook("WARN", "Apply skipped because the board is not connected.")
             return
         if self.auto_apply_timer.isActive():
             self.auto_apply_timer.stop()
@@ -1887,7 +2005,7 @@ class MainWindow(QMainWindow):
 
         def on_error(message):
             self.status_label.setText("Apply failed.")
-            self._show_error("Apply failed", message)
+            self._show_error("Apply failed", message, log=False)
 
         def on_finished():
             if self._pending_apply_state is not None:
@@ -1895,7 +2013,17 @@ class MainWindow(QMainWindow):
             else:
                 self._apply_in_flight = False
 
-        self._submit_job(task, on_result=on_result, on_error=on_error, on_finished=on_finished)
+        self._submit_job(
+            task,
+            on_result=on_result,
+            on_error=on_error,
+            on_finished=on_finished,
+            operation=(
+                "Apply pulse settings "
+                f"(divider={state.divider}, width={state.width_cycles}, "
+                f"delay={state.delay_cycles}, control=0x{state.control_word:X})"
+            ),
+        )
 
     def _update_readback(self, data):
         control = int(data.get("control", 0))
@@ -1977,6 +2105,7 @@ class MainWindow(QMainWindow):
         self.freq_warning_label.setText("  ".join(f"\u26a0  {text}" for text in warnings))
 
     def closeEvent(self, event):
+        self._record_logbook("INFO", "Application closing.")
         self._stop_poll()
         self.executor.shutdown(wait=False, cancel_futures=True)
         # Best-effort: close the SSH ControlMaster socket so the board's
