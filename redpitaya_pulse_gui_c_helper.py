@@ -28,7 +28,7 @@ DIV_MAX   = 32
 WIDTH_MIN = 1    # minimum hardware cycle count
 DELAY_MIN = 1    # minimum hardware cycle count
 MOD_FREQ_MIN_HZ = 0.0
-MOD_FREQ_MAX_HZ = 5_000.0
+MOD_FREQ_MAX_HZ = 25_000.0
 MOD_AMP_MIN = 0.0
 MOD_AMP_MAX = 1.0
 MOD_AMP_Q15_MAX = 32767
@@ -247,8 +247,9 @@ class App:
 
         # Internal cycle tracking — updated from hardware filt_period
         self._period_cycles = 1
-        self._period_valid = False
-        self._timeout_flag = False
+        self._period_valid  = False
+        self._period_stable = False
+        self._timeout_flag  = False
         self._phase_freq_clamped = False
         self._mod_freq_dirty = False
         self._mod_amp_dirty = False
@@ -818,7 +819,9 @@ class App:
         self.read_back()
 
     def _effective_phase_mod_enabled(self):
-        return self.phase_mod_enable_var.get() and self._period_valid and not self._timeout_flag
+        # Matches FPGA behaviour: modulation only activates after period_stable
+        # (8 consecutive valid periods), not merely period_valid.
+        return self.phase_mod_enable_var.get() and self._period_stable and not self._timeout_flag
 
     def _phase_mod_requested(self):
         return self.phase_mod_enable_var.get()
@@ -1113,13 +1116,15 @@ class App:
         phase_freq  = int(data.get("phase_freq", 0))
         phase_amp_q15 = int(data.get("phase_amp_q15", 0))
 
-        busy         = (status >> 0) & 0x1
-        period_valid = (status >> 1) & 0x1
-        timeout_flag = (status >> 2) & 0x1
-        enable       = control & CONTROL_PULSE_ENABLE
+        busy           = (status >> 0) & 0x1
+        period_valid   = (status >> 1) & 0x1
+        timeout_flag   = (status >> 2) & 0x1
+        period_stable  = int(data.get("period_stable", (status >> 3) & 0x1))
+        enable         = control & CONTROL_PULSE_ENABLE
         phase_mod_enable = (control & CONTROL_PHASE_MOD_ENABLE) != 0
-        self._period_valid = bool(period_valid)
-        self._timeout_flag = bool(timeout_flag)
+        self._period_valid  = bool(period_valid)
+        self._timeout_flag  = bool(timeout_flag)
+        self._period_stable = bool(period_stable)
 
         # Update internal period reference from filtered hardware measurement.
         # Only apply if change exceeds 5% or a force update was requested.
@@ -1150,7 +1155,7 @@ class App:
         self.stat_output_freq_var.set(fmt_freq_hz(out_freq)  if filt_period > 0 else "—")
         frac = self.width_frac_var.get()
         self.stat_duty_var.set(f"{frac * 100:.1f} %")
-        if phase_mod_enable and period_valid and not timeout_flag:
+        if phase_mod_enable and period_stable and not timeout_flag:
             self.stat_phase_var.set(fmt_freq_hz(mod_freq_hz))
         else:
             self.stat_phase_var.set(f"{self.delay_deg_var.get():.1f} °")
@@ -1158,7 +1163,7 @@ class App:
         width_frac = cycles_to_frac(width, self._period_cycles)
         delay_deg  = cycles_to_deg(delay,  self._period_cycles)
 
-        blocked_phase_mod = self.phase_mod_enable_var.get() and (not period_valid or timeout_flag)
+        blocked_phase_mod = self.phase_mod_enable_var.get() and (not period_stable or timeout_flag)
         self.enable_var.set(bool(enable))
         clamped_mod_freq_hz = clamp_mod_freq_hz(mod_freq_hz)
         should_sync_mod_freq = (phase_mod_enable or phase_freq != 0) and not self._mod_freq_dirty
@@ -1180,16 +1185,20 @@ class App:
 
         warnings = []
         if blocked_phase_mod:
-            warnings.append("Phase modulation requested, but blocked by trigger status. Static delay is active.")
+            if not period_stable:
+                warnings.append("Phase modulation waiting for period_stable (8 consecutive valid periods). Static delay active.")
+            else:
+                warnings.append("Phase modulation blocked by trigger timeout. Static delay active.")
         if not period_valid:
             warnings.append("No valid trigger period.")
         if timeout_flag:
             warnings.append("Trigger timeout detected on STATUS.bit2.")
         if self._phase_freq_clamped:
-            warnings.append("Modulation frequency was clamped to 5 kHz.")
+            warnings.append("Modulation frequency was clamped to 25 kHz.")
         self.freq_warning_text.set("  ".join(f"⚠  {text}" for text in warnings))
 
-        status_str = f"busy={busy}  valid={period_valid}  timeout={timeout_flag}"
+        status_str = (f"busy={busy}  valid={period_valid}  "
+                      f"stable={period_stable}  timeout={timeout_flag}")
 
         self.readback_text.set(
             f"control  = 0x{control:08X}    enable = {1 if enable else 0}  phase_mod = {1 if phase_mod_enable else 0}\n"

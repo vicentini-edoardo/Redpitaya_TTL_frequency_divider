@@ -12,7 +12,7 @@
  *   0x04  divider      frequency divider value (1–32)
  *   0x08  width        pulse width in 125 MHz clock cycles
  *   0x0C  delay        pulse delay in 125 MHz clock cycles
- *   0x10  status       bit 0 = busy, bit 1 = period_valid, bit 2 = timeout
+ *   0x10  status       bit 0 = busy, bit 1 = period_valid, bit 2 = timeout, bit 3 = period_stable
  *   0x14  period       last raw measured input period (cycles)
  *   0x18  period_avg   filtered measured input period (cycles)
  *   0x1C  phase_freq   DDS phase increment word
@@ -60,19 +60,22 @@ static void wr32(volatile uint8_t *base, off_t off, uint32_t val) {
 
 /* Print all registers as a JSON object. The GUI parses this output. */
 static void print_json(volatile uint8_t *base) {
-    const uint32_t raw_period = rd32(base, REG_RAW_PERIOD);
+    const uint32_t raw_period  = rd32(base, REG_RAW_PERIOD);
     const uint32_t filt_period = rd32(base, REG_FILT_PERIOD);
-    printf("{\"control\":%u,\"divider\":%u,\"width\":%u,\"delay\":%u,\"status\":%u,"
-           "\"period\":%u,\"raw_period\":%u,\"period_avg\":%u,\"filt_period\":%u,"
+    const uint32_t status      = rd32(base, REG_STATUS);
+    /* Decode individual status bits for easier parsing in the GUI */
+    const uint32_t period_stable = (status >> 3) & 0x1u;
+    printf("{\"control\":%u,\"divider\":%u,\"width\":%u,\"delay\":%u,"
+           "\"status\":%u,\"period_stable\":%u,"
+           "\"raw_period\":%u,\"period_avg\":%u,"
            "\"phase_freq\":%u,\"phase_amp_q15\":%u}\n",
            rd32(base, REG_CONTROL),
            rd32(base, REG_DIVIDER),
            rd32(base, REG_WIDTH),
            rd32(base, REG_DELAY),
-           rd32(base, REG_STATUS),
+           status,
+           period_stable,
            raw_period,
-           raw_period,
-           filt_period,
            filt_period,
            rd32(base, REG_PHASE_FREQ),
            rd32(base, REG_PHASE_AMP));
@@ -138,7 +141,8 @@ int main(int argc, char **argv) {
         } else {
             phase_freq = rd32(base, REG_PHASE_FREQ);
             phase_amp_q15 = rd32(base, REG_PHASE_AMP);
-            control    = ((uint32_t)strtoul(argv[6], NULL, 0) & 0x1u);
+            /* Keep bits 0 (enable) and 2 (phase_mod_enable) from the argument */
+            control    = ((uint32_t)strtoul(argv[6], NULL, 0) & 0x7u);
         }
 
         /* Disable output before changing parameters to avoid glitches */
@@ -148,15 +152,16 @@ int main(int argc, char **argv) {
         wr32(base, REG_DELAY, delay);
         wr32(base, REG_PHASE_FREQ, phase_freq);
         wr32(base, REG_PHASE_AMP, phase_amp_q15);
-        wr32(base, REG_CONTROL, control & 0x5u);
+        /* Mask: bit0=pulse_enable, bit2=phase_mod_enable; bit1 (soft_reset) self-clears */
+        wr32(base, REG_CONTROL, control & 0x7u);
 
         print_json(base);
 
     } else if (strcmp(argv[2], "soft_reset") == 0) {
         const uint32_t control = rd32(base, REG_CONTROL) & ~0x2u;
-        /* Pulse the reset bit (bit 1), then restore the previous control state. */
+        /* Bit 1 is self-clearing in the FPGA (single-cycle strobe) — one write is enough.
+         * Preserve bits 0 and 2 (enable / phase_mod_enable). */
         wr32(base, REG_CONTROL, control | 0x2u);
-        wr32(base, REG_CONTROL, control);
         print_json(base);
 
     } else {
