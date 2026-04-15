@@ -1,6 +1,6 @@
 # FPGA build artifacts
 VIVADO/
-*.bin
+
 
 # Python
 __pycache__/
