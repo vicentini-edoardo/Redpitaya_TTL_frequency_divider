@@ -2,9 +2,9 @@
 """
 redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya pulse generator.
 
-This is the Qt-based parallel rewrite of the original Tkinter GUI. It preserves
-the same hardware semantics and remote helper contract while replacing the
-visual layer with a custom-painted cyberpunk dashboard.
+Free-running mode: the FPGA measures the input frequency once at startup, then
+generates pulses at f_input + delta_f. The frequency offset is given as a signed
+period offset in clock cycles (period_offset register at 0x1C).
 
 Run with:  python3 redpitaya_pulse_gui_qt.py
 Requires: PySide6
@@ -70,17 +70,12 @@ REMOTE_FPGAUTIL = "/opt/redpitaya/bin/fpgautil"
 REMOTE_BITFILE = "/root/red_pitaya_top.bit.bin"
 LOGBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_logbook.log")
 
-DIV_MIN = 1
-DIV_MAX = 32
 WIDTH_MIN = 1
-DELAY_MIN = 1
-MOD_FREQ_MIN_HZ = 0.0
-MOD_FREQ_MAX_HZ = 5_000.0
-MOD_AMP_Q15_FIXED = 32767  # amplitude register unused; written as constant
+PERIOD_OFFSET_MIN = -10_000_000
+PERIOD_OFFSET_MAX =  10_000_000
 
 CONTROL_PULSE_ENABLE = 0x1
-CONTROL_SOFT_RESET = 0x2
-CONTROL_PHASE_MOD_ENABLE = 0x4
+CONTROL_SOFT_RESET   = 0x2
 
 # 60% dominant — dark navy backgrounds
 CLR_BG = "#060c17"
@@ -89,21 +84,20 @@ CLR_SURFACE = "#0c1826"
 CLR_PANEL = "#081220"
 
 # 30% secondary — structural elements, borders, text hierarchy
-CLR_BORDER = "#1b4a62"        # panel chamfer borders (muted teal, not accent-bright)
-CLR_BORDER_MAGENTA = "#3d1535"  # decorative only, very dim magenta
-CLR_BORDER_DIM = "#0c4a5e"    # waveform output track shadow fill
-CLR_SOFT = "#1e3a52"          # inactive borders, slider track bg
-CLR_GRID = "#0e2030"          # background scan-line grid
-CLR_MUTED = "#6a9ab0"         # secondary labels, captions
-CLR_TEXT = "#8ab8d0"          # body text
+CLR_BORDER = "#1b4a62"
+CLR_BORDER_MAGENTA = "#3d1535"
+CLR_BORDER_DIM = "#0c4a5e"
+CLR_SOFT = "#1e3a52"
+CLR_GRID = "#0e2030"
+CLR_MUTED = "#6a9ab0"
+CLR_TEXT = "#8ab8d0"
 
-# 10% accent — used sparingly on primary interactive / output elements
-CLR_ACCENT = "#0ecce0"        # primary cyan (OUTPUT waveform, key values, main buttons)
-CLR_ACCENT2 = "#b84098"       # secondary magenta (phase mod toggle only)
-CLR_SUCCESS = "#0dbb90"       # connected / ok state
-CLR_WARN = "#dd3355"          # error / disconnected state
+# 10% accent
+CLR_ACCENT = "#0ecce0"
+CLR_SUCCESS = "#0dbb90"
+CLR_WARN = "#dd3355"
 
-CLR_ENTRY_BG = "#060f1a"      # input field backgrounds
+CLR_ENTRY_BG = "#060f1a"
 MONO_FONT_FAMILY = "Menlo"
 
 
@@ -133,30 +127,20 @@ def cycles_to_frac(cycles: int, period_cycles: int) -> float:
     return cycles / period_cycles if period_cycles > 0 else 0.0
 
 
-def deg_to_cycles(deg: float, period_cycles: int) -> int:
-    max_delay = max(DELAY_MIN, period_cycles // 2)
-    return max(DELAY_MIN, min(max_delay, round((deg / 360.0) * period_cycles)))
+def offset_to_delta_f(offset_cycles: int, period_avg: int) -> float:
+    """Approximate frequency shift for a given period offset in clock ticks.
 
-
-def cycles_to_deg(cycles: int, period_cycles: int) -> float:
-    return (cycles / period_cycles) * 360.0 if period_cycles > 0 else 0.0
-
-
-def clamp_mod_freq_hz(freq_hz: float) -> float:
-    return max(MOD_FREQ_MIN_HZ, min(MOD_FREQ_MAX_HZ, freq_hz))
-
-
-def mod_freq_to_word(freq_hz: float) -> int:
-    return int(clamp_mod_freq_hz(freq_hz) * (2**32) / CLOCK_HZ)
-
+    delta_f ≈ -offset * f_input^2 / CLOCK_HZ = -offset * CLOCK_HZ / period^2
+    """
+    if period_avg <= 0:
+        return 0.0
+    return -offset_cycles * CLOCK_HZ / (period_avg ** 2)
 
 
 @dataclass
 class ApplyState:
-    divider: int
     width_cycles: int
-    delay_cycles: int
-    phase_freq_word: int
+    period_offset: int
     control_word: int
 
 
@@ -169,42 +153,31 @@ _SSH_KEY_CANDIDATES = [
 
 
 class SshKeyHelper:
-    """One-time SSH key setup: generate a key pair and install it on the board.
-
-    All methods block and are intended to be called from a background thread.
-    """
+    """One-time SSH key setup: generate a key pair and install it on the board."""
 
     @staticmethod
     def default_key_path() -> str | None:
-        """Return the first existing default private key path, or None."""
         for path in _SSH_KEY_CANDIDATES:
             if os.path.isfile(path):
                 return path
         return None
 
     @staticmethod
-    def key_installed_on_board(
-        host: str, user: str, port: int, key_path: str
-    ) -> bool:
-        """Return True when key-based auth to the board succeeds."""
+    def key_installed_on_board(host: str, user: str, port: int, key_path: str) -> bool:
         cmd = [
-            "ssh",
-            "-p", str(port),
-            "-i", key_path,
+            "ssh", "-p", str(port), "-i", key_path,
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
             "-o", "PubkeyAuthentication=yes",
             "-o", "PasswordAuthentication=no",
-            f"{user}@{host}",
-            "echo ok",
+            f"{user}@{host}", "echo ok",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
         return result.returncode == 0
 
     @staticmethod
     def generate_key(key_path: str = _SSH_KEY_CANDIDATES[0]) -> None:
-        """Generate an ed25519 key pair if none exists at key_path."""
         if os.path.isfile(key_path):
             return
         os.makedirs(os.path.dirname(key_path), exist_ok=True)
@@ -216,55 +189,32 @@ class SshKeyHelper:
             raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
 
     @staticmethod
-    def _copy_key_sshpass(
-        host: str, user: str, port: int, key_path: str, password: str
-    ) -> None:
-        """Install public key via sshpass + ssh-copy-id. Raises RuntimeError."""
+    def _copy_key_sshpass(host: str, user: str, port: int, key_path: str, password: str) -> None:
         if not shutil.which("sshpass"):
             raise RuntimeError("sshpass_unavailable")
         pub_path = key_path + ".pub"
         cmd = [
-            "sshpass", "-e",
-            "ssh-copy-id",
-            "-i", pub_path,
-            "-p", str(port),
+            "sshpass", "-e", "ssh-copy-id",
+            "-i", pub_path, "-p", str(port),
             "-o", "StrictHostKeyChecking=accept-new",
             f"{user}@{host}",
         ]
         env = os.environ.copy()
         env["SSHPASS"] = password
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, env=env
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if result.returncode != 0:
-            raise RuntimeError(
-                result.stderr.strip() or result.stdout.strip()
-                or "ssh-copy-id failed."
-            )
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ssh-copy-id failed.")
 
     @staticmethod
-    def _copy_key_askpass(
-        host: str, user: str, port: int, key_path: str, password: str
-    ) -> None:
-        """Fallback: install public key via SSH_ASKPASS Python wrapper."""
+    def _copy_key_askpass(host: str, user: str, port: int, key_path: str, password: str) -> None:
         pub_path = key_path + ".pub"
         with open(pub_path) as fh:
             pubkey = fh.read().strip()
-
-        # Write a tiny Python askpass script that prints the password.
-        # repr() handles all special characters safely.
-        script = (
-            "#!/usr/bin/env python3\n"
-            "import sys\n"
-            f"sys.stdout.write({repr(password)})\n"
-        )
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, prefix="rp_askpass_"
-        ) as tf:
+        script = "#!/usr/bin/env python3\nimport sys\n" + f"sys.stdout.write({repr(password)})\n"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="rp_askpass_") as tf:
             askpass_path = tf.name
             tf.write(script)
         os.chmod(askpass_path, 0o700)
-
         remote_cmd = (
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
             f"echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys && "
@@ -272,43 +222,27 @@ class SshKeyHelper:
         )
         env = os.environ.copy()
         env["SSH_ASKPASS"] = askpass_path
-        env["SSH_ASKPASS_REQUIRE"] = "force"  # OpenSSH 8.4+
+        env["SSH_ASKPASS_REQUIRE"] = "force"
         if "DISPLAY" not in env:
             env["DISPLAY"] = ":0"
-
         cmd = [
-            "ssh",
-            "-p", str(port),
+            "ssh", "-p", str(port),
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "PubkeyAuthentication=no",
             "-o", "PasswordAuthentication=yes",
             "-o", "ConnectTimeout=15",
-            f"{user}@{host}",
-            remote_cmd,
+            f"{user}@{host}", remote_cmd,
         ]
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, env=env
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         finally:
             os.unlink(askpass_path)
-
         if result.returncode != 0:
-            raise RuntimeError(
-                result.stderr.strip() or result.stdout.strip()
-                or "Key installation failed."
-            )
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Key installation failed.")
 
     @classmethod
-    def install_key(
-        cls,
-        host: str,
-        user: str,
-        port: int,
-        password: str,
-        key_path: str = _SSH_KEY_CANDIDATES[0],
-    ) -> None:
-        """Generate key if needed, then install it on the board (one-time)."""
+    def install_key(cls, host: str, user: str, port: int, password: str,
+                    key_path: str = _SSH_KEY_CANDIDATES[0]) -> None:
         cls.generate_key(key_path)
         try:
             cls._copy_key_sshpass(host, user, port, key_path, password)
@@ -324,18 +258,11 @@ class RemoteCtl:
         self.host = ""
         self.user = ""
         self.port = 22
+        self._allow_control_master = True
 
-    # ControlMaster socket path — %h/%p/%r are OpenSSH escape sequences,
-    # NOT Python format placeholders. Pass this string verbatim to -o ControlPath=
-    # Use forward slashes even on Windows so OpenSSH can parse the path.
     _CONTROL_PATH = "/".join([
         tempfile.gettempdir().replace("\\", "/"), "rp_ssh_%h_%p_%r.sock"
     ])
-
-    # SSH ControlMaster relies on Unix domain sockets, which Windows OpenSSH
-    # does not support.  Skip the mux options entirely on Windows to avoid
-    # hangs caused by the unsupported socket path.
-    _USE_CONTROL_MASTER = sys.platform != "win32"
 
     def connect(self, host: str, user: str, port: int):
         if not shutil.which("ssh"):
@@ -344,14 +271,15 @@ class RemoteCtl:
         self.user = user
         self.port = port
 
-    def _ssh_base_args(self) -> list[str]:
-        """Common SSH/SCP flags: non-interactive, fast-fail, connection reuse."""
+    def _ssh_base_args(self, *, use_control_master: bool | None = None) -> list[str]:
         args = [
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
         ]
-        if self._USE_CONTROL_MASTER:
+        if use_control_master is None:
+            use_control_master = self._allow_control_master
+        if use_control_master:
             args += [
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPath={self._CONTROL_PATH}",
@@ -365,35 +293,57 @@ class RemoteCtl:
     @staticmethod
     def _is_auth_error(message: str) -> bool:
         lowered = message.lower()
-        return any(
-            phrase in lowered for phrase in (
-                "permission denied",
-                "publickey",
-                "authentication failed",
-                "no supported authentication methods",
+        return any(phrase in lowered for phrase in (
+            "permission denied", "publickey", "authentication failed",
+            "no supported authentication methods",
+        ))
+
+    @staticmethod
+    def _is_control_master_error(message: str) -> bool:
+        lowered = message.lower()
+        return any(phrase in lowered for phrase in (
+            "bad configuration option: controlmaster",
+            "bad configuration option: controlpath",
+            "bad configuration option: controlpersist",
+            "controlsocket",
+            "unix_listener",
+        ))
+
+    def _run_subprocess_with_optional_control_master(self, cmd_builder, timeout: int):
+        last_error = None
+        for use_control_master in ([self._allow_control_master, False] if self._allow_control_master else [False]):
+            proc = subprocess.run(
+                cmd_builder(use_control_master),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-        )
+            if proc.returncode == 0:
+                if not use_control_master:
+                    self._allow_control_master = False
+                return proc
+            error_message = proc.stderr.strip() or proc.stdout.strip() or "Command failed."
+            last_error = error_message
+            if use_control_master and self._is_control_master_error(error_message):
+                self._allow_control_master = False
+                continue
+            break
+        raise RuntimeError(last_error or "Command failed.")
 
     def run(self, cmd: str):
-        ssh_cmd = (
-            ["ssh", "-p", str(self.port)]
-            + self._ssh_base_args()
-            + [f"{self.user}@{self.host}", cmd]
+        proc = self._run_subprocess_with_optional_control_master(
+            lambda use_control_master: (
+                ["ssh", "-p", str(self.port)]
+                + self._ssh_base_args(use_control_master=use_control_master)
+                + [f"{self.user}@{self.host}", cmd]
+            ),
+            timeout=45,
         )
-        proc = subprocess.run(
-            ssh_cmd, capture_output=True, text=True, timeout=45
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                proc.stderr.strip() or proc.stdout.strip()
-                or "SSH command failed."
-            )
         return proc.stdout.strip()
 
-    def helper(self, base_addr: int, command: str, *args: int):
+    def helper(self, base_addr: int, command: str, *args):
         remote_cmd = " ".join(
-            [shlex.quote(REMOTE_BIN), shlex.quote(hex(base_addr)),
-             shlex.quote(command)]
+            [shlex.quote(REMOTE_BIN), shlex.quote(hex(base_addr)), shlex.quote(command)]
             + [shlex.quote(str(a)) for a in args]
         )
         return json.loads(self.run(remote_cmd))
@@ -401,40 +351,34 @@ class RemoteCtl:
     def upload_bitfile(self, local_path: str):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        scp_cmd = (
-            ["scp", "-P", str(self.port)]
-            + self._ssh_base_args()
-            + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
-        )
-        proc = subprocess.run(
-            scp_cmd, capture_output=True, text=True, timeout=60
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        try:
+            self._run_subprocess_with_optional_control_master(
+                lambda use_control_master: (
+                    ["scp", "-P", str(self.port)]
+                    + self._ssh_base_args(use_control_master=use_control_master)
+                    + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
+                ),
+                timeout=60,
             )
+        except RuntimeError as exc:
+            raise RuntimeError(f"scp failed: {exc}") from exc
         self.run(f"{REMOTE_FPGAUTIL} -b {REMOTE_BITFILE}")
 
-    def upload_and_compile(
-        self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"
-    ):
+    def upload_and_compile(self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        scp_cmd = (
-            ["scp", "-P", str(self.port)]
-            + self._ssh_base_args()
-            + [local_src, f"{self.user}@{self.host}:{remote_src}"]
-        )
-        proc = subprocess.run(
-            scp_cmd, capture_output=True, text=True, timeout=30
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        try:
+            self._run_subprocess_with_optional_control_master(
+                lambda use_control_master: (
+                    ["scp", "-P", str(self.port)]
+                    + self._ssh_base_args(use_control_master=use_control_master)
+                    + [local_src, f"{self.user}@{self.host}:{remote_src}"]
+                ),
+                timeout=30,
             )
-        compile_cmd = (
-            f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
-        )
+        except RuntimeError as exc:
+            raise RuntimeError(f"scp failed: {exc}") from exc
+        compile_cmd = f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
         return self.run(compile_cmd)
 
 
@@ -448,7 +392,6 @@ class BackgroundWidget(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-
         rect = self.rect()
         grad = QLinearGradient(0, 0, rect.width(), rect.height())
         grad.setColorAt(0.0, QColor(CLR_BG))
@@ -525,7 +468,6 @@ class CyberPanel(QWidget):
         painter.setPen(QPen(QColor(CLR_BORDER), 1.5))
         painter.drawPath(path)
 
-        # Subtle decorative accent lines — 30% colour, low opacity
         painter.setOpacity(0.55)
         painter.setPen(QPen(QColor("#2a6880"), 1.2))
         painter.drawLine(rect.right() - 100, rect.top() + 10, rect.right() - 20, rect.top() + 10)
@@ -583,73 +525,13 @@ class ToggleButton(QPushButton):
         self.setObjectName("toggleButton")
 
 
-class DividerControl(QWidget):
-    valueChanged = Signal(int)
-
-    def __init__(self, minimum: int, maximum: int, parent=None):
-        super().__init__(parent)
-        self.minimum = minimum
-        self.maximum = maximum
-        self._value = minimum
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        self.dec_btn = QPushButton("‹")
-        self.inc_btn = QPushButton("›")
-        for btn in (self.dec_btn, self.inc_btn):
-            btn.setFixedSize(44, 40)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setObjectName("stepButton")
-            layout.addWidget(btn)
-
-        self.entry = QLineEdit(str(minimum))
-        self.entry.setAlignment(Qt.AlignCenter)
-        self.entry.setValidator(QIntValidator(minimum, maximum, self))
-        self.entry.setFixedWidth(86)
-        self.entry.setObjectName("valueBox")
-        layout.insertWidget(1, self.entry)
-
-        self.dec_btn.clicked.connect(lambda: self.setValue(self._value - 1))
-        self.inc_btn.clicked.connect(lambda: self.setValue(self._value + 1))
-        self.entry.editingFinished.connect(self._emit_entry)
-
-    def _emit_entry(self):
-        try:
-            value = int(self.entry.text())
-        except ValueError:
-            value = self._value
-        self.setValue(value)
-
-    def value(self) -> int:
-        return self._value
-
-    def setValue(self, value: int):
-        value = max(self.minimum, min(self.maximum, int(value)))
-        if value == self._value and self.entry.text() == str(value):
-            return
-        self._value = value
-        self.entry.setText(str(value))
-        self.valueChanged.emit(value)
-
-
 class ParameterSlider(QWidget):
     valueChanged = Signal(float)
     valueCommitted = Signal(float)
 
-    def __init__(
-        self,
-        title: str,
-        minimum: float,
-        maximum: float,
-        step: float,
-        decimals: int,
-        suffix_label: str = "",
-        display_factor: float = 1.0,
-        display_suffix: str = "",
-        parent=None,
-    ):
+    def __init__(self, title: str, minimum: float, maximum: float, step: float,
+                 decimals: int, suffix_label: str = "", display_factor: float = 1.0,
+                 display_suffix: str = "", parent=None):
         super().__init__(parent)
         self.minimum = minimum
         self.maximum = maximum
@@ -805,25 +687,14 @@ class WaveformPreview(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(180)
         self.setMaximumHeight(220)
-        self.divider = 1
-        self.width_frac = 0.5
-        self.delay_deg = 0.0
-        self.phase_mod_enabled = False
-        self.mod_freq_hz = 0.0
+        self.width_frac = 0.1
+        self.offset_cycles = 0
+        self.period_avg = 500
 
-    def set_state(
-        self,
-        divider: int,
-        width_frac: float,
-        delay_deg: float,
-        phase_mod_enabled: bool = False,
-        mod_freq_hz: float = 0.0,
-    ):
-        self.divider = max(1, divider)
+    def set_state(self, width_frac: float, offset_cycles: int, period_avg: int):
         self.width_frac = max(0.001, min(0.999, width_frac))
-        self.delay_deg = max(0.0, min(180.0, delay_deg))
-        self.phase_mod_enabled = phase_mod_enabled
-        self.mod_freq_hz = max(0.0, mod_freq_hz)
+        self.offset_cycles = offset_cycles
+        self.period_avg = max(1, period_avg)
         self.update()
 
     def paintEvent(self, _event):
@@ -850,7 +721,6 @@ class WaveformPreview(QWidget):
         right = rect.right() - 10
         track_w = max(40, right - left)
 
-        # Proportional Y zones: INPUT 8-36%, OUTPUT 52-80%, caption 88%
         y_in_hi  = rect.top() + int(h * 0.08)
         y_in_lo  = rect.top() + int(h * 0.36)
         y_out_hi = rect.top() + int(h * 0.52)
@@ -865,17 +735,11 @@ class WaveformPreview(QWidget):
         painter.setFont(sig_font)
 
         painter.setPen(QPen(QColor(CLR_MUTED), 1))
-        painter.drawText(
-            QRectF(rect.left() + 2, in_center - 10, label_col_w - 6, 20),
-            Qt.AlignRight | Qt.AlignVCenter,
-            "INPUT",
-        )
+        painter.drawText(QRectF(rect.left() + 2, in_center - 10, label_col_w - 6, 20),
+                         Qt.AlignRight | Qt.AlignVCenter, "INPUT")
         painter.setPen(QPen(QColor(CLR_ACCENT), 1))
-        painter.drawText(
-            QRectF(rect.left() + 2, out_center - 10, label_col_w - 6, 20),
-            Qt.AlignRight | Qt.AlignVCenter,
-            "OUTPUT",
-        )
+        painter.drawText(QRectF(rect.left() + 2, out_center - 10, label_col_w - 6, 20),
+                         Qt.AlignRight | Qt.AlignVCenter, "OUTPUT")
 
         for y in (y_in_hi, y_in_lo, y_out_hi, y_out_lo):
             painter.setPen(QPen(QColor(CLR_GRID), 1, Qt.DashLine))
@@ -889,29 +753,26 @@ class WaveformPreview(QWidget):
         for _ in range(n_in):
             mid_x = x + in_pw / 2
             points = [
-                QPointF(x, y_in_lo),
-                QPointF(x, y_in_hi),
-                QPointF(mid_x, y_in_hi),
-                QPointF(mid_x, y_in_lo),
+                QPointF(x, y_in_lo), QPointF(x, y_in_hi),
+                QPointF(mid_x, y_in_hi), QPointF(mid_x, y_in_lo),
                 QPointF(x + in_pw, y_in_lo),
             ]
             for p1, p2 in zip(points, points[1:]):
                 painter.drawLine(p1, p2)
             x += in_pw
 
-        out_pw = in_pw * self.divider
-        n_out = max(1, int(n_in / self.divider))
+        # Output period is slightly different from input period
+        out_pw_raw = in_pw * (1.0 + self.offset_cycles / max(1, self.period_avg))
+        out_pw = max(4.0, out_pw_raw)
+        n_out = max(1, int(track_w / out_pw))
         x = float(left)
-        delay_frac = self.delay_deg / 360.0
         for _ in range(n_out):
-            d_px = out_pw * delay_frac
             h_px = out_pw * self.width_frac
             points = [
                 QPointF(x, y_out_lo),
-                QPointF(x + d_px, y_out_lo),
-                QPointF(x + d_px, y_out_hi),
-                QPointF(x + d_px + h_px, y_out_hi),
-                QPointF(x + d_px + h_px, y_out_lo),
+                QPointF(x, y_out_hi),
+                QPointF(x + h_px, y_out_hi),
+                QPointF(x + h_px, y_out_lo),
                 QPointF(x + out_pw, y_out_lo),
             ]
             painter.setPen(QPen(QColor(CLR_BORDER_DIM), 5))
@@ -926,15 +787,12 @@ class WaveformPreview(QWidget):
         caption_font = QFont(MONO_FONT_FAMILY, 9)
         caption_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.6)
         painter.setFont(caption_font)
+        delta_f = offset_to_delta_f(self.offset_cycles, self.period_avg)
+        sign = "+" if delta_f >= 0 else ""
         painter.drawText(
             QRectF(left, caption_y - 14, track_w, 16),
             Qt.AlignCenter,
-            (
-                f"÷{self.divider}  |  duty {self.width_frac * 100:.1f}% of input period"
-                f"  |  freq shift +{fmt_freq_hz(self.mod_freq_hz)}"
-                if self.phase_mod_enabled
-                else f"÷{self.divider}  |  duty {self.width_frac * 100:.1f}% of input period  |  delay {self.delay_deg:.1f}°"
-            ),
+            f"duty {self.width_frac * 100:.1f}%  |  offset {self.offset_cycles:+d} cyc  |  Δf ≈ {sign}{fmt_freq_hz(delta_f)}",
         )
 
 
@@ -942,8 +800,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Red Pitaya Pulse Control")
-        self.resize(1240, 760)
-        self.setMinimumSize(980, 620)
+        self.resize(1100, 700)
+        self.setMinimumSize(860, 560)
 
         self.remote = RemoteCtl()
         self.connected = False
@@ -957,14 +815,11 @@ class MainWindow(QMainWindow):
         self._job_handlers: dict[int, dict[str, object]] = {}
         self._job_futures: dict[int, Future] = {}
         self._period_cycles = 1
-        self._force_period_update = False
+        self._period_valid = False
+        self._timeout_flag = False
         self._apply_in_flight = False
         self._pending_apply_state: ApplyState | None = None
         self._poll_in_flight = False
-        self._period_valid = False
-        self._timeout_flag = False
-        self._phase_freq_clamped = False
-        self._mod_freq_dirty = False
         self.waveform: WaveformPreview | None = None
         self.logbook_view: QTextEdit | None = None
         self._logbook_entries: list[str] = []
@@ -1020,18 +875,13 @@ class MainWindow(QMainWindow):
         controls_col = QVBoxLayout()
         controls_col.setSpacing(16)
         self.pulse_controls_panel = self._build_pulse_controls_panel()
-        self.modulation_panel = self._build_modulation_panel()
         self.wave_panel = self._build_waveform_panel()
         controls_col.addWidget(self.pulse_controls_panel, 1)
-        controls_col.addWidget(self.modulation_panel, 1)
         mid_row.addLayout(controls_col, 11)
         mid_row.addWidget(self.wave_panel, 10)
 
-        # Initialize control defaults only after every dependent widget exists.
-        self.divider_control.setValue(1)
-        self.width_control.setValue(0.5)
-        self.delay_control.setValue(0.0)
-        self.mod_freq_control.setValue(10.0)
+        self.width_control.setValue(0.1)
+        self.offset_entry.setText("0")
 
         self.logbook_panel = self._build_logbook_panel()
         root.addWidget(self.logbook_panel)
@@ -1062,9 +912,7 @@ class MainWindow(QMainWindow):
         self.ssh_setup_btn = QPushButton("SETUP SSH KEY")
         self.ssh_setup_btn.setObjectName("ghostButton")
         self.ssh_setup_btn.setToolTip(
-            "One-time setup: generates an SSH key pair and installs it on the "
-            "board.\nRun this once from each new computer to avoid password "
-            "prompts."
+            "One-time setup: generates an SSH key pair and installs it on the board."
         )
         self.ssh_setup_btn.clicked.connect(self._on_setup_ssh_key)
         row.addWidget(self.ssh_setup_btn, 2, 0, 1, 4)
@@ -1105,13 +953,11 @@ class MainWindow(QMainWindow):
         self.soft_reset_btn = self._make_small_button("SOFT RESET", self.soft_reset)
         self.upload_compile_btn = self._make_small_button("UPLOAD & COMPILE", self.upload_and_compile)
         self.upload_bitfile_btn = self._make_small_button("UPLOAD BITFILE", self.upload_bitfile)
-        self.force_freq_btn = self._make_small_button("FORCE FREQ UPDATE", self.force_freq_update)
 
         adv.addWidget(self.readback_btn, 1, 0, 1, 1)
         adv.addWidget(self.soft_reset_btn, 1, 1, 1, 1)
         adv.addWidget(self.upload_compile_btn, 1, 2, 1, 2)
         adv.addWidget(self.upload_bitfile_btn, 1, 4, 1, 1)
-        adv.addWidget(self.force_freq_btn, 1, 5, 1, 1)
 
         self.info_label = QLabel("Connect to read input frequency from hardware.")
         self.info_label.setWordWrap(True)
@@ -1132,12 +978,12 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(12)
         panel.content_layout.addLayout(grid)
 
-        self.stat_input = StatCard("INPUT FREQ", CLR_TEXT)
-        self.stat_output = StatCard("OUTPUT FREQ", CLR_ACCENT)
-        self.stat_duty = StatCard("DUTY CYCLE", CLR_TEXT)
-        self.stat_phase = StatCard("PHASE SHIFT", CLR_MUTED)
+        self.stat_input  = StatCard("INPUT FREQ",    CLR_TEXT)
+        self.stat_output = StatCard("OUTPUT FREQ",   CLR_ACCENT)
+        self.stat_duty   = StatCard("DUTY CYCLE",    CLR_TEXT)
+        self.stat_status = StatCard("FREERUN STATUS", CLR_MUTED)
 
-        for col, widget in enumerate([self.stat_input, self.stat_output, self.stat_duty, self.stat_phase]):
+        for col, widget in enumerate([self.stat_input, self.stat_output, self.stat_duty, self.stat_status]):
             grid.addWidget(widget, 0, col)
             grid.setColumnStretch(col, 1)
 
@@ -1147,28 +993,38 @@ class MainWindow(QMainWindow):
         panel = CyberPanel("PULSE CONTROLS")
         layout = panel.content_layout
 
-        divider_row = QWidget()
-        divider_layout = QGridLayout(divider_row)
-        divider_layout.setContentsMargins(0, 0, 0, 0)
-        divider_layout.setHorizontalSpacing(12)
-        divider_layout.setVerticalSpacing(4)
-        divider_layout.addWidget(self._make_field_label("Divider"), 0, 0)
-        self.divider_control = DividerControl(DIV_MIN, DIV_MAX)
-        divider_layout.addWidget(self.divider_control, 0, 1)
-        layout.addWidget(divider_row)
-
         self.width_control = ParameterSlider(
             "Width (duty cycle)",
-            0.0,
-            1.0,
-            0.05,
-            1,
-            display_factor=100.0,
-            display_suffix="%",
+            0.0, 1.0, 0.05, 1,
+            display_factor=100.0, display_suffix="%",
         )
-        self.delay_control = ParameterSlider("Delay (phase 0–180°)", 0.0, 180.0, 5.0, 1)
         layout.addWidget(self.width_control)
-        layout.addWidget(self.delay_control)
+
+        # Period offset — signed integer entry
+        offset_row = QWidget()
+        offset_layout = QGridLayout(offset_row)
+        offset_layout.setContentsMargins(0, 0, 0, 0)
+        offset_layout.setHorizontalSpacing(12)
+        offset_layout.setVerticalSpacing(4)
+
+        offset_title = QLabel("Period offset (cycles)")
+        offset_title.setObjectName("paramTitle")
+        offset_layout.addWidget(offset_title, 0, 0)
+
+        self.offset_entry = QLineEdit("0")
+        self.offset_entry.setAlignment(Qt.AlignCenter)
+        self.offset_entry.setObjectName("valueBox")
+        self.offset_entry.setFixedWidth(120)
+        self.offset_entry.setValidator(
+            QIntValidator(PERIOD_OFFSET_MIN, PERIOD_OFFSET_MAX, self)
+        )
+        offset_layout.addWidget(self.offset_entry, 0, 1)
+
+        self.offset_detail = QLabel("")
+        self.offset_detail.setObjectName("paramDetail")
+        offset_layout.addWidget(self.offset_detail, 1, 0, 1, 2)
+
+        layout.addWidget(offset_row)
 
         toggles = QHBoxLayout()
         toggles.setSpacing(12)
@@ -1180,34 +1036,6 @@ class MainWindow(QMainWindow):
         toggles.addStretch(1)
         layout.addLayout(toggles)
 
-        layout.addStretch(1)
-
-        self.divider_control.valueChanged.connect(self.on_divider_changed)
-        self.width_control.valueChanged.connect(self.on_width_changed)
-        self.delay_control.valueChanged.connect(self.on_delay_changed)
-        self.width_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
-        self.delay_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
-        self.enable_toggle.toggled.connect(lambda _checked: self.maybe_auto_apply())
-
-        return panel
-
-    def _build_modulation_panel(self) -> CyberPanel:
-        panel = CyberPanel("MODULATION")
-        layout = panel.content_layout
-
-        self.phase_mod_toggle = ToggleButton("Enable frequency shift")
-        layout.addWidget(self.phase_mod_toggle)
-
-        self.mod_freq_control = ParameterSlider(
-            "Modulation frequency",
-            MOD_FREQ_MIN_HZ,
-            MOD_FREQ_MAX_HZ,
-            0.1,
-            1,
-            display_suffix=" Hz",
-        )
-        layout.addWidget(self.mod_freq_control)
-
         self.apply_btn = QPushButton("APPLY NOW")
         self.apply_btn.setObjectName("accentButton")
         self.apply_btn.clicked.connect(self.apply_now)
@@ -1215,9 +1043,10 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        self.mod_freq_control.valueChanged.connect(self.on_mod_freq_changed)
-        self.mod_freq_control.valueCommitted.connect(lambda _value: self.maybe_auto_apply())
-        self.phase_mod_toggle.toggled.connect(self.on_phase_mod_toggled)
+        self.width_control.valueChanged.connect(self.on_width_changed)
+        self.width_control.valueCommitted.connect(lambda _v: self.maybe_auto_apply())
+        self.offset_entry.editingFinished.connect(self.on_offset_changed)
+        self.enable_toggle.toggled.connect(lambda _checked: self.maybe_auto_apply())
 
         return panel
 
@@ -1310,9 +1139,6 @@ class MainWindow(QMainWindow):
             QPushButton#accentButton:hover, QPushButton#wideAccentButton:hover {{
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #0ca8c0, stop:1 #30e8f8);
-            }}
-            QPushButton#wideAccentButton {{
-                min-height: 44px;
             }}
             QPushButton#ghostButton, QPushButton#stepButton {{
                 background: {CLR_PANEL};
@@ -1408,17 +1234,13 @@ class MainWindow(QMainWindow):
             detail_text = " ".join(str(details).splitlines()).strip()
             if detail_text:
                 line = f"{line} | {detail_text}"
-
         self._logbook_entries.append(line)
         self._logbook_entries = self._logbook_entries[-500:]
-
         try:
             with open(self._logbook_path, "a", encoding="utf-8") as log_file:
                 log_file.write(line + "\n")
         except OSError:
-            # Logging must never break hardware control.
             pass
-
         if self.logbook_view is not None:
             self.logbook_view.setPlainText("\n".join(self._logbook_entries[-200:]))
             self.logbook_view.moveCursor(QTextCursor.End)
@@ -1429,28 +1251,17 @@ class MainWindow(QMainWindow):
                 self._logbook_entries = log_file.read().splitlines()[-200:]
         except OSError:
             self._logbook_entries = []
-
         if self.logbook_view is not None and self._logbook_entries:
             self.logbook_view.setPlainText("\n".join(self._logbook_entries))
             self.logbook_view.moveCursor(QTextCursor.End)
 
-    def _submit_job(
-        self,
-        fn,
-        on_result=None,
-        on_error=None,
-        on_finished=None,
-        operation: str = "Background operation",
-        log_success: bool = True,
-    ):
+    def _submit_job(self, fn, on_result=None, on_error=None, on_finished=None,
+                    operation: str = "Background operation", log_success: bool = True):
         job_id = self._next_job_id
         self._next_job_id += 1
         self._job_handlers[job_id] = {
-            "result": on_result,
-            "error": on_error,
-            "finished": on_finished,
-            "operation": operation,
-            "log_success": log_success,
+            "result": on_result, "error": on_error, "finished": on_finished,
+            "operation": operation, "log_success": log_success,
         }
         if log_success:
             self._record_logbook("INFO", f"{operation} started.")
@@ -1461,7 +1272,7 @@ class MainWindow(QMainWindow):
         def _done_callback(done_future: Future):
             try:
                 result = done_future.result()
-            except Exception as exc:  # pragma: no cover - UI worker error path
+            except Exception as exc:
                 self.job_signals.error.emit(job_id, str(exc))
             else:
                 self.job_signals.result.emit(job_id, result)
@@ -1505,80 +1316,54 @@ class MainWindow(QMainWindow):
             self._record_logbook("ERROR", title, message)
         QMessageBox.critical(self, title, message)
 
-    def _effective_phase_mod_enabled(self) -> bool:
-        return self.phase_mod_toggle.isChecked() and self._period_valid and not self._timeout_flag
-
-    def _phase_mod_requested_state(self) -> bool:
-        return self.phase_mod_toggle.isChecked()
-
-    def _update_modulation_controls(self):
-        effective_phase_mod = self._effective_phase_mod_enabled()
-        self.delay_control.setEnabled(not effective_phase_mod)
-        self.mod_freq_control.setEnabled(self._phase_mod_requested_state())
+    def _get_offset_cycles(self) -> int:
+        try:
+            return max(PERIOD_OFFSET_MIN, min(PERIOD_OFFSET_MAX, int(self.offset_entry.text())))
+        except ValueError:
+            return 0
 
     def _refresh_preview_and_stats(self):
-        divider = self.divider_control.value()
         width = self.width_control.value()
-        delay = self.delay_control.value()
-        mod_freq_hz = clamp_mod_freq_hz(self.mod_freq_control.value())
-        effective_phase_mod = self._effective_phase_mod_enabled()
+        offset = self._get_offset_cycles()
+
         if self.waveform is not None:
-            self.waveform.set_state(divider, width, delay, effective_phase_mod, mod_freq_hz)
+            self.waveform.set_state(width, offset, self._period_cycles)
+
         self.stat_duty.set_value(f"{width * 100:.1f} %")
-        if effective_phase_mod:
-            self.stat_phase.set_value(fmt_freq_hz(mod_freq_hz))
-            self.stat_phase.set_footer("freq shift Δf")
-        else:
-            self.stat_phase.set_value(f"{delay:.1f} °")
-            self.stat_phase.set_footer("input referenced")
+        self.stat_duty.set_footer("of output period")
 
         width_cycles = frac_to_cycles(width, self._period_cycles)
-        delay_cycles = deg_to_cycles(delay, self._period_cycles)
-        phase_word = mod_freq_to_word(mod_freq_hz)
-        self.width_control.set_detail(f"{width * 100:.1f}%   {fmt_time_s(width_cycles / CLOCK_HZ)}")
-        if effective_phase_mod:
-            self.delay_control.set_detail("ignored while phase modulation is active")
-        else:
-            self.delay_control.set_detail(fmt_time_s(delay_cycles / CLOCK_HZ))
-        self.mod_freq_control.set_detail(f"DDS word 0x{phase_word:08X}   TTL ref {fmt_freq_hz(mod_freq_hz)}")
-        self._update_modulation_controls()
+        self.width_control.set_detail(
+            f"{width * 100:.1f}%   {fmt_time_s(width_cycles / CLOCK_HZ)}"
+        )
+
+        delta_f = offset_to_delta_f(offset, self._period_cycles)
+        sign = "+" if delta_f >= 0 else ""
+        self.offset_detail.setText(
+            f"Δf ≈ {sign}{fmt_freq_hz(delta_f)}  "
+            f"(output_period ≈ {self._period_cycles + offset} cycles)"
+        )
         self._update_info_text()
 
     def _update_info_text(self):
         if self._period_cycles <= 1:
             self.info_label.setText("Connect to read input frequency from hardware.")
             return
-        divider = max(DIV_MIN, min(DIV_MAX, self.divider_control.value()))
         input_hz = CLOCK_HZ / self._period_cycles
-        divided_hz = input_hz / divider
-        input_period_s = self._period_cycles / CLOCK_HZ
-        mode_text = (
-            f"Frequency shift: +{fmt_freq_hz(clamp_mod_freq_hz(self.mod_freq_control.value()))}, output at f_tip + Δf"
-            if self._effective_phase_mod_enabled()
-            else "Static delay mode"
-        )
+        offset = self._get_offset_cycles()
+        out_period = max(200, self._period_cycles + offset)
+        out_hz = CLOCK_HZ / out_period
         self.info_label.setText(
-            f"Input: {fmt_freq_hz(input_hz)}  |  Divider: ÷{divider}  |  Divided: {fmt_freq_hz(divided_hz)}\n"
-            f"Width/Delay ref: input period {fmt_time_s(input_period_s)}  ({self._period_cycles} cycles)  |  {mode_text}"
+            f"Input: {fmt_freq_hz(input_hz)}  ({self._period_cycles} cycles)  |  "
+            f"Output: {fmt_freq_hz(out_hz)}  (period {out_period} cycles)"
         )
 
     def _capture_apply_state(self) -> ApplyState:
-        divider = max(DIV_MIN, min(DIV_MAX, self.divider_control.value()))
         frac = max(0.0, min(1.0, self.width_control.value()))
-        deg = max(0.0, min(180.0, self.delay_control.value()))
-        mod_freq_hz = clamp_mod_freq_hz(self.mod_freq_control.value())
-        control_word = 0
-        if self.enable_toggle.isChecked():
-            control_word |= CONTROL_PULSE_ENABLE
-        if self._phase_mod_requested_state():
-            control_word |= CONTROL_PHASE_MOD_ENABLE
-        return ApplyState(
-            divider=divider,
-            width_cycles=frac_to_cycles(frac, self._period_cycles),
-            delay_cycles=deg_to_cycles(deg, self._period_cycles),
-            phase_freq_word=mod_freq_to_word(mod_freq_hz),
-            control_word=control_word,
-        )
+        width_cycles = frac_to_cycles(frac, self._period_cycles)
+        offset = self._get_offset_cycles()
+        control_word = CONTROL_PULSE_ENABLE if self.enable_toggle.isChecked() else 0
+        return ApplyState(width_cycles=width_cycles, period_offset=offset, control_word=control_word)
 
     def _parse_connect_params(self):
         host = self.host_edit.text().strip()
@@ -1619,13 +1404,9 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Connection failed.")
             if RemoteCtl._is_auth_error(message):
                 reply = QMessageBox.question(
-                    self,
-                    "Authentication Failed",
-                    "SSH authentication failed — the board rejected the "
-                    "connection.\n\nThis usually means no SSH key is installed "
-                    "from this computer.\n\nRun SSH Key Setup now?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
+                    self, "Authentication Failed",
+                    "SSH authentication failed.\n\nRun SSH Key Setup now?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
                 )
                 if reply == QMessageBox.Yes:
                     self._on_setup_ssh_key()
@@ -1633,15 +1414,12 @@ class MainWindow(QMainWindow):
                 self._show_error("Connection error", message, log=False)
 
         self._submit_job(
-            task,
-            on_result=on_result,
-            on_error=on_error,
+            task, on_result=on_result, on_error=on_error,
             on_finished=lambda: self.connect_btn.setEnabled(True),
             operation=f"Connect to {user}@{host}:{port}",
         )
 
     def _on_setup_ssh_key(self):
-        """One-time SSH key installation wizard (runs from GUI thread)."""
         try:
             host, user, port, _base = self._parse_connect_params()
         except Exception as exc:
@@ -1659,31 +1437,23 @@ class MainWindow(QMainWindow):
             if already_works:
                 self.ssh_setup_btn.setEnabled(True)
                 self.status_label.setText("SSH key already installed.")
-                QMessageBox.information(
-                    self,
-                    "SSH Key",
-                    f"Key-based auth to {user}@{host} is already working.\n"
-                    "No setup needed.",
-                )
+                QMessageBox.information(self, "SSH Key",
+                    f"Key-based auth to {user}@{host} is already working.")
                 return
             _ask_password()
 
         def probe_error(_message: str):
-            # Board may be unreachable but auth setup can still proceed.
             _ask_password()
 
         def _ask_password():
             password, ok = QInputDialog.getText(
-                self,
-                "SSH Key Setup",
-                f"Enter the SSH password for {user}@{host}:\n"
-                "(used only once to install your public key)",
+                self, "SSH Key Setup",
+                f"Enter the SSH password for {user}@{host}:",
                 QLineEdit.Password,
             )
             if not ok or not password:
                 self.ssh_setup_btn.setEnabled(True)
                 self.status_label.setText("SSH key setup cancelled.")
-                self._record_logbook("INFO", f"SSH key setup cancelled for {user}@{host}:{port}.")
                 return
             _run_install(password)
 
@@ -1694,32 +1464,22 @@ class MainWindow(QMainWindow):
                 SshKeyHelper.install_key(host, user, port, password, key_path)
 
             def install_done(_result):
-                self.status_label.setText(
-                    "SSH key installed — click CONNECT to log in without a password."
-                )
-                QMessageBox.information(
-                    self,
-                    "SSH Key Setup Complete",
-                    f"Your public key has been installed on {user}@{host}.\n\n"
-                    "Click CONNECT — no password will be required.",
-                )
+                self.status_label.setText("SSH key installed — click CONNECT.")
+                QMessageBox.information(self, "SSH Key Setup Complete",
+                    f"Your public key has been installed on {user}@{host}.")
 
             def install_error(message: str):
                 self.status_label.setText("SSH key installation failed.")
                 self._show_error("SSH Key Setup Failed", message, log=False)
 
             self._submit_job(
-                install_task,
-                on_result=install_done,
-                on_error=install_error,
+                install_task, on_result=install_done, on_error=install_error,
                 on_finished=lambda: self.ssh_setup_btn.setEnabled(True),
                 operation=f"Install SSH key on {user}@{host}:{port}",
             )
 
         self._submit_job(
-            probe_task,
-            on_result=probe_done,
-            on_error=probe_error,
+            probe_task, on_result=probe_done, on_error=probe_error,
             operation=f"Check SSH key for {user}@{host}:{port}",
         )
 
@@ -1741,23 +1501,19 @@ class MainWindow(QMainWindow):
             self._update_readback(data)
 
         self._submit_job(
-            task,
-            on_result=on_result,
+            task, on_result=on_result,
             on_finished=lambda: setattr(self, "_poll_in_flight", False),
-            operation="Poll register readback",
-            log_success=False,
+            operation="Poll register readback", log_success=False,
         )
 
     def upload_bitfile(self):
         if not self.connected:
             self._show_error("Not connected", "Connect to the Red Pitaya first.")
             return
-
         local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "red_pitaya_top.bit.bin")
         if not os.path.isfile(local_path):
             self._show_error("File not found", f"Cannot find:\n{local_path}")
             return
-
         self.status_label.setText("Uploading bitfile…")
 
         def task():
@@ -1772,23 +1528,17 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Bitfile upload failed.")
             self._show_error("Upload bitfile failed", message, log=False)
 
-        self._submit_job(
-            task,
-            on_result=on_result,
-            on_error=on_error,
-            operation=f"Upload FPGA bitfile {os.path.basename(local_path)}",
-        )
+        self._submit_job(task, on_result=on_result, on_error=on_error,
+                         operation=f"Upload FPGA bitfile {os.path.basename(local_path)}")
 
     def upload_and_compile(self):
         if not self.connected:
             self._show_error("Not connected", "Connect to the Red Pitaya first.")
             return
-
         local_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_pulse_ctl.c")
         if not os.path.isfile(local_src):
             self._show_error("File not found", f"Cannot find:\n{local_src}")
             return
-
         self.status_label.setText("Uploading rp_pulse_ctl.c…")
 
         def task():
@@ -1805,11 +1555,6 @@ class MainWindow(QMainWindow):
             on_error=on_error,
             operation=f"Upload and compile {os.path.basename(local_src)}",
         )
-
-    def force_freq_update(self):
-        self._force_period_update = True
-        self._record_logbook("INFO", "Force frequency update requested.")
-        self.read_back()
 
     def read_back(self):
         if not self.connected:
@@ -1828,12 +1573,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Readback failed.")
             self._show_error("Readback failed", message, log=False)
 
-        self._submit_job(
-            task,
-            on_result=on_result,
-            on_error=on_error,
-            operation="Read hardware registers",
-        )
+        self._submit_job(task, on_result=on_result, on_error=on_error,
+                         operation="Read hardware registers")
 
     def soft_reset(self):
         if not self.connected:
@@ -1852,42 +1593,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Soft reset failed.")
             self._show_error("Soft reset failed", message, log=False)
 
-        self._submit_job(
-            task,
-            on_result=on_result,
-            on_error=on_error,
-            operation="Send soft reset",
-        )
+        self._submit_job(task, on_result=on_result, on_error=on_error,
+                         operation="Send soft reset")
 
-    def on_divider_changed(self, value: int):
-        if self.divider_control.entry.hasFocus():
-            self.divider_control.entry.setText(str(value))
-        self._refresh_preview_and_stats()
-        self.maybe_auto_apply()
-
-    def on_width_changed(self, value: float):
+    def on_width_changed(self, _value: float):
         self._refresh_preview_and_stats()
         if not self.width_control.value_box.hasFocus():
             self.maybe_auto_apply()
 
-    def on_delay_changed(self, value: float):
-        self._refresh_preview_and_stats()
-        if not self.delay_control.value_box.hasFocus():
-            self.maybe_auto_apply()
-
-    def on_mod_freq_changed(self, value: float):
-        clamped = clamp_mod_freq_hz(value)
-        was_clamped = abs(clamped - value) > 1e-9
-        self._phase_freq_clamped = was_clamped
-        if was_clamped:
-            self.mod_freq_control.setValue(clamped)
-            return
-        self._mod_freq_dirty = True
-        self._refresh_preview_and_stats()
-        if not self.mod_freq_control.value_box.hasFocus():
-            self.maybe_auto_apply()
-
-    def on_phase_mod_toggled(self, checked: bool):
+    def on_offset_changed(self):
         self._refresh_preview_and_stats()
         self.maybe_auto_apply()
 
@@ -1928,13 +1642,9 @@ class MainWindow(QMainWindow):
 
         def task():
             data = self.remote.helper(
-                self.base_addr,
-                "write",
-                state.divider,
+                self.base_addr, "write",
                 state.width_cycles,
-                state.delay_cycles,
-                state.phase_freq_word,
-                MOD_AMP_Q15_FIXED,
+                state.period_offset,
                 state.control_word,
             )
             return state, data
@@ -1942,11 +1652,9 @@ class MainWindow(QMainWindow):
         def on_result(payload):
             apply_state, data = payload
             self._update_readback(data)
-            if int(data.get("phase_freq", -1)) == apply_state.phase_freq_word:
-                self._mod_freq_dirty = False
-            mode_text = "phase mod ON" if (apply_state.control_word & CONTROL_PHASE_MOD_ENABLE) else "phase mod OFF"
             self.status_label.setText(
-                f"Applied — width {apply_state.width_cycles} cyc, delay {apply_state.delay_cycles} cyc, {mode_text}."
+                f"Applied — width {apply_state.width_cycles} cyc, "
+                f"offset {apply_state.period_offset:+d} cyc."
             )
 
         def on_error(message):
@@ -1960,105 +1668,80 @@ class MainWindow(QMainWindow):
                 self._apply_in_flight = False
 
         self._submit_job(
-            task,
-            on_result=on_result,
-            on_error=on_error,
-            on_finished=on_finished,
+            task, on_result=on_result, on_error=on_error, on_finished=on_finished,
             operation=(
-                "Apply pulse settings "
-                f"(divider={state.divider}, width={state.width_cycles}, "
-                f"delay={state.delay_cycles}, control=0x{state.control_word:X})"
+                f"Apply pulse settings "
+                f"(width={state.width_cycles}, offset={state.period_offset:+d}, "
+                f"control=0x{state.control_word:X})"
             ),
         )
 
     def _update_readback(self, data):
-        control = int(data.get("control", 0))
-        divider = int(data.get("divider", 0))
-        width = int(data.get("width", 0))
-        delay = int(data.get("delay", 0))
-        status = int(data.get("status", 0))
-        raw_period = int(data.get("period", data.get("raw_period", 0)))
+        control     = int(data.get("control", 0))
         filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
-        phase_freq = int(data.get("phase_freq", 0))
+        out_period  = int(data.get("output_period", 0))
+        status      = int(data.get("status", 0))
+        period_valid   = (status >> 1) & 0x1
+        timeout_flag   = (status >> 2) & 0x1
+        period_stable  = (status >> 3) & 0x1
+        freerun_active = (status >> 4) & 0x1
+        enable         = control & CONTROL_PULSE_ENABLE
 
-        busy = (status >> 0) & 0x1
-        period_valid = (status >> 1) & 0x1
-        timeout_flag = (status >> 2) & 0x1
-        enable = control & CONTROL_PULSE_ENABLE
-        phase_mod_enable = (control & CONTROL_PHASE_MOD_ENABLE) != 0
         self._period_valid = bool(period_valid)
         self._timeout_flag = bool(timeout_flag)
 
         if period_valid and filt_period > 0:
-            change = abs(filt_period - self._period_cycles) / max(1, self._period_cycles)
-            if self._force_period_update or self._period_cycles <= 1 or change > 0.05:
-                self._force_period_update = False
-                self._period_cycles = filt_period
-                self._refresh_preview_and_stats()
+            self._period_cycles = filt_period
 
-        raw_freq = CLOCK_HZ / raw_period if raw_period > 0 else 0.0
-        filt_freq = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
-        divider_hw = max(1, divider)
-        out_freq = filt_freq / divider_hw if filt_freq > 0 else 0.0
-        current_width = self.width_control.value()
-        current_delay = self.delay_control.value()
-        mod_freq_hz = phase_freq * CLOCK_HZ / (2**32)
+        raw_period  = int(data.get("raw_period", 0))
+        filt_freq   = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
+        out_freq    = CLOCK_HZ / out_period if (out_period > 0 and freerun_active) else (
+                      CLOCK_HZ / filt_period if filt_period > 0 else 0.0)
 
         self.stat_input.set_value(fmt_freq_hz(filt_freq) if filt_period > 0 else "—")
-        self.stat_output.set_value(fmt_freq_hz(out_freq) if filt_period > 0 else "—")
-        self.stat_duty.set_value(f"{current_width * 100:.1f} %")
         self.stat_input.set_footer("from hardware")
-        self.stat_output.set_footer("divided output")
-        self.stat_duty.set_footer("input referenced")
-        if phase_mod_enable and period_valid and not timeout_flag:
-            self.stat_phase.set_value(fmt_freq_hz(mod_freq_hz))
-            self.stat_phase.set_footer("freq shift Δf")
-        else:
-            self.stat_phase.set_value(f"{current_delay:.1f} °")
-            self.stat_phase.set_footer("input referenced")
+        self.stat_output.set_value(fmt_freq_hz(out_freq) if filt_period > 0 else "—")
+        self.stat_output.set_footer("freerun output" if freerun_active else "awaiting lock")
+        self.stat_duty.set_value(f"{self.width_control.value() * 100:.1f} %")
+        self.stat_duty.set_footer("of output period")
 
-        blocked_phase_mod = self.phase_mod_toggle.isChecked() and (not period_valid or timeout_flag)
+        if freerun_active:
+            self.stat_status.set_value("RUNNING")
+            self.stat_status.set_footer(f"period {out_period} cyc")
+        elif period_stable:
+            self.stat_status.set_value("LOCKING")
+            self.stat_status.set_footer("period stable, transitioning")
+        elif period_valid:
+            self.stat_status.set_value("MEASURING")
+            self.stat_status.set_footer("waiting for stability")
+        else:
+            self.stat_status.set_value("WAITING")
+            self.stat_status.set_footer("no valid trigger")
 
         self.enable_toggle.blockSignals(True)
         self.enable_toggle.setChecked(bool(enable))
         self.enable_toggle.blockSignals(False)
 
-        should_sync_mod_freq = (phase_mod_enable or phase_freq != 0) and not self._mod_freq_dirty
-        if should_sync_mod_freq and abs(self.mod_freq_control.value() - clamp_mod_freq_hz(mod_freq_hz)) > 0.5:
-            self.mod_freq_control.blockSignals(True)
-            self.mod_freq_control.setValue(clamp_mod_freq_hz(mod_freq_hz))
-            self.mod_freq_control.blockSignals(False)
-
         self._refresh_preview_and_stats()
 
         warnings: list[str] = []
-        if blocked_phase_mod:
-            warnings.append("Frequency shift requested, but blocked by trigger status. Static delay is active.")
         if not period_valid:
             warnings.append("No valid trigger period.")
         if timeout_flag:
             warnings.append("Trigger timeout detected on STATUS.bit2.")
-        if self._phase_freq_clamped:
-            warnings.append("Modulation frequency was clamped to 5 kHz.")
         self.freq_warning_label.setText("  ".join(f"\u26a0  {text}" for text in warnings))
 
     def closeEvent(self, event):
         self._record_logbook("INFO", "Application closing.")
         self._stop_poll()
         self.executor.shutdown(wait=False, cancel_futures=True)
-        # Best-effort: close the SSH ControlMaster socket so the board's
-        # sshd doesn't hold an idle connection after the app exits.
-        # ControlMaster is only used on non-Windows platforms.
         if self.connected and self.remote.host and RemoteCtl._USE_CONTROL_MASTER:
             try:
                 subprocess.run(
-                    [
-                        "ssh", "-O", "exit",
-                        "-o", f"ControlPath={RemoteCtl._CONTROL_PATH}",
-                        f"{self.remote.user}@{self.remote.host}",
-                    ],
-                    capture_output=True,
-                    timeout=5,
+                    ["ssh", "-O", "exit",
+                     "-o", f"ControlPath={RemoteCtl._CONTROL_PATH}",
+                     f"{self.remote.user}@{self.remote.host}"],
+                    capture_output=True, timeout=5,
                 )
             except Exception:
                 pass
