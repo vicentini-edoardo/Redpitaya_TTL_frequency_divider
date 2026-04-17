@@ -258,11 +258,11 @@ class RemoteCtl:
         self.host = ""
         self.user = ""
         self.port = 22
-        self._allow_control_master = True
 
     _CONTROL_PATH = "/".join([
         tempfile.gettempdir().replace("\\", "/"), "rp_ssh_%h_%p_%r.sock"
     ])
+    _USE_CONTROL_MASTER = sys.platform != "win32"
 
     def connect(self, host: str, user: str, port: int):
         if not shutil.which("ssh"):
@@ -271,15 +271,13 @@ class RemoteCtl:
         self.user = user
         self.port = port
 
-    def _ssh_base_args(self, *, use_control_master: bool | None = None) -> list[str]:
+    def _ssh_base_args(self) -> list[str]:
         args = [
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
         ]
-        if use_control_master is None:
-            use_control_master = self._allow_control_master
-        if use_control_master:
+        if self._USE_CONTROL_MASTER:
             args += [
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPath={self._CONTROL_PATH}",
@@ -298,47 +296,15 @@ class RemoteCtl:
             "no supported authentication methods",
         ))
 
-    @staticmethod
-    def _is_control_master_error(message: str) -> bool:
-        lowered = message.lower()
-        return any(phrase in lowered for phrase in (
-            "bad configuration option: controlmaster",
-            "bad configuration option: controlpath",
-            "bad configuration option: controlpersist",
-            "controlsocket",
-            "unix_listener",
-        ))
-
-    def _run_subprocess_with_optional_control_master(self, cmd_builder, timeout: int):
-        last_error = None
-        for use_control_master in ([self._allow_control_master, False] if self._allow_control_master else [False]):
-            proc = subprocess.run(
-                cmd_builder(use_control_master),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if proc.returncode == 0:
-                if not use_control_master:
-                    self._allow_control_master = False
-                return proc
-            error_message = proc.stderr.strip() or proc.stdout.strip() or "Command failed."
-            last_error = error_message
-            if use_control_master and self._is_control_master_error(error_message):
-                self._allow_control_master = False
-                continue
-            break
-        raise RuntimeError(last_error or "Command failed.")
-
     def run(self, cmd: str):
-        proc = self._run_subprocess_with_optional_control_master(
-            lambda use_control_master: (
-                ["ssh", "-p", str(self.port)]
-                + self._ssh_base_args(use_control_master=use_control_master)
-                + [f"{self.user}@{self.host}", cmd]
-            ),
-            timeout=45,
+        ssh_cmd = (
+            ["ssh", "-p", str(self.port)]
+            + self._ssh_base_args()
+            + [f"{self.user}@{self.host}", cmd]
         )
+        proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=45)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "SSH command failed.")
         return proc.stdout.strip()
 
     def helper(self, base_addr: int, command: str, *args):
@@ -351,33 +317,27 @@ class RemoteCtl:
     def upload_bitfile(self, local_path: str):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        try:
-            self._run_subprocess_with_optional_control_master(
-                lambda use_control_master: (
-                    ["scp", "-P", str(self.port)]
-                    + self._ssh_base_args(use_control_master=use_control_master)
-                    + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
-                ),
-                timeout=60,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(f"scp failed: {exc}") from exc
+        scp_cmd = (
+            ["scp", "-P", str(self.port)]
+            + self._ssh_base_args()
+            + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
+        )
+        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
         self.run(f"{REMOTE_FPGAUTIL} -b {REMOTE_BITFILE}")
 
     def upload_and_compile(self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"):
         if not shutil.which("scp"):
             raise RuntimeError("scp not found on this PC.")
-        try:
-            self._run_subprocess_with_optional_control_master(
-                lambda use_control_master: (
-                    ["scp", "-P", str(self.port)]
-                    + self._ssh_base_args(use_control_master=use_control_master)
-                    + [local_src, f"{self.user}@{self.host}:{remote_src}"]
-                ),
-                timeout=30,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(f"scp failed: {exc}") from exc
+        scp_cmd = (
+            ["scp", "-P", str(self.port)]
+            + self._ssh_base_args()
+            + [local_src, f"{self.user}@{self.host}:{remote_src}"]
+        )
+        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
         compile_cmd = f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
         return self.run(compile_cmd)
 
