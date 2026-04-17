@@ -17,8 +17,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import tkinter.font as tkfont
 
-CLOCK_HZ = 125_000_000          # Red Pitaya FPGA clock frequency
-BASE_ADDR = 0x40600000           # Default AXI base address of the FPGA core
+CLOCK_HZ   = 125_000_000          # Red Pitaya FPGA clock frequency
+BASE_ADDR  = 0x40600000           # Default AXI base address of the FPGA core
+NCO_WIDTH  = 48                   # Phase accumulator width (W)
 REMOTE_BIN      = "/root/rp_pulse_ctl"
 REMOTE_FPGAUTIL = "/opt/redpitaya/bin/fpgautil"   # Full path required for non-login SSH
 REMOTE_BITFILE  = "/root/red_pitaya_top.bit.bin"
@@ -118,6 +119,36 @@ def mod_amp_to_q15(value: float) -> int:
 
 def q15_to_mod_amp(value: int) -> float:
     return clamp_mod_amp(value / MOD_AMP_Q15_MAX) if MOD_AMP_Q15_MAX > 0 else 0.0
+
+
+# ── NCO phase-step / frequency conversion ─────────────────────────────────────
+
+def hz_to_phase_step_offset(freq_hz: float) -> int:
+    """Convert a signed frequency offset in Hz to a signed 48-bit phase-step word."""
+    raw = round(freq_hz * (2 ** NCO_WIDTH) / CLOCK_HZ)
+    # Clamp to signed 48-bit range
+    limit = 2 ** (NCO_WIDTH - 1)
+    return max(-limit, min(limit - 1, raw))
+
+
+def phase_step_offset_to_hz(word: int) -> float:
+    """Convert a signed 48-bit phase-step offset word back to Hz."""
+    return word * CLOCK_HZ / (2 ** NCO_WIDTH)
+
+
+def fmt_freq_offset_hz(freq_hz: float) -> str:
+    """Format a (potentially sub-Hz) frequency offset with appropriate precision."""
+    abs_f = abs(freq_hz)
+    sign  = "-" if freq_hz < 0 else "+"
+    if abs_f >= 1e6:
+        return f"{sign}{abs_f/1e6:.6g} MHz"
+    if abs_f >= 1e3:
+        return f"{sign}{abs_f/1e3:.6g} kHz"
+    if abs_f >= 1.0:
+        return f"{sign}{abs_f:.6g} Hz"
+    if abs_f >= 1e-3:
+        return f"{sign}{abs_f*1e3:.6g} mHz"
+    return f"{sign}{abs_f*1e6:.6g} µHz"
 
 
 class _Tooltip:
@@ -232,6 +263,11 @@ class App:
         self.delay_deg_entry_var = tk.StringVar(value="0.0")
         self.delay_ns_var = tk.StringVar(value="")
 
+        # NCO frequency offset in Hz (maps to phase_step_offset)
+        self.freq_offset_hz_var = tk.DoubleVar(value=0.0)
+        self.freq_offset_hz_entry_var = tk.StringVar(value="0.000000")
+        self.freq_offset_word_var = tk.StringVar(value="")
+
         self.mod_freq_var = tk.DoubleVar(value=10.0)
         self.mod_freq_entry_var = tk.StringVar(value="10")
         self.mod_freq_word_var = tk.StringVar(value="")
@@ -281,6 +317,7 @@ class App:
         self._conn_dot = None   # tk.Label used as a colored status indicator
 
         self._build()
+        self.on_freq_offset_change(self.freq_offset_hz_var.get())
         self.on_mod_freq_change(self.mod_freq_var.get())
         self.on_mod_amp_change(self.mod_amp_var.get())
         self._update_modulation_controls()
@@ -554,7 +591,9 @@ class App:
                             ns_var=self.delay_ns_var,
                             scale_attr="delay_scale")
 
-        self._add_param_row(ctrl, 3,
+        self._add_freq_offset_row(ctrl, 3)
+
+        self._add_param_row(ctrl, 4,
                             label="Modulation frequency (Hz)",
                             float_var=self.mod_freq_var, int_var=None,
                             entry_var=self.mod_freq_entry_var,
@@ -563,7 +602,7 @@ class App:
                             ns_var=self.mod_freq_word_var,
                             scale_attr="mod_freq_scale")
 
-        self._add_param_row(ctrl, 4,
+        self._add_param_row(ctrl, 5,
                             label="Modulation amplitude (sweep / T)",
                             float_var=self.mod_amp_var, int_var=None,
                             entry_var=self.mod_amp_entry_var,
@@ -573,7 +612,7 @@ class App:
                             scale_attr="mod_amp_scale")
 
         btn_frame = tk.Frame(ctrl, bg=CLR_SURFACE)
-        btn_frame.grid(row=5, column=0, columnspan=4, sticky="w", pady=(14, 0))
+        btn_frame.grid(row=6, column=0, columnspan=4, sticky="w", pady=(14, 0))
 
         ttk.Checkbutton(btn_frame, text="Enable output", variable=self.enable_var,
                         command=self.maybe_auto_apply).pack(side="left", padx=(0, 12))
@@ -616,6 +655,24 @@ class App:
         setattr(self, scale_attr, scale)
         setattr(self, f"{scale_attr}_entry", entry)
         scale.set(var.get())
+
+    def _add_freq_offset_row(self, parent, row):
+        """Frequency offset row: label + wide entry + word readback. No slider."""
+        ttk.Label(parent, text="Freq offset (Hz)", width=22, anchor="w",
+                  background=CLR_SURFACE, foreground=CLR_TEXT).grid(
+            row=row, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
+
+        # Entry spans the slider column (col 1) so it gets the extra space.
+        # width=20 fits "-12345678.901234" without truncation.
+        entry = ttk.Entry(parent, textvariable=self.freq_offset_hz_entry_var, width=20)
+        entry.grid(row=row, column=1, sticky="w", pady=(6, 0), padx=(0, 8))
+        entry.bind("<Return>",   lambda e: self.on_freq_offset_change(None))
+        entry.bind("<FocusOut>", lambda e: self.on_freq_offset_change(None))
+        self.freq_offset_entry = entry
+
+        ttk.Label(parent, textvariable=self.freq_offset_word_var,
+                  style="Muted.TLabel", width=22).grid(
+            row=row, column=2, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_waveform(self, outer):
         wf_outer, wf_inner = self._make_cyber_frame(outer, "WAVEFORM PREVIEW")
@@ -871,6 +928,7 @@ class App:
             "delay_cycles": deg_to_cycles(deg, self._period_cycles),
             "phase_freq_word": mod_freq_to_word(mod_freq_hz),
             "phase_amp_q15": mod_amp_to_q15(mod_amp),
+            "phase_step_offset": hz_to_phase_step_offset(self.freq_offset_hz_var.get()),
             "control_word": control_word,
         }
 
@@ -1004,6 +1062,23 @@ class App:
         self._draw_waveform()
         self.maybe_auto_apply()
 
+    def on_freq_offset_change(self, value):
+        if self.updating_widgets:
+            return
+        try:
+            new_val = float(self.freq_offset_hz_entry_var.get().strip())
+        except ValueError:
+            new_val = self.freq_offset_hz_var.get()
+        self.updating_widgets = True
+        self.freq_offset_hz_var.set(new_val)
+        # Show 6 decimal places so sub-mHz values are visible
+        self.freq_offset_hz_entry_var.set(f"{new_val:.6f}")
+        word = hz_to_phase_step_offset(new_val)
+        self.freq_offset_word_var.set(
+            f"step offset {word:+d}  ({fmt_freq_offset_hz(new_val)})")
+        self.updating_widgets = False
+        self.maybe_auto_apply()
+
     def on_mod_freq_change(self, value):
         if self.updating_widgets:
             return
@@ -1115,6 +1190,17 @@ class App:
         filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
         phase_freq  = int(data.get("phase_freq", 0))
         phase_amp_q15 = int(data.get("phase_amp_q15", 0))
+        # NCO registers (signed 48-bit, may not be present on older firmware)
+        phase_step_offset_raw = int(data.get("phase_step_offset", 0))
+        phase_step_base_raw   = int(data.get("phase_step_base",   0))
+        phase_step_raw        = int(data.get("phase_step",        0))
+        # Sign-extend 48-bit values
+        if phase_step_offset_raw >= 2**(NCO_WIDTH - 1):
+            phase_step_offset_raw -= 2**NCO_WIDTH
+        if phase_step_base_raw >= 2**(NCO_WIDTH - 1):
+            phase_step_base_raw -= 2**NCO_WIDTH
+        if phase_step_raw >= 2**(NCO_WIDTH - 1):
+            phase_step_raw -= 2**NCO_WIDTH
 
         busy           = (status >> 0) & 0x1
         period_valid   = (status >> 1) & 0x1
@@ -1200,6 +1286,20 @@ class App:
         status_str = (f"busy={busy}  valid={period_valid}  "
                       f"stable={period_stable}  timeout={timeout_flag}")
 
+        # Sync freq offset entry from hardware if present (non-zero or explicitly sent)
+        if phase_step_offset_raw != 0:
+            hw_offset_hz = phase_step_offset_to_hz(phase_step_offset_raw)
+            if abs(hw_offset_hz - self.freq_offset_hz_var.get()) > 1e-7:
+                self.freq_offset_hz_var.set(hw_offset_hz)
+                self.freq_offset_hz_entry_var.set(f"{hw_offset_hz:.6f}")
+                word = hz_to_phase_step_offset(hw_offset_hz)
+                self.freq_offset_word_var.set(
+                    f"step offset {word:+d}  ({fmt_freq_offset_hz(hw_offset_hz)})")
+
+        offset_hz   = phase_step_offset_to_hz(phase_step_offset_raw)
+        base_hz     = phase_step_offset_to_hz(phase_step_base_raw)
+        live_hz     = phase_step_offset_to_hz(phase_step_raw)
+
         self.readback_text.set(
             f"control  = 0x{control:08X}    enable = {1 if enable else 0}  phase_mod = {1 if phase_mod_enable else 0}\n"
             f"divider  = {divider}\n"
@@ -1207,6 +1307,9 @@ class App:
             f"delay    = {delay:6d} cycles  ({fmt_time_s(delay / CLOCK_HZ):>10})  →  {delay_deg:.1f}°\n"
             f"phase_fr = 0x{phase_freq:08X}  ({fmt_freq_hz(mod_freq_hz):>12})\n"
             f"phase_amp= {phase_amp_q15:6d}  ({mod_amp:.2f}T sweep)\n"
+            f"step_off = {phase_step_offset_raw:+d}  ({offset_hz:+.6f} Hz)\n"
+            f"step_base= {phase_step_base_raw}  ({base_hz:.6f} Hz)\n"
+            f"step_live= {phase_step_raw}  ({live_hz:.6f} Hz)\n"
             f"status   = 0x{status:08X}    {status_str}\n"
             f"raw  f   = {fmt_freq_hz(raw_freq):>12}  ({raw_period} cycles)\n"
             f"filt f   = {fmt_freq_hz(filt_freq):>12}  ({filt_period} cycles)"

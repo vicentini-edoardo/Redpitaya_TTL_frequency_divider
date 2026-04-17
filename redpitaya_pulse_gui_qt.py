@@ -2,9 +2,9 @@
 """
 redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya pulse generator.
 
-Free-running mode: the FPGA measures the input frequency once at startup, then
-generates pulses at f_input + delta_f. The frequency offset is given as a signed
-period offset in clock cycles (period_offset register at 0x1C).
+Free-running NCO mode: the FPGA measures the input frequency once at startup, then
+generates pulses at f_input + delta_f via a 48-bit phase accumulator. The frequency
+offset is entered in Hz with decimal precision (maps to the phase_step_offset register).
 
 Run with:  python3 redpitaya_pulse_gui_qt.py
 Requires: PySide6
@@ -63,16 +63,15 @@ except ImportError as exc:  # pragma: no cover - dependency guard
     ) from exc
 
 
-CLOCK_HZ = 125_000_000
-BASE_ADDR = 0x40600000
+CLOCK_HZ   = 125_000_000
+NCO_WIDTH  = 48                   # Phase accumulator width in the FPGA
+BASE_ADDR  = 0x40600000
 REMOTE_BIN = "/root/rp_pulse_ctl"
 REMOTE_FPGAUTIL = "/opt/redpitaya/bin/fpgautil"
 REMOTE_BITFILE = "/root/red_pitaya_top.bit.bin"
 LOGBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_logbook.log")
 
 WIDTH_MIN = 1
-PERIOD_OFFSET_MIN = -10_000_000
-PERIOD_OFFSET_MAX =  10_000_000
 
 CONTROL_PULSE_ENABLE = 0x1
 CONTROL_SOFT_RESET   = 0x2
@@ -127,20 +126,27 @@ def cycles_to_frac(cycles: int, period_cycles: int) -> float:
     return cycles / period_cycles if period_cycles > 0 else 0.0
 
 
-def offset_to_delta_f(offset_cycles: int, period_avg: int) -> float:
-    """Approximate frequency shift for a given period offset in clock ticks.
+def hz_to_phase_step_offset(freq_hz: float) -> int:
+    """Convert a signed frequency offset in Hz to a signed 48-bit phase-step word."""
+    raw = round(freq_hz * (2 ** NCO_WIDTH) / CLOCK_HZ)
+    limit = 2 ** (NCO_WIDTH - 1)
+    return max(-limit, min(limit - 1, raw))
 
-    delta_f ≈ -offset * f_input^2 / CLOCK_HZ = -offset * CLOCK_HZ / period^2
-    """
-    if period_avg <= 0:
-        return 0.0
-    return -offset_cycles * CLOCK_HZ / (period_avg ** 2)
+
+def phase_step_offset_to_hz(word: int) -> float:
+    """Convert a signed 48-bit phase-step word back to Hz."""
+    return word * CLOCK_HZ / (2 ** NCO_WIDTH)
+
+
+def nco_resolution_hz() -> float:
+    """One LSB of phase_step_offset expressed in Hz."""
+    return CLOCK_HZ / (2 ** NCO_WIDTH)
 
 
 @dataclass
 class ApplyState:
     width_cycles: int
-    period_offset: int
+    phase_step_offset: int
     control_word: int
 
 
@@ -648,12 +654,12 @@ class WaveformPreview(QWidget):
         self.setMinimumHeight(180)
         self.setMaximumHeight(220)
         self.width_frac = 0.1
-        self.offset_cycles = 0
+        self.delta_f_hz = 0.0
         self.period_avg = 500
 
-    def set_state(self, width_frac: float, offset_cycles: int, period_avg: int):
+    def set_state(self, width_frac: float, delta_f_hz: float, period_avg: int):
         self.width_frac = max(0.001, min(0.999, width_frac))
-        self.offset_cycles = offset_cycles
+        self.delta_f_hz = delta_f_hz
         self.period_avg = max(1, period_avg)
         self.update()
 
@@ -722,7 +728,8 @@ class WaveformPreview(QWidget):
             x += in_pw
 
         # Output period is slightly different from input period
-        out_pw_raw = in_pw * (1.0 + self.offset_cycles / max(1, self.period_avg))
+        input_hz = CLOCK_HZ / self.period_avg if self.period_avg > 0 else 1.0
+        out_pw_raw = in_pw * (input_hz / max(1e-9, input_hz + self.delta_f_hz))
         out_pw = max(4.0, out_pw_raw)
         n_out = max(1, int(track_w / out_pw))
         x = float(left)
@@ -747,12 +754,11 @@ class WaveformPreview(QWidget):
         caption_font = QFont(MONO_FONT_FAMILY, 9)
         caption_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.6)
         painter.setFont(caption_font)
-        delta_f = offset_to_delta_f(self.offset_cycles, self.period_avg)
-        sign = "+" if delta_f >= 0 else ""
+        sign = "+" if self.delta_f_hz >= 0 else ""
         painter.drawText(
             QRectF(left, caption_y - 14, track_w, 16),
             Qt.AlignCenter,
-            f"duty {self.width_frac * 100:.1f}%  |  offset {self.offset_cycles:+d} cyc  |  Δf ≈ {sign}{fmt_freq_hz(delta_f)}",
+            f"duty {self.width_frac * 100:.1f}%  |  shift {sign}{self.delta_f_hz:.6f} Hz",
         )
 
 
@@ -841,7 +847,7 @@ class MainWindow(QMainWindow):
         mid_row.addWidget(self.wave_panel, 10)
 
         self.width_control.setValue(0.1)
-        self.offset_entry.setText("0")
+        self.offset_entry.setText("0.000000")
 
         self.logbook_panel = self._build_logbook_panel()
         root.addWidget(self.logbook_panel)
@@ -960,24 +966,26 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.width_control)
 
-        # Period offset — signed integer entry
+        # Frequency shift — entered in Hz, quantized to period-offset cycles underneath
         offset_row = QWidget()
         offset_layout = QGridLayout(offset_row)
         offset_layout.setContentsMargins(0, 0, 0, 0)
         offset_layout.setHorizontalSpacing(12)
         offset_layout.setVerticalSpacing(4)
 
-        offset_title = QLabel("Period offset (cycles)")
+        offset_title = QLabel("Frequency offset (Hz)")
         offset_title.setObjectName("paramTitle")
         offset_layout.addWidget(offset_title, 0, 0)
 
-        self.offset_entry = QLineEdit("0")
+        self.offset_entry = QLineEdit("0.000000")
         self.offset_entry.setAlignment(Qt.AlignCenter)
         self.offset_entry.setObjectName("valueBox")
-        self.offset_entry.setFixedWidth(120)
-        self.offset_entry.setValidator(
-            QIntValidator(PERIOD_OFFSET_MIN, PERIOD_OFFSET_MAX, self)
-        )
+        # Wide enough for "-12345678.901234" (16 chars of digits + sign + decimal)
+        self.offset_entry.setMinimumWidth(200)
+        self.offset_entry.setMaximumWidth(280)
+        validator = QDoubleValidator(-1e12, 1e12, 6, self)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        self.offset_entry.setValidator(validator)
         offset_layout.addWidget(self.offset_entry, 0, 1)
 
         self.offset_detail = QLabel("")
@@ -1276,18 +1284,20 @@ class MainWindow(QMainWindow):
             self._record_logbook("ERROR", title, message)
         QMessageBox.critical(self, title, message)
 
-    def _get_offset_cycles(self) -> int:
+    def _get_requested_delta_f_hz(self) -> float:
         try:
-            return max(PERIOD_OFFSET_MIN, min(PERIOD_OFFSET_MAX, int(self.offset_entry.text())))
+            return float(self.offset_entry.text())
         except ValueError:
-            return 0
+            return 0.0
 
     def _refresh_preview_and_stats(self):
         width = self.width_control.value()
-        offset = self._get_offset_cycles()
+        delta_f = self._get_requested_delta_f_hz()
+        step_word = hz_to_phase_step_offset(delta_f)
+        actual_delta_f = phase_step_offset_to_hz(step_word)
 
         if self.waveform is not None:
-            self.waveform.set_state(width, offset, self._period_cycles)
+            self.waveform.set_state(width, actual_delta_f, self._period_cycles)
 
         self.stat_duty.set_value(f"{width * 100:.1f} %")
         self.stat_duty.set_footer("of output period")
@@ -1297,11 +1307,11 @@ class MainWindow(QMainWindow):
             f"{width * 100:.1f}%   {fmt_time_s(width_cycles / CLOCK_HZ)}"
         )
 
-        delta_f = offset_to_delta_f(offset, self._period_cycles)
-        sign = "+" if delta_f >= 0 else ""
+        resolution_hz = nco_resolution_hz()
         self.offset_detail.setText(
-            f"Δf ≈ {sign}{fmt_freq_hz(delta_f)}  "
-            f"(output_period ≈ {self._period_cycles + offset} cycles)"
+            f"actual {actual_delta_f:+.6f} Hz  |  "
+            f"resolution {resolution_hz:.4e} Hz/LSB  |  "
+            f"step word {step_word:+d}"
         )
         self._update_info_text()
 
@@ -1310,20 +1320,19 @@ class MainWindow(QMainWindow):
             self.info_label.setText("Connect to read input frequency from hardware.")
             return
         input_hz = CLOCK_HZ / self._period_cycles
-        offset = self._get_offset_cycles()
-        out_period = max(200, self._period_cycles + offset)
-        out_hz = CLOCK_HZ / out_period
+        delta_f = self._get_requested_delta_f_hz()
+        out_hz = max(0.0, input_hz + delta_f)
         self.info_label.setText(
             f"Input: {fmt_freq_hz(input_hz)}  ({self._period_cycles} cycles)  |  "
-            f"Output: {fmt_freq_hz(out_hz)}  (period {out_period} cycles)"
+            f"Output: {fmt_freq_hz(out_hz)}  (shift {delta_f:+.6f} Hz)"
         )
 
     def _capture_apply_state(self) -> ApplyState:
         frac = max(0.0, min(1.0, self.width_control.value()))
         width_cycles = frac_to_cycles(frac, self._period_cycles)
-        offset = self._get_offset_cycles()
+        step_offset = hz_to_phase_step_offset(self._get_requested_delta_f_hz())
         control_word = CONTROL_PULSE_ENABLE if self.enable_toggle.isChecked() else 0
-        return ApplyState(width_cycles=width_cycles, period_offset=offset, control_word=control_word)
+        return ApplyState(width_cycles=width_cycles, phase_step_offset=step_offset, control_word=control_word)
 
     def _parse_connect_params(self):
         host = self.host_edit.text().strip()
@@ -1604,7 +1613,7 @@ class MainWindow(QMainWindow):
             data = self.remote.helper(
                 self.base_addr, "write",
                 state.width_cycles,
-                state.period_offset,
+                state.phase_step_offset,
                 state.control_word,
             )
             return state, data
@@ -1612,9 +1621,10 @@ class MainWindow(QMainWindow):
         def on_result(payload):
             apply_state, data = payload
             self._update_readback(data)
+            actual_delta_f = phase_step_offset_to_hz(apply_state.phase_step_offset)
             self.status_label.setText(
                 f"Applied — width {apply_state.width_cycles} cyc, "
-                f"offset {apply_state.period_offset:+d} cyc."
+                f"shift {actual_delta_f:+.6f} Hz."
             )
 
         def on_error(message):
@@ -1631,7 +1641,9 @@ class MainWindow(QMainWindow):
             task, on_result=on_result, on_error=on_error, on_finished=on_finished,
             operation=(
                 f"Apply pulse settings "
-                f"(width={state.width_cycles}, offset={state.period_offset:+d}, "
+                f"(width={state.width_cycles}, "
+                f"shift={phase_step_offset_to_hz(state.phase_step_offset):+.6f} Hz, "
+                f"step_offset={state.phase_step_offset:+d}, "
                 f"control=0x{state.control_word:X})"
             ),
         )
@@ -1639,7 +1651,6 @@ class MainWindow(QMainWindow):
     def _update_readback(self, data):
         control     = int(data.get("control", 0))
         filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
-        out_period  = int(data.get("output_period", 0))
         status      = int(data.get("status", 0))
         period_valid   = (status >> 1) & 0x1
         timeout_flag   = (status >> 2) & 0x1
@@ -1647,27 +1658,36 @@ class MainWindow(QMainWindow):
         freerun_active = (status >> 4) & 0x1
         enable         = control & CONTROL_PULSE_ENABLE
 
+        # NCO readback (signed 48-bit, sign-extend if needed)
+        _limit = 2 ** (NCO_WIDTH - 1)
+        phase_step_raw = int(data.get("phase_step", 0))
+        if phase_step_raw >= _limit:
+            phase_step_raw -= 2 ** NCO_WIDTH
+        phase_step_base_raw = int(data.get("phase_step_base", 0))
+        if phase_step_base_raw >= _limit:
+            phase_step_base_raw -= 2 ** NCO_WIDTH
+
         self._period_valid = bool(period_valid)
         self._timeout_flag = bool(timeout_flag)
 
         if period_valid and filt_period > 0:
             self._period_cycles = filt_period
 
-        raw_period  = int(data.get("raw_period", 0))
-        filt_freq   = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
-        out_freq    = CLOCK_HZ / out_period if (out_period > 0 and freerun_active) else (
-                      CLOCK_HZ / filt_period if filt_period > 0 else 0.0)
+        filt_freq = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
+        # Output freq = input freq + live NCO delta
+        live_delta_f = phase_step_offset_to_hz(phase_step_raw)
+        out_freq = filt_freq + live_delta_f if filt_period > 0 else 0.0
 
         self.stat_input.set_value(fmt_freq_hz(filt_freq) if filt_period > 0 else "—")
         self.stat_input.set_footer("from hardware")
         self.stat_output.set_value(fmt_freq_hz(out_freq) if filt_period > 0 else "—")
-        self.stat_output.set_footer("freerun output" if freerun_active else "awaiting lock")
+        self.stat_output.set_footer("NCO output" if freerun_active else "awaiting lock")
         self.stat_duty.set_value(f"{self.width_control.value() * 100:.1f} %")
         self.stat_duty.set_footer("of output period")
 
         if freerun_active:
             self.stat_status.set_value("RUNNING")
-            self.stat_status.set_footer(f"period {out_period} cyc")
+            self.stat_status.set_footer(f"shift {live_delta_f:+.4f} Hz")
         elif period_stable:
             self.stat_status.set_value("LOCKING")
             self.stat_status.set_footer("period stable, transitioning")
