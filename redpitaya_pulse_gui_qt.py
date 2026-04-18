@@ -1,1740 +1,813 @@
 #!/usr/bin/env python3
 """
-redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya pulse generator.
+redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya TTL frequency divider.
 
-Free-running NCO mode: the FPGA measures the input frequency once at startup, then
-generates pulses at f_input + delta_f via a 48-bit phase accumulator. The frequency
-offset is entered in Hz with decimal precision (maps to the phase_step_offset register).
+Architecture
+------------
+- SshBackend  : persistent paramiko TCP connection, single worker thread, priority queue.
+                User writes (priority 0) always execute before polls (priority 9).
+                Works on Windows, macOS, and Linux without any OS-level SSH client.
+- MainWindow  : Qt UI on the main thread; communicates with the backend via signals only.
 
-Run with:  python3 redpitaya_pulse_gui_qt.py
-Requires: PySide6
+Run with:  python redpitaya_pulse_gui_qt.py
+Requires:  pip install PySide6 paramiko
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shlex
-import shutil
-import subprocess
+import queue
 import sys
-import tempfile
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
 
 try:
-    from PySide6.QtCore import QObject, QPointF, QRectF, QTimer, Qt, Signal
-    from PySide6.QtGui import (
-        QAction,
-        QColor,
-        QDoubleValidator,
-        QFont,
-        QIntValidator,
-        QKeySequence,
-        QLinearGradient,
-        QPainter,
-        QPainterPath,
-        QPen,
-        QTextCursor,
-    )
+    from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
+    from PySide6.QtGui import QAction, QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication,
-        QFrame,
-        QGridLayout,
-        QHBoxLayout,
-        QInputDialog,
-        QLabel,
-        QLineEdit,
-        QMainWindow,
-        QMessageBox,
-        QPushButton,
-        QScrollArea,
-        QSizePolicy,
-        QTextEdit,
-        QVBoxLayout,
-        QWidget,
+        QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
+        QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
+        QSizePolicy, QSlider, QTextEdit, QVBoxLayout, QWidget,
     )
-except ImportError as exc:  # pragma: no cover - dependency guard
+except ImportError as exc:
     raise SystemExit(
-        "PySide6 is required. Create a local environment and install it with:\n"
-        "python3 -m venv .venv && .venv/bin/python -m pip install PySide6-Essentials"
+        "PySide6 is required.\n"
+        "  python -m pip install PySide6-Essentials"
     ) from exc
 
+try:
+    import paramiko
+    _HAS_PARAMIKO = True
+except ImportError:
+    _HAS_PARAMIKO = False
 
-CLOCK_HZ   = 125_000_000
-NCO_WIDTH  = 48                   # Phase accumulator width in the FPGA
-BASE_ADDR  = 0x40600000
-REMOTE_BIN = "/root/rp_pulse_ctl"
-REMOTE_FPGAUTIL = "/opt/redpitaya/bin/fpgautil"
-REMOTE_BITFILE = "/root/red_pitaya_top.bit.bin"
-LOGBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_logbook.log")
+# ─────────────────────────────────────────────────────────────────────────────
+# Hardware constants
+# ─────────────────────────────────────────────────────────────────────────────
+CLK_HZ       = 125_000_000
+PHASE_BITS   = 48
+DEFAULT_BASE = 0x40600000
+CTRL_ENABLE  = 0x01
 
-WIDTH_MIN = 1
+_PHASE_MAX = 2 ** (PHASE_BITS - 1)
 
-CONTROL_PULSE_ENABLE = 0x1
-CONTROL_SOFT_RESET   = 0x2
+# ─────────────────────────────────────────────────────────────────────────────
+# Math helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# 60% dominant — dark navy backgrounds
-CLR_BG = "#060c17"
-CLR_BG_2 = "#09131f"
-CLR_SURFACE = "#0c1826"
-CLR_PANEL = "#081220"
-
-# 30% secondary — structural elements, borders, text hierarchy
-CLR_BORDER = "#1b4a62"
-CLR_BORDER_MAGENTA = "#3d1535"
-CLR_BORDER_DIM = "#0c4a5e"
-CLR_SOFT = "#1e3a52"
-CLR_GRID = "#0e2030"
-CLR_MUTED = "#6a9ab0"
-CLR_TEXT = "#8ab8d0"
-
-# 10% accent
-CLR_ACCENT = "#0ecce0"
-CLR_SUCCESS = "#0dbb90"
-CLR_WARN = "#dd3355"
-
-CLR_ENTRY_BG = "#060f1a"
-MONO_FONT_FAMILY = "Menlo"
+def hz_to_phase(delta_hz: float) -> int:
+    v = int(round(delta_hz * 2**PHASE_BITS / CLK_HZ))
+    return max(-_PHASE_MAX, min(_PHASE_MAX - 1, v))
 
 
-def fmt_freq_hz(freq_hz: float) -> str:
-    if freq_hz >= 1e6:
-        return f"{freq_hz / 1e6:.6g} MHz"
-    if freq_hz >= 1e3:
-        return f"{freq_hz / 1e3:.6g} kHz"
-    return f"{freq_hz:.6g} Hz"
+def phase_to_hz(word: int) -> float:
+    return word * CLK_HZ / 2**PHASE_BITS
 
 
-def fmt_time_s(value_s: float) -> str:
-    if value_s >= 1:
-        return f"{value_s:.6g} s"
-    if value_s >= 1e-3:
-        return f"{value_s * 1e3:.6g} ms"
-    if value_s >= 1e-6:
-        return f"{value_s * 1e6:.6g} us"
-    return f"{value_s * 1e9:.6g} ns"
+def duty_to_cycles(frac: float, period: int) -> int:
+    return max(1, min(period - 1, int(round(frac * period))))
 
 
-def frac_to_cycles(frac: float, period_cycles: int) -> int:
-    return max(WIDTH_MIN, min(period_cycles, round(frac * period_cycles)))
+def fmt_freq(hz: float) -> str:
+    if hz <= 0:
+        return "---"
+    if hz < 1e3:
+        return f"{hz:.6f} Hz"
+    if hz < 1e6:
+        return f"{hz / 1e3:.6f} kHz"
+    return f"{hz / 1e6:.6f} MHz"
 
 
-def cycles_to_frac(cycles: int, period_cycles: int) -> float:
-    return cycles / period_cycles if period_cycles > 0 else 0.0
+def fmt_dur(s: float) -> str:
+    if s <= 0:
+        return "---"
+    if s < 1e-6:
+        return f"{s * 1e9:.3f} ns"
+    if s < 1e-3:
+        return f"{s * 1e6:.3f} µs"
+    if s < 1.0:
+        return f"{s * 1e3:.3f} ms"
+    return f"{s:.6f} s"
 
 
-def hz_to_phase_step_offset(freq_hz: float) -> int:
-    """Convert a signed frequency offset in Hz to a signed 48-bit phase-step word."""
-    raw = round(freq_hz * (2 ** NCO_WIDTH) / CLOCK_HZ)
-    limit = 2 ** (NCO_WIDTH - 1)
-    return max(-limit, min(limit - 1, raw))
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH Backend
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Job:
+    """Priority queue item. Lower pri number = higher urgency."""
+    __slots__ = ("pri", "seq", "fn", "cb")
+    _counter = 0
+
+    def __init__(self, pri: int, fn: Callable, cb: Optional[Callable]):
+        _Job._counter += 1
+        self.pri = pri
+        self.seq = _Job._counter
+        self.fn  = fn
+        self.cb  = cb
+
+    def __lt__(self, other: "_Job") -> bool:
+        return (self.pri, self.seq) < (other.pri, other.seq)
 
 
-def phase_step_offset_to_hz(word: int) -> float:
-    """Convert a signed 48-bit phase-step word back to Hz."""
-    return word * CLOCK_HZ / (2 ** NCO_WIDTH)
+class SshBackend(QObject):
+    """
+    Maintains a single persistent paramiko SSH session.
 
+    All SSH I/O runs in one background thread fed by a priority queue:
+      P_USER (0)   – register writes triggered by the user
+      P_UPLOAD (1) – file upload / compile
+      P_INIT (2)   – connect / disconnect
+      P_POLL (9)   – periodic register reads
 
-def nco_resolution_hz() -> float:
-    """One LSB of phase_step_offset expressed in Hz."""
-    return CLOCK_HZ / (2 ** NCO_WIDTH)
+    Results are returned to the Qt main thread through signals.
+    """
 
+    P_USER   = 0
+    P_UPLOAD = 1
+    P_INIT   = 2
+    P_POLL   = 9
 
-@dataclass
-class ApplyState:
-    width_cycles: int
-    phase_step_offset: int
-    control_word: int
+    sig_connected    = Signal()
+    sig_disconnected = Signal(str)   # reason string
+    sig_status       = Signal(dict)  # parsed JSON from the board
+    sig_log          = Signal(str)
+    sig_error        = Signal(str)
 
-
-_SSH_KEY_CANDIDATES = [
-    os.path.expanduser("~/.ssh/id_ed25519"),
-    os.path.expanduser("~/.ssh/id_rsa"),
-    os.path.expanduser("~/.ssh/id_ecdsa"),
-    os.path.expanduser("~/.ssh/id_dsa"),
-]
-
-
-class SshKeyHelper:
-    """One-time SSH key setup: generate a key pair and install it on the board."""
-
-    @staticmethod
-    def default_key_path() -> str | None:
-        for path in _SSH_KEY_CANDIDATES:
-            if os.path.isfile(path):
-                return path
-        return None
-
-    @staticmethod
-    def key_installed_on_board(host: str, user: str, port: int, key_path: str) -> bool:
-        cmd = [
-            "ssh", "-p", str(port), "-i", key_path,
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=8",
-            "-o", "PubkeyAuthentication=yes",
-            "-o", "PasswordAuthentication=no",
-            f"{user}@{host}", "echo ok",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-        return result.returncode == 0
-
-    @staticmethod
-    def generate_key(key_path: str = _SSH_KEY_CANDIDATES[0]) -> None:
-        if os.path.isfile(key_path):
-            return
-        os.makedirs(os.path.dirname(key_path), exist_ok=True)
-        result = subprocess.run(
-            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", "", "-q"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"ssh-keygen failed: {result.stderr.strip()}")
-
-    @staticmethod
-    def _copy_key_sshpass(host: str, user: str, port: int, key_path: str, password: str) -> None:
-        if not shutil.which("sshpass"):
-            raise RuntimeError("sshpass_unavailable")
-        pub_path = key_path + ".pub"
-        cmd = [
-            "sshpass", "-e", "ssh-copy-id",
-            "-i", pub_path, "-p", str(port),
-            "-o", "StrictHostKeyChecking=accept-new",
-            f"{user}@{host}",
-        ]
-        env = os.environ.copy()
-        env["SSHPASS"] = password
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "ssh-copy-id failed.")
-
-    @staticmethod
-    def _copy_key_askpass(host: str, user: str, port: int, key_path: str, password: str) -> None:
-        pub_path = key_path + ".pub"
-        with open(pub_path) as fh:
-            pubkey = fh.read().strip()
-        script = "#!/usr/bin/env python3\nimport sys\n" + f"sys.stdout.write({repr(password)})\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="rp_askpass_") as tf:
-            askpass_path = tf.name
-            tf.write(script)
-        os.chmod(askpass_path, 0o700)
-        remote_cmd = (
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
-            f"echo {shlex.quote(pubkey)} >> ~/.ssh/authorized_keys && "
-            "chmod 600 ~/.ssh/authorized_keys"
-        )
-        env = os.environ.copy()
-        env["SSH_ASKPASS"] = askpass_path
-        env["SSH_ASKPASS_REQUIRE"] = "force"
-        if "DISPLAY" not in env:
-            env["DISPLAY"] = ":0"
-        cmd = [
-            "ssh", "-p", str(port),
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "PubkeyAuthentication=no",
-            "-o", "PasswordAuthentication=yes",
-            "-o", "ConnectTimeout=15",
-            f"{user}@{host}", remote_cmd,
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-        finally:
-            os.unlink(askpass_path)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Key installation failed.")
-
-    @classmethod
-    def install_key(cls, host: str, user: str, port: int, password: str,
-                    key_path: str = _SSH_KEY_CANDIDATES[0]) -> None:
-        cls.generate_key(key_path)
-        try:
-            cls._copy_key_sshpass(host, user, port, key_path, password)
-        except RuntimeError as exc:
-            if "sshpass_unavailable" in str(exc):
-                cls._copy_key_askpass(host, user, port, key_path, password)
-            else:
-                raise
-
-
-class RemoteCtl:
-    def __init__(self):
-        self.host = ""
-        self.user = ""
-        self.port = 22
-
-    _CONTROL_PATH = "/".join([
-        tempfile.gettempdir().replace("\\", "/"), "rp_ssh_%h_%p_%r.sock"
-    ])
-    _USE_CONTROL_MASTER = sys.platform != "win32"
-
-    def connect(self, host: str, user: str, port: int):
-        if not shutil.which("ssh"):
-            raise RuntimeError("OpenSSH client not found on this PC.")
-        self.host = host
-        self.user = user
-        self.port = port
-
-    def _ssh_base_args(self) -> list[str]:
-        args = [
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=8",
-        ]
-        if self._USE_CONTROL_MASTER:
-            args += [
-                "-o", "ControlMaster=auto",
-                "-o", f"ControlPath={self._CONTROL_PATH}",
-                "-o", "ControlPersist=120",
-            ]
-        key_path = SshKeyHelper.default_key_path()
-        if key_path:
-            args += ["-i", key_path]
-        return args
-
-    @staticmethod
-    def _is_auth_error(message: str) -> bool:
-        lowered = message.lower()
-        return any(phrase in lowered for phrase in (
-            "permission denied", "publickey", "authentication failed",
-            "no supported authentication methods",
-        ))
-
-    def run(self, cmd: str):
-        ssh_cmd = (
-            ["ssh", "-p", str(self.port)]
-            + self._ssh_base_args()
-            + [f"{self.user}@{self.host}", cmd]
-        )
-        proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=45)
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "SSH command failed.")
-        return proc.stdout.strip()
-
-    def helper(self, base_addr: int, command: str, *args):
-        remote_cmd = " ".join(
-            [shlex.quote(REMOTE_BIN), shlex.quote(hex(base_addr)), shlex.quote(command)]
-            + [shlex.quote(str(a)) for a in args]
-        )
-        return json.loads(self.run(remote_cmd))
-
-    def upload_bitfile(self, local_path: str):
-        if not shutil.which("scp"):
-            raise RuntimeError("scp not found on this PC.")
-        scp_cmd = (
-            ["scp", "-P", str(self.port)]
-            + self._ssh_base_args()
-            + [local_path, f"{self.user}@{self.host}:{REMOTE_BITFILE}"]
-        )
-        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
-        if proc.returncode != 0:
-            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        self.run(f"{REMOTE_FPGAUTIL} -b {REMOTE_BITFILE}")
-
-    def upload_and_compile(self, local_src: str, remote_src: str = "/root/rp_pulse_ctl.c"):
-        if not shutil.which("scp"):
-            raise RuntimeError("scp not found on this PC.")
-        scp_cmd = (
-            ["scp", "-P", str(self.port)]
-            + self._ssh_base_args()
-            + [local_src, f"{self.user}@{self.host}:{remote_src}"]
-        )
-        proc = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            raise RuntimeError(f"scp failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        compile_cmd = f"gcc -O2 -o {shlex.quote(REMOTE_BIN)} {shlex.quote(remote_src)}"
-        return self.run(compile_cmd)
-
-
-class JobSignals(QObject):
-    result = Signal(int, object)
-    error = Signal(int, str)
-    finished = Signal(int)
-
-
-class BackgroundWidget(QWidget):
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect()
-        grad = QLinearGradient(0, 0, rect.width(), rect.height())
-        grad.setColorAt(0.0, QColor(CLR_BG))
-        grad.setColorAt(0.45, QColor(CLR_BG_2))
-        grad.setColorAt(1.0, QColor("#04070d"))
-        painter.fillRect(rect, grad)
-
-        painter.setOpacity(0.15)
-        pen = QPen(QColor(CLR_GRID), 1)
-        painter.setPen(pen)
-        for y in range(16, rect.height(), 28):
-            painter.drawLine(0, y, rect.width(), y)
-
-        painter.setOpacity(0.08)
-        painter.setPen(QPen(QColor(CLR_BORDER), 1))
-        for i in range(8):
-            y = 40 + i * 112
-            painter.drawLine(30, y, rect.width() - 40, y + (i % 2) * 6)
-
-        painter.setPen(QPen(QColor("#2a4a60"), 2))
-        painter.setOpacity(0.20)
-        for x, y, w in [(80, 54, 120), (rect.width() - 240, 84, 140), (140, rect.height() - 110, 180)]:
-            painter.drawLine(x, y, x + w, y)
-
-
-class CyberPanel(QWidget):
-    def __init__(self, title: str, parent=None):
+    def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self.title = title
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 28, 24, 20)
-        outer.setSpacing(12)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("panelTitle")
-        outer.addWidget(self.title_label)
-
-        self.content_widget = QWidget()
-        self.content_layout = QVBoxLayout(self.content_widget)
-        self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(12)
-        outer.addWidget(self.content_widget)
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect().adjusted(2, 2, -2, -2)
-
-        panel_grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
-        panel_grad.setColorAt(0.0, QColor(9, 17, 29, 220))
-        panel_grad.setColorAt(1.0, QColor(7, 10, 18, 230))
-        painter.fillRect(rect, panel_grad)
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 10))
-        painter.drawRect(rect.adjusted(8, 8, -8, -8))
-
-        path = QPainterPath()
-        chamfer = 18
-        x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
-        path.moveTo(x1 + chamfer, y1)
-        path.lineTo(x2 - chamfer, y1)
-        path.lineTo(x2, y1 + chamfer)
-        path.lineTo(x2, y2 - chamfer)
-        path.lineTo(x2 - chamfer, y2)
-        path.lineTo(x1 + chamfer, y2)
-        path.lineTo(x1, y2 - chamfer)
-        path.lineTo(x1, y1 + chamfer)
-        path.closeSubpath()
-
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(CLR_BORDER), 1.5))
-        painter.drawPath(path)
-
-        painter.setOpacity(0.55)
-        painter.setPen(QPen(QColor("#2a6880"), 1.2))
-        painter.drawLine(rect.right() - 100, rect.top() + 10, rect.right() - 20, rect.top() + 10)
-        painter.drawLine(rect.left() + 20, rect.bottom() - 12, rect.left() + 100, rect.bottom() - 12)
-
-        painter.setOpacity(0.30)
-        painter.setPen(QPen(QColor(CLR_BORDER), 5))
-        painter.drawLine(rect.left() + 8, rect.top() + 18, rect.left() + 50, rect.top() + 18)
-        painter.drawLine(rect.right() - 38, rect.bottom() - 16, rect.right() - 18, rect.bottom() - 16)
-
-        painter.setOpacity(1.0)
-
-
-class StatCard(QFrame):
-    def __init__(self, title: str, accent: str, parent=None):
-        super().__init__(parent)
-        self.accent = accent
-        self.setObjectName("statCard")
-        self.setMinimumHeight(110)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 12, 10, 10)
-        layout.setSpacing(5)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("statTitle")
-        self.title_label.setWordWrap(False)
-        layout.addWidget(self.title_label)
-
-        self.value_label = QLabel("—")
-        self.value_label.setObjectName("statValue")
-        self.value_label.setStyleSheet(f"color: {accent};")
-        self.value_label.setWordWrap(False)
-        layout.addWidget(self.value_label)
-
-        self.footer_label = QLabel("")
-        self.footer_label.setObjectName("statFooter")
-        self.footer_label.setWordWrap(False)
-        layout.addWidget(self.footer_label)
-        layout.addStretch(1)
-
-    def set_value(self, text: str):
-        self.value_label.setText(text)
-
-    def set_footer(self, text: str):
-        self.footer_label.setText(text)
-
-
-class ToggleButton(QPushButton):
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setCheckable(True)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(34)
-        self.setObjectName("toggleButton")
-
-
-class ParameterSlider(QWidget):
-    valueChanged = Signal(float)
-    valueCommitted = Signal(float)
-
-    def __init__(self, title: str, minimum: float, maximum: float, step: float,
-                 decimals: int, suffix_label: str = "", display_factor: float = 1.0,
-                 display_suffix: str = "", parent=None):
-        super().__init__(parent)
-        self.minimum = minimum
-        self.maximum = maximum
-        self.step = step
-        self.decimals = decimals
-        self._internal_decimals = max(decimals, self._decimal_places(step))
-        self.display_factor = display_factor
-        self.display_suffix = display_suffix
-        self._value = minimum
-
-        layout = QGridLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setHorizontalSpacing(12)
-        layout.setVerticalSpacing(6)
-
-        self.title_label = QLabel(title)
-        self.title_label.setObjectName("paramTitle")
-        layout.addWidget(self.title_label, 0, 0)
-
-        self.value_box = QLineEdit()
-        self.value_box.setAlignment(Qt.AlignCenter)
-        self.value_box.setObjectName("valueBox")
-        self.value_box.setFixedWidth(88)
-        display_min = minimum * self.display_factor
-        display_max = maximum * self.display_factor
-        if decimals == 0:
-            self.value_box.setValidator(QIntValidator(int(display_min), int(display_max), self))
-        else:
-            validator = QDoubleValidator(display_min, display_max, decimals, self)
-            validator.setNotation(QDoubleValidator.StandardNotation)
-            self.value_box.setValidator(validator)
-        layout.addWidget(self.value_box, 0, 2, 2, 1)
-
-        self.slider = QFrame()
-        self.slider.setObjectName("sliderTrack")
-        self.slider.setMinimumHeight(18)
-        self.slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.slider.mousePressEvent = self._slider_mouse_press
-        self.slider.mouseMoveEvent = self._slider_mouse_move
-        self.slider.paintEvent = self._paint_slider
-        layout.addWidget(self.slider, 0, 1)
-
-        self.detail_label = QLabel(suffix_label)
-        self.detail_label.setObjectName("paramDetail")
-        layout.addWidget(self.detail_label, 1, 1)
-
-        self.value_box.textEdited.connect(self._sync_from_text)
-        self.value_box.editingFinished.connect(self._entry_changed)
-
-    @staticmethod
-    def _decimal_places(value: float) -> int:
-        decimal_value = Decimal(str(value)).normalize()
-        return max(0, -decimal_value.as_tuple().exponent)
-
-    def _normalize_value(self, value: float, snap: bool = False) -> float:
-        value = max(self.minimum, min(self.maximum, value))
-        if self.decimals == 0:
-            return int(round(value))
-        if snap:
-            value = round(value / self.step) * self.step
-        return round(value, self._internal_decimals)
-
-    def _set_internal_value(self, value: float):
-        if self._value == value:
-            self.slider.update()
-            return
-        self._value = value
-        self.slider.update()
-        self.valueChanged.emit(float(value))
-
-    def _format_display_value(self, value: float) -> str:
-        display_value = value * self.display_factor
-        return f"{display_value:.{self.decimals}f}{self.display_suffix}"
-
-    def _parse_display_value(self, raw_text: str) -> float:
-        raw = raw_text.strip()
-        if self.display_suffix and raw.endswith(self.display_suffix):
-            raw = raw[: -len(self.display_suffix)].strip()
-        return float(raw) / self.display_factor
-
-    def _sync_from_text(self, raw_text: str):
-        if not raw_text.strip():
-            return
-        try:
-            value = self._parse_display_value(raw_text)
-        except ValueError:
-            return
-        if self.minimum <= value <= self.maximum:
-            self._set_internal_value(self._normalize_value(value, snap=False))
-
-    def _entry_changed(self):
-        try:
-            value = self._parse_display_value(self.value_box.text())
-        except ValueError:
-            value = self._value
-        self.setValue(value, snap=False)
-        self.valueCommitted.emit(float(self._value))
-
-    def _slider_mouse_press(self, event):
-        self._set_from_pos(event.position().x())
-
-    def _slider_mouse_move(self, event):
-        if event.buttons() & Qt.LeftButton:
-            self._set_from_pos(event.position().x())
-
-    def _set_from_pos(self, x_pos: float):
-        usable = max(1.0, self.slider.width() - 20.0)
-        t = min(1.0, max(0.0, (x_pos - 10.0) / usable))
-        value = self.minimum + t * (self.maximum - self.minimum)
-        snapped = round(value / self.step) * self.step
-        self.setValue(snapped, snap=True)
-
-    def _paint_slider(self, _event):
-        painter = QPainter(self.slider)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.slider.rect().adjusted(2, 2, -2, -2)
-
-        track_rect = QRectF(rect.left() + 8, rect.center().y() - 3, rect.width() - 16, 6)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(CLR_SOFT))
-        painter.drawRoundedRect(track_rect, 3, 3)
-
-        t = 0.0 if self.maximum <= self.minimum else (self._value - self.minimum) / (self.maximum - self.minimum)
-        filled = QRectF(track_rect.left(), track_rect.top(), max(10.0, track_rect.width() * t), track_rect.height())
-        grad = QLinearGradient(filled.topLeft(), filled.topRight())
-        grad.setColorAt(0.0, QColor(CLR_ACCENT))
-        grad.setColorAt(1.0, QColor("#7fffff"))
-        painter.setBrush(grad)
-        painter.drawRoundedRect(filled, 3, 3)
-
-        knob_x = track_rect.left() + track_rect.width() * t
-        glow_pen = QPen(QColor(CLR_ACCENT), 8)
-        glow_pen.setCapStyle(Qt.RoundCap)
-        painter.setPen(glow_pen)
-        painter.drawPoint(QPointF(knob_x, track_rect.center().y()))
-        painter.setPen(QPen(QColor("#b8ffff"), 3))
-        painter.drawPoint(QPointF(knob_x, track_rect.center().y()))
-
-    def set_detail(self, text: str):
-        self.detail_label.setText(text)
-
-    def value(self) -> float:
-        return self._value
-
-    def setValue(self, value: float, snap: bool = False):
-        value = self._normalize_value(value, snap=snap)
-        self.value_box.setText(self._format_display_value(value))
-        self._set_internal_value(value)
-
-
-class WaveformPreview(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(180)
-        self.setMaximumHeight(220)
-        self.width_frac = 0.1
-        self.delta_f_hz = 0.0
-        self.period_avg = 500
-
-    def set_state(self, width_frac: float, delta_f_hz: float, period_avg: int):
-        self.width_frac = max(0.001, min(0.999, width_frac))
-        self.delta_f_hz = delta_f_hz
-        self.period_avg = max(1, period_avg)
-        self.update()
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect().adjusted(12, 8, -12, -8)
-        h = rect.height()
-
-        panel_grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        panel_grad.setColorAt(0.0, QColor(8, 14, 24, 215))
-        panel_grad.setColorAt(1.0, QColor(6, 10, 18, 230))
-        painter.fillRect(rect, panel_grad)
-
-        painter.setPen(QPen(QColor(CLR_GRID), 1))
-        for i in range(10):
-            x = rect.left() + int(i * rect.width() / 10)
-            painter.drawLine(x, rect.top() + 6, x, rect.bottom() - 20)
-        for i in range(4):
-            y = rect.top() + 6 + int(i * (h - 30) / 3)
-            painter.drawLine(rect.left() + 14, y, rect.right() - 8, y)
-
-        label_col_w = 82
-        left = rect.left() + label_col_w + 8
-        right = rect.right() - 10
-        track_w = max(40, right - left)
-
-        y_in_hi  = rect.top() + int(h * 0.08)
-        y_in_lo  = rect.top() + int(h * 0.36)
-        y_out_hi = rect.top() + int(h * 0.52)
-        y_out_lo = rect.top() + int(h * 0.80)
-        caption_y = rect.top() + int(h * 0.90)
-
-        in_center  = (y_in_hi + y_in_lo) // 2
-        out_center = (y_out_hi + y_out_lo) // 2
-
-        sig_font = QFont(MONO_FONT_FAMILY, 9)
-        sig_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.0)
-        painter.setFont(sig_font)
-
-        painter.setPen(QPen(QColor(CLR_MUTED), 1))
-        painter.drawText(QRectF(rect.left() + 2, in_center - 10, label_col_w - 6, 20),
-                         Qt.AlignRight | Qt.AlignVCenter, "INPUT")
-        painter.setPen(QPen(QColor(CLR_ACCENT), 1))
-        painter.drawText(QRectF(rect.left() + 2, out_center - 10, label_col_w - 6, 20),
-                         Qt.AlignRight | Qt.AlignVCenter, "OUTPUT")
-
-        for y in (y_in_hi, y_in_lo, y_out_hi, y_out_lo):
-            painter.setPen(QPen(QColor(CLR_GRID), 1, Qt.DashLine))
-            painter.drawLine(left, y, right, y)
-
-        n_in = 32
-        in_pw = track_w / n_in
-
-        painter.setPen(QPen(QColor(CLR_MUTED), 1.4))
-        x = float(left)
-        for _ in range(n_in):
-            mid_x = x + in_pw / 2
-            points = [
-                QPointF(x, y_in_lo), QPointF(x, y_in_hi),
-                QPointF(mid_x, y_in_hi), QPointF(mid_x, y_in_lo),
-                QPointF(x + in_pw, y_in_lo),
-            ]
-            for p1, p2 in zip(points, points[1:]):
-                painter.drawLine(p1, p2)
-            x += in_pw
-
-        # Output period is slightly different from input period
-        input_hz = CLOCK_HZ / self.period_avg if self.period_avg > 0 else 1.0
-        out_pw_raw = in_pw * (input_hz / max(1e-9, input_hz + self.delta_f_hz))
-        out_pw = max(4.0, out_pw_raw)
-        n_out = max(1, int(track_w / out_pw))
-        x = float(left)
-        for _ in range(n_out):
-            h_px = out_pw * self.width_frac
-            points = [
-                QPointF(x, y_out_lo),
-                QPointF(x, y_out_hi),
-                QPointF(x + h_px, y_out_hi),
-                QPointF(x + h_px, y_out_lo),
-                QPointF(x + out_pw, y_out_lo),
-            ]
-            painter.setPen(QPen(QColor(CLR_BORDER_DIM), 5))
-            for p1, p2 in zip(points, points[1:]):
-                painter.drawLine(p1, p2)
-            painter.setPen(QPen(QColor(CLR_ACCENT), 2))
-            for p1, p2 in zip(points, points[1:]):
-                painter.drawLine(p1, p2)
-            x += out_pw
-
-        painter.setPen(QPen(QColor(CLR_MUTED), 1))
-        caption_font = QFont(MONO_FONT_FAMILY, 9)
-        caption_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.6)
-        painter.setFont(caption_font)
-        sign = "+" if self.delta_f_hz >= 0 else ""
-        painter.drawText(
-            QRectF(left, caption_y - 14, track_w, 16),
-            Qt.AlignCenter,
-            f"duty {self.width_frac * 100:.1f}%  |  shift {sign}{self.delta_f_hz:.6f} Hz",
-        )
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Red Pitaya Pulse Control")
-        self.resize(1100, 700)
-        self.setMinimumSize(860, 560)
-
-        self.remote = RemoteCtl()
-        self.connected = False
-        self.base_addr = BASE_ADDR
-        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpctl")
-        self.job_signals = JobSignals()
-        self.job_signals.result.connect(self._handle_job_result)
-        self.job_signals.error.connect(self._handle_job_error)
-        self.job_signals.finished.connect(self._handle_job_finished)
-        self._next_job_id = 0
-        self._job_handlers: dict[int, dict[str, object]] = {}
-        self._job_futures: dict[int, Future] = {}
-        self._period_cycles = 1
-        self._period_valid = False
-        self._timeout_flag = False
-        self._apply_in_flight = False
-        self._pending_apply_state: ApplyState | None = None
-        self._poll_in_flight = False
-        self.waveform: WaveformPreview | None = None
-        self.logbook_view: QTextEdit | None = None
-        self._logbook_entries: list[str] = []
-        self._logbook_path = LOGBOOK_FILE
-
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(2000)
-        self.poll_timer.timeout.connect(self._poll_tick)
-
-        self.auto_apply_timer = QTimer(self)
-        self.auto_apply_timer.setSingleShot(True)
-        self.auto_apply_timer.setInterval(300)
-        self.auto_apply_timer.timeout.connect(self._auto_apply_timeout)
-
-        self._build_ui()
-        self._wire_shortcuts()
-        self._apply_styles()
-        self._refresh_preview_and_stats()
-        self._load_existing_logbook()
-        self._record_logbook("INFO", "Application started.")
-
-    def _build_ui(self):
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setCentralWidget(scroll)
-
-        bg = BackgroundWidget()
-        scroll.setWidget(bg)
-
-        root = QVBoxLayout(bg)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(14)
-        root.setAlignment(Qt.AlignTop)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(16)
-        top_row.setAlignment(Qt.AlignTop)
-        root.addLayout(top_row)
-
-        self.connection_panel = self._build_connection_panel()
-        self.stats_panel = self._build_stats_panel()
-        top_row.addWidget(self.connection_panel, 1)
-        top_row.addWidget(self.stats_panel, 1)
-
-        mid_row = QHBoxLayout()
-        mid_row.setSpacing(16)
-        mid_row.setAlignment(Qt.AlignTop)
-        root.addLayout(mid_row)
-
-        controls_col = QVBoxLayout()
-        controls_col.setSpacing(16)
-        self.pulse_controls_panel = self._build_pulse_controls_panel()
-        self.wave_panel = self._build_waveform_panel()
-        controls_col.addWidget(self.pulse_controls_panel, 1)
-        mid_row.addLayout(controls_col, 11)
-        mid_row.addWidget(self.wave_panel, 10)
-
-        self.width_control.setValue(0.1)
-        self.offset_entry.setText("0.000000")
-
-        self.logbook_panel = self._build_logbook_panel()
-        root.addWidget(self.logbook_panel)
-        root.addStretch(1)
-
-    def _build_connection_panel(self) -> CyberPanel:
-        panel = CyberPanel("CONNECTION")
-        layout = panel.content_layout
-
-        row = QGridLayout()
-        row.setHorizontalSpacing(12)
-        row.setVerticalSpacing(10)
-        layout.addLayout(row)
-
-        host_label = QLabel("HOST")
-        host_label.setObjectName("fieldLabel")
-        row.addWidget(host_label, 0, 0)
-
-        self.host_edit = QLineEdit("rp-f06a51.local")
-        self.host_edit.setObjectName("neonEntry")
-        row.addWidget(self.host_edit, 0, 1, 1, 2)
-
-        self.connect_btn = QPushButton("CONNECT")
-        self.connect_btn.setObjectName("accentButton")
-        self.connect_btn.clicked.connect(self.connect_to_board)
-        row.addWidget(self.connect_btn, 1, 0, 1, 4)
-
-        self.ssh_setup_btn = QPushButton("SETUP SSH KEY")
-        self.ssh_setup_btn.setObjectName("ghostButton")
-        self.ssh_setup_btn.setToolTip(
-            "One-time setup: generates an SSH key pair and installs it on the board."
-        )
-        self.ssh_setup_btn.clicked.connect(self._on_setup_ssh_key)
-        row.addWidget(self.ssh_setup_btn, 2, 0, 1, 4)
-
-        self.advanced_toggle = QPushButton("▾ ADVANCED")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setObjectName("ghostButton")
-        self.advanced_toggle.toggled.connect(self._toggle_advanced)
-        row.addWidget(self.advanced_toggle, 0, 3, 1, 1, Qt.AlignRight)
-
-        self.status_label = QLabel("Disconnected")
-        self.status_label.setObjectName("warnStatus")
-        layout.addWidget(self.status_label)
-
-        self.advanced_widget = QWidget()
-        self.advanced_widget.setVisible(False)
-        adv = QGridLayout(self.advanced_widget)
-        adv.setHorizontalSpacing(10)
-        adv.setVerticalSpacing(10)
-
-        adv.addWidget(self._make_field_label("PORT"), 0, 0)
-        self.port_edit = QLineEdit("22")
-        self.port_edit.setValidator(QIntValidator(1, 65535, self))
-        self.port_edit.setObjectName("neonEntry")
-        adv.addWidget(self.port_edit, 0, 1)
-
-        adv.addWidget(self._make_field_label("USER"), 0, 2)
-        self.user_edit = QLineEdit("root")
-        self.user_edit.setObjectName("neonEntry")
-        adv.addWidget(self.user_edit, 0, 3)
-
-        adv.addWidget(self._make_field_label("BASE ADDRESS"), 0, 4)
-        self.base_edit = QLineEdit("0x40600000")
-        self.base_edit.setObjectName("neonEntry")
-        adv.addWidget(self.base_edit, 0, 5)
-
-        self.readback_btn = self._make_small_button("READ BACK", self.read_back)
-        self.soft_reset_btn = self._make_small_button("SOFT RESET", self.soft_reset)
-        self.upload_compile_btn = self._make_small_button("UPLOAD & COMPILE", self.upload_and_compile)
-        self.upload_bitfile_btn = self._make_small_button("UPLOAD BITFILE", self.upload_bitfile)
-
-        adv.addWidget(self.readback_btn, 1, 0, 1, 1)
-        adv.addWidget(self.soft_reset_btn, 1, 1, 1, 1)
-        adv.addWidget(self.upload_compile_btn, 1, 2, 1, 2)
-        adv.addWidget(self.upload_bitfile_btn, 1, 4, 1, 1)
-
-        self.info_label = QLabel("Connect to read input frequency from hardware.")
-        self.info_label.setWordWrap(True)
-        self.info_label.setObjectName("infoLabel")
-        adv.addWidget(self.info_label, 2, 0, 1, 6)
-
-        self.freq_warning_label = QLabel("")
-        self.freq_warning_label.setObjectName("warnStatus")
-        adv.addWidget(self.freq_warning_label, 3, 0, 1, 6)
-
-        layout.addWidget(self.advanced_widget)
-        return panel
-
-    def _build_stats_panel(self) -> CyberPanel:
-        panel = CyberPanel("LIVE STATS")
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(12)
-        panel.content_layout.addLayout(grid)
-
-        self.stat_input  = StatCard("INPUT FREQ",    CLR_TEXT)
-        self.stat_output = StatCard("OUTPUT FREQ",   CLR_ACCENT)
-        self.stat_duty   = StatCard("DUTY CYCLE",    CLR_TEXT)
-        self.stat_status = StatCard("FREERUN STATUS", CLR_MUTED)
-
-        for col, widget in enumerate([self.stat_input, self.stat_output, self.stat_duty, self.stat_status]):
-            grid.addWidget(widget, 0, col)
-            grid.setColumnStretch(col, 1)
-
-        return panel
-
-    def _build_pulse_controls_panel(self) -> CyberPanel:
-        panel = CyberPanel("PULSE CONTROLS")
-        layout = panel.content_layout
-
-        self.width_control = ParameterSlider(
-            "Width (duty cycle)",
-            0.0, 1.0, 0.05, 1,
-            display_factor=100.0, display_suffix="%",
-        )
-        layout.addWidget(self.width_control)
-
-        # Frequency shift — entered in Hz, quantized to period-offset cycles underneath
-        offset_row = QWidget()
-        offset_layout = QGridLayout(offset_row)
-        offset_layout.setContentsMargins(0, 0, 0, 0)
-        offset_layout.setHorizontalSpacing(12)
-        offset_layout.setVerticalSpacing(4)
-
-        offset_title = QLabel("Frequency offset (Hz)")
-        offset_title.setObjectName("paramTitle")
-        offset_layout.addWidget(offset_title, 0, 0)
-
-        self.offset_entry = QLineEdit("0.000000")
-        self.offset_entry.setAlignment(Qt.AlignCenter)
-        self.offset_entry.setObjectName("valueBox")
-        # Wide enough for "-12345678.901234" (16 chars of digits + sign + decimal)
-        self.offset_entry.setMinimumWidth(200)
-        self.offset_entry.setMaximumWidth(280)
-        validator = QDoubleValidator(-1e12, 1e12, 6, self)
-        validator.setNotation(QDoubleValidator.StandardNotation)
-        self.offset_entry.setValidator(validator)
-        offset_layout.addWidget(self.offset_entry, 0, 1)
-
-        self.offset_detail = QLabel("")
-        self.offset_detail.setObjectName("paramDetail")
-        offset_layout.addWidget(self.offset_detail, 1, 0, 1, 2)
-
-        layout.addWidget(offset_row)
-
-        toggles = QHBoxLayout()
-        toggles.setSpacing(12)
-        self.enable_toggle = ToggleButton("Enable output")
-        self.enable_toggle.setChecked(True)
-        toggles.addWidget(self.enable_toggle)
-        self.auto_apply_toggle = ToggleButton("Auto apply")
-        toggles.addWidget(self.auto_apply_toggle)
-        toggles.addStretch(1)
-        layout.addLayout(toggles)
-
-        self.apply_btn = QPushButton("APPLY NOW")
-        self.apply_btn.setObjectName("accentButton")
-        self.apply_btn.clicked.connect(self.apply_now)
-        layout.addWidget(self.apply_btn)
-
-        layout.addStretch(1)
-
-        self.width_control.valueChanged.connect(self.on_width_changed)
-        self.width_control.valueCommitted.connect(lambda _v: self.maybe_auto_apply())
-        self.offset_entry.editingFinished.connect(self.on_offset_changed)
-        self.enable_toggle.toggled.connect(lambda _checked: self.maybe_auto_apply())
-
-        return panel
-
-    def _build_waveform_panel(self) -> CyberPanel:
-        panel = CyberPanel("WAVEFORM PREVIEW")
-        self.waveform = WaveformPreview()
-        panel.content_layout.addWidget(self.waveform, 0, Qt.AlignTop)
-        panel.content_layout.addStretch(1)
-        return panel
-
-    def _build_logbook_panel(self) -> CyberPanel:
-        panel = CyberPanel("LOGBOOK")
-        self.logbook_view = QTextEdit()
-        self.logbook_view.setReadOnly(True)
-        self.logbook_view.setMinimumHeight(150)
-        self.logbook_view.setObjectName("logbookView")
-        panel.content_layout.addWidget(self.logbook_view)
-
-        hint = QLabel(f"Persistent log: {self._logbook_path}")
-        hint.setObjectName("infoLabel")
-        hint.setWordWrap(True)
-        panel.content_layout.addWidget(hint)
-        return panel
-
-    def _wire_shortcuts(self):
-        action = QAction(self)
-        action.setShortcut(QKeySequence("Ctrl+Return"))
-        action.triggered.connect(self.apply_now)
-        self.addAction(action)
-
-    def _apply_styles(self):
-        self.setStyleSheet(
-            f"""
-            QWidget {{
-                color: {CLR_TEXT};
-                font-family: Menlo, Monaco, 'Courier New', monospace;
-                font-size: 13px;
-            }}
-            QScrollArea, QScrollArea > QWidget > QWidget {{
-                background: transparent;
-                border: none;
-            }}
-            QLabel#panelTitle {{
-                color: #4a9ab5;
-                font-size: 18px;
-                font-weight: 700;
-                letter-spacing: 3px;
-            }}
-            QLabel#fieldLabel {{
-                color: {CLR_MUTED};
-                font-size: 12px;
-                letter-spacing: 1px;
-            }}
-            QLabel#infoLabel {{
-                color: {CLR_MUTED};
-                font-size: 11px;
-            }}
-            QLabel#warnStatus {{
-                color: {CLR_WARN};
-                font-size: 13px;
-            }}
-            QLabel#okStatus {{
-                color: {CLR_SUCCESS};
-                font-size: 13px;
-            }}
-            QLineEdit#neonEntry, QLineEdit#valueBox {{
-                background: {CLR_ENTRY_BG};
-                border: 1px solid {CLR_SOFT};
-                border-radius: 4px;
-                padding: 7px 10px;
-                color: {CLR_TEXT};
-                selection-background-color: {CLR_ACCENT};
-                selection-color: {CLR_BG};
-            }}
-            QLineEdit#neonEntry:focus, QLineEdit#valueBox:focus {{
-                border-color: {CLR_BORDER};
-            }}
-            QPushButton#accentButton, QPushButton#wideAccentButton {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0a8da0, stop:1 {CLR_ACCENT});
-                color: #d8f8ff;
-                border: 1px solid {CLR_ACCENT};
-                border-radius: 6px;
-                padding: 8px 18px;
-                min-height: 38px;
-                font-size: 15px;
-                font-weight: 700;
-                letter-spacing: 2px;
-            }}
-            QPushButton#accentButton:hover, QPushButton#wideAccentButton:hover {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ca8c0, stop:1 #30e8f8);
-            }}
-            QPushButton#ghostButton, QPushButton#stepButton {{
-                background: {CLR_PANEL};
-                border: 1px solid {CLR_SOFT};
-                border-radius: 5px;
-                padding: 6px 10px;
-                color: {CLR_TEXT};
-            }}
-            QPushButton#ghostButton:checked {{
-                border-color: {CLR_BORDER};
-                color: {CLR_ACCENT};
-            }}
-            QPushButton#smallButton {{
-                background: {CLR_PANEL};
-                border: 1px solid {CLR_SOFT};
-                border-radius: 5px;
-                padding: 6px 10px;
-                color: {CLR_MUTED};
-            }}
-            QPushButton#smallButton:hover, QPushButton#ghostButton:hover, QPushButton#stepButton:hover {{
-                border-color: {CLR_BORDER};
-                color: {CLR_TEXT};
-            }}
-            QPushButton#toggleButton {{
-                text-align: left;
-                background: {CLR_PANEL};
-                border: 1px solid {CLR_SOFT};
-                border-radius: 5px;
-                padding: 7px 12px;
-                color: {CLR_MUTED};
-            }}
-            QPushButton#toggleButton:checked {{
-                background: rgba(14, 204, 224, 20);
-                border-color: {CLR_BORDER};
-                color: {CLR_TEXT};
-            }}
-            QFrame#statCard {{
-                background: rgba(8, 16, 28, 200);
-                border: 1px solid {CLR_SOFT};
-                border-radius: 6px;
-            }}
-            QLabel#statTitle {{
-                color: {CLR_MUTED};
-                font-size: 11px;
-                letter-spacing: 0.5px;
-            }}
-            QLabel#statValue {{
-                font-size: 22px;
-                font-weight: 700;
-            }}
-            QLabel#statFooter {{
-                color: {CLR_MUTED};
-                font-size: 11px;
-            }}
-            QLabel#paramTitle {{
-                color: {CLR_TEXT};
-                font-size: 13px;
-            }}
-            QLabel#paramDetail {{
-                color: {CLR_MUTED};
-                font-size: 11px;
-            }}
-            QTextEdit#logbookView {{
-                background: {CLR_ENTRY_BG};
-                border: 1px solid {CLR_SOFT};
-                border-radius: 6px;
-                color: {CLR_TEXT};
-                padding: 8px;
-                font-size: 11px;
-            }}
-            """
-        )
-
-    def _make_field_label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("fieldLabel")
-        return label
-
-    def _make_small_button(self, text: str, slot) -> QPushButton:
-        button = QPushButton(text)
-        button.setObjectName("smallButton")
-        button.clicked.connect(slot)
-        return button
-
-    def _toggle_advanced(self, checked: bool):
-        self.advanced_widget.setVisible(checked)
-        self.advanced_toggle.setText("▴ ADVANCED" if checked else "▾ ADVANCED")
-
-    def _record_logbook(self, level: str, message: str, details: str | None = None):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"{timestamp} [{level}] {message}"
-        if details:
-            detail_text = " ".join(str(details).splitlines()).strip()
-            if detail_text:
-                line = f"{line} | {detail_text}"
-        self._logbook_entries.append(line)
-        self._logbook_entries = self._logbook_entries[-500:]
-        try:
-            with open(self._logbook_path, "a", encoding="utf-8") as log_file:
-                log_file.write(line + "\n")
-        except OSError:
-            pass
-        if self.logbook_view is not None:
-            self.logbook_view.setPlainText("\n".join(self._logbook_entries[-200:]))
-            self.logbook_view.moveCursor(QTextCursor.End)
-
-    def _load_existing_logbook(self):
-        try:
-            with open(self._logbook_path, "r", encoding="utf-8") as log_file:
-                self._logbook_entries = log_file.read().splitlines()[-200:]
-        except OSError:
-            self._logbook_entries = []
-        if self.logbook_view is not None and self._logbook_entries:
-            self.logbook_view.setPlainText("\n".join(self._logbook_entries))
-            self.logbook_view.moveCursor(QTextCursor.End)
-
-    def _submit_job(self, fn, on_result=None, on_error=None, on_finished=None,
-                    operation: str = "Background operation", log_success: bool = True):
-        job_id = self._next_job_id
-        self._next_job_id += 1
-        self._job_handlers[job_id] = {
-            "result": on_result, "error": on_error, "finished": on_finished,
-            "operation": operation, "log_success": log_success,
-        }
-        if log_success:
-            self._record_logbook("INFO", f"{operation} started.")
-
-        future = self.executor.submit(fn)
-        self._job_futures[job_id] = future
-
-        def _done_callback(done_future: Future):
-            try:
-                result = done_future.result()
-            except Exception as exc:
-                self.job_signals.error.emit(job_id, str(exc))
-            else:
-                self.job_signals.result.emit(job_id, result)
-            finally:
-                self.job_signals.finished.emit(job_id)
-
-        future.add_done_callback(_done_callback)
-
-    def _handle_job_result(self, job_id: int, payload):
-        job = self._job_handlers.get(job_id, {})
-        if job.get("log_success", True):
-            self._record_logbook("INFO", f"{job.get('operation', 'Background operation')} completed.")
-        handler = job.get("result")
-        if handler is not None:
-            handler(payload)
-
-    def _handle_job_error(self, job_id: int, message: str):
-        job = self._job_handlers.get(job_id, {})
-        self._record_logbook("ERROR", f"{job.get('operation', 'Background operation')} failed.", message)
-        handler = job.get("error")
-        if handler is not None:
-            handler(message)
-
-    def _handle_job_finished(self, job_id: int):
-        handler = self._job_handlers.get(job_id, {}).get("finished")
-        if handler is not None:
-            handler()
-        self._job_handlers.pop(job_id, None)
-        self._job_futures.pop(job_id, None)
-
-    def _set_connected(self, connected: bool):
-        self.connected = connected
-        host = self.host_edit.text().strip()
-        self.setWindowTitle(f"Red Pitaya Pulse Control — {host}" if connected else "Red Pitaya Pulse Control")
-        self.status_label.setObjectName("okStatus" if connected else "warnStatus")
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
-
-    def _show_error(self, title: str, message: str, *, log: bool = True):
-        if log:
-            self._record_logbook("ERROR", title, message)
-        QMessageBox.critical(self, title, message)
-
-    def _get_requested_delta_f_hz(self) -> float:
-        try:
-            return float(self.offset_entry.text())
-        except ValueError:
-            return 0.0
-
-    def _refresh_preview_and_stats(self):
-        width = self.width_control.value()
-        delta_f = self._get_requested_delta_f_hz()
-        step_word = hz_to_phase_step_offset(delta_f)
-        actual_delta_f = phase_step_offset_to_hz(step_word)
-
-        if self.waveform is not None:
-            self.waveform.set_state(width, actual_delta_f, self._period_cycles)
-
-        self.stat_duty.set_value(f"{width * 100:.1f} %")
-        self.stat_duty.set_footer("of output period")
-
-        width_cycles = frac_to_cycles(width, self._period_cycles)
-        self.width_control.set_detail(
-            f"{width * 100:.1f}%   {fmt_time_s(width_cycles / CLOCK_HZ)}"
-        )
-
-        resolution_hz = nco_resolution_hz()
-        self.offset_detail.setText(
-            f"actual {actual_delta_f:+.6f} Hz  |  "
-            f"resolution {resolution_hz:.4e} Hz/LSB  |  "
-            f"step word {step_word:+d}"
-        )
-        self._update_info_text()
-
-    def _update_info_text(self):
-        if self._period_cycles <= 1:
-            self.info_label.setText("Connect to read input frequency from hardware.")
-            return
-        input_hz = CLOCK_HZ / self._period_cycles
-        delta_f = self._get_requested_delta_f_hz()
-        out_hz = max(0.0, input_hz + delta_f)
-        self.info_label.setText(
-            f"Input: {fmt_freq_hz(input_hz)}  ({self._period_cycles} cycles)  |  "
-            f"Output: {fmt_freq_hz(out_hz)}  (shift {delta_f:+.6f} Hz)"
-        )
-
-    def _capture_apply_state(self) -> ApplyState:
-        frac = max(0.0, min(1.0, self.width_control.value()))
-        width_cycles = frac_to_cycles(frac, self._period_cycles)
-        step_offset = hz_to_phase_step_offset(self._get_requested_delta_f_hz())
-        control_word = CONTROL_PULSE_ENABLE if self.enable_toggle.isChecked() else 0
-        return ApplyState(width_cycles=width_cycles, phase_step_offset=step_offset, control_word=control_word)
-
-    def _parse_connect_params(self):
-        host = self.host_edit.text().strip()
-        user = self.user_edit.text().strip()
-        port = int(self.port_edit.text().strip())
-        base_addr = int(self.base_edit.text().replace("_", ""), 0)
-        return host, user, port, base_addr
-
-    def connect_to_board(self):
-        try:
-            host, user, port, base_addr = self._parse_connect_params()
-        except Exception as exc:
-            self._show_error("Connection error", str(exc))
-            return
-
-        self.connect_btn.setEnabled(False)
-        self.status_label.setText("Loading FPGA bitstream…")
-
-        def task():
-            remote = RemoteCtl()
-            remote.connect(host, user, port)
-            remote.run(f"{REMOTE_FPGAUTIL} -b {REMOTE_BITFILE}")
-            data = remote.helper(base_addr, "read")
-            return remote, data, host, user, port, base_addr
-
-        def on_result(payload):
-            remote, data, host, user, port, base_addr = payload
-            self.remote = remote
-            self.base_addr = base_addr
-            self._set_connected(True)
-            self.status_label.setText(f"Connected to {user}@{host}:{port}.")
-            self._update_readback(data)
-            self._start_poll()
-
-        def on_error(message):
-            self._stop_poll()
-            self._set_connected(False)
-            self.status_label.setText("Connection failed.")
-            if RemoteCtl._is_auth_error(message):
-                reply = QMessageBox.question(
-                    self, "Authentication Failed",
-                    "SSH authentication failed.\n\nRun SSH Key Setup now?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-                )
-                if reply == QMessageBox.Yes:
-                    self._on_setup_ssh_key()
-            else:
-                self._show_error("Connection error", message, log=False)
-
-        self._submit_job(
-            task, on_result=on_result, on_error=on_error,
-            on_finished=lambda: self.connect_btn.setEnabled(True),
-            operation=f"Connect to {user}@{host}:{port}",
-        )
-
-    def _on_setup_ssh_key(self):
-        try:
-            host, user, port, _base = self._parse_connect_params()
-        except Exception as exc:
-            self._show_error("Setup SSH key", f"Fix connection fields first:\n{exc}")
-            return
-
-        key_path = SshKeyHelper.default_key_path() or _SSH_KEY_CANDIDATES[0]
-        self.ssh_setup_btn.setEnabled(False)
-        self.status_label.setText("Checking SSH key…")
-
-        def probe_task():
-            return SshKeyHelper.key_installed_on_board(host, user, port, key_path)
-
-        def probe_done(already_works: bool):
-            if already_works:
-                self.ssh_setup_btn.setEnabled(True)
-                self.status_label.setText("SSH key already installed.")
-                QMessageBox.information(self, "SSH Key",
-                    f"Key-based auth to {user}@{host} is already working.")
-                return
-            _ask_password()
-
-        def probe_error(_message: str):
-            _ask_password()
-
-        def _ask_password():
-            password, ok = QInputDialog.getText(
-                self, "SSH Key Setup",
-                f"Enter the SSH password for {user}@{host}:",
-                QLineEdit.Password,
-            )
-            if not ok or not password:
-                self.ssh_setup_btn.setEnabled(True)
-                self.status_label.setText("SSH key setup cancelled.")
-                return
-            _run_install(password)
-
-        def _run_install(password: str):
-            self.status_label.setText("Installing SSH key on board…")
-
-            def install_task():
-                SshKeyHelper.install_key(host, user, port, password, key_path)
-
-            def install_done(_result):
-                self.status_label.setText("SSH key installed — click CONNECT.")
-                QMessageBox.information(self, "SSH Key Setup Complete",
-                    f"Your public key has been installed on {user}@{host}.")
-
-            def install_error(message: str):
-                self.status_label.setText("SSH key installation failed.")
-                self._show_error("SSH Key Setup Failed", message, log=False)
-
-            self._submit_job(
-                install_task, on_result=install_done, on_error=install_error,
-                on_finished=lambda: self.ssh_setup_btn.setEnabled(True),
-                operation=f"Install SSH key on {user}@{host}:{port}",
-            )
-
-        self._submit_job(
-            probe_task, on_result=probe_done, on_error=probe_error,
-            operation=f"Check SSH key for {user}@{host}:{port}",
-        )
-
-    def _start_poll(self):
-        self.poll_timer.start()
-
-    def _stop_poll(self):
-        self.poll_timer.stop()
-
-    def _poll_tick(self):
-        if not self.connected or self._poll_in_flight:
-            return
-        self._poll_in_flight = True
-
-        def task():
-            return self.remote.helper(self.base_addr, "read")
-
-        def on_result(data):
-            self._update_readback(data)
-
-        self._submit_job(
-            task, on_result=on_result,
-            on_finished=lambda: setattr(self, "_poll_in_flight", False),
-            operation="Poll register readback", log_success=False,
-        )
-
-    def upload_bitfile(self):
-        if not self.connected:
-            self._show_error("Not connected", "Connect to the Red Pitaya first.")
-            return
-        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "red_pitaya_top.bit.bin")
-        if not os.path.isfile(local_path):
-            self._show_error("File not found", f"Cannot find:\n{local_path}")
-            return
-        self.status_label.setText("Uploading bitfile…")
-
-        def task():
-            self.remote.upload_bitfile(local_path)
-            return self.remote.helper(self.base_addr, "read")
-
-        def on_result(data):
-            self.status_label.setText("Bitfile uploaded and FPGA reloaded.")
-            self._update_readback(data)
-
-        def on_error(message):
-            self.status_label.setText("Bitfile upload failed.")
-            self._show_error("Upload bitfile failed", message, log=False)
-
-        self._submit_job(task, on_result=on_result, on_error=on_error,
-                         operation=f"Upload FPGA bitfile {os.path.basename(local_path)}")
-
-    def upload_and_compile(self):
-        if not self.connected:
-            self._show_error("Not connected", "Connect to the Red Pitaya first.")
-            return
-        local_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rp_pulse_ctl.c")
-        if not os.path.isfile(local_src):
-            self._show_error("File not found", f"Cannot find:\n{local_src}")
-            return
-        self.status_label.setText("Uploading rp_pulse_ctl.c…")
-
-        def task():
-            self.remote.upload_and_compile(local_src)
-            return None
-
-        def on_error(message):
-            self.status_label.setText("Upload/compile failed.")
-            self._show_error("Upload/compile failed", message, log=False)
-
-        self._submit_job(
-            task,
-            on_result=lambda _none: self.status_label.setText("Upload & compile successful."),
-            on_error=on_error,
-            operation=f"Upload and compile {os.path.basename(local_src)}",
-        )
-
-    def read_back(self):
-        if not self.connected:
-            self._record_logbook("WARN", "Readback skipped because the board is not connected.")
-            return
-        self.status_label.setText("Reading registers…")
-
-        def task():
-            return self.remote.helper(self.base_addr, "read")
-
-        def on_result(data):
-            self._update_readback(data)
-            self.status_label.setText("Readback updated.")
-
-        def on_error(message):
-            self.status_label.setText("Readback failed.")
-            self._show_error("Readback failed", message, log=False)
-
-        self._submit_job(task, on_result=on_result, on_error=on_error,
-                         operation="Read hardware registers")
+        self._ssh:  Optional[paramiko.SSHClient]  = None
+        self._sftp: Optional[paramiko.SFTPClient] = None
+        self._live  = False
+        self._base  = DEFAULT_BASE
+        self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
+        self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
+        self._thread.start()
+
+    # ── public API (called from Qt main thread) ───────────────────────────────
+
+    def start_connect(self, host: str, port: int, user: str,
+                      key: Optional[str], base: int):
+        self._base = base
+        self._enqueue(self.P_INIT, lambda: self._do_connect(host, port, user, key))
+
+    def start_disconnect(self):
+        self._enqueue(self.P_INIT, self._do_disconnect)
+
+    def poll(self):
+        if self._live:
+            self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
+
+    def apply(self, width_cycles: int, offset_word: int, enable: bool):
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_write(width_cycles, offset_word, enable),
+                          self.sig_status.emit)
 
     def soft_reset(self):
-        if not self.connected:
-            self._record_logbook("WARN", "Soft reset skipped because the board is not connected.")
-            return
-        self.status_label.setText("Sending soft reset…")
+        if self._live:
+            self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
-        def task():
-            return self.remote.helper(self.base_addr, "soft_reset")
+    def upload(self, c_src: str, bit_src: Optional[str]):
+        if self._live:
+            self._enqueue(self.P_UPLOAD, lambda: self._do_upload(c_src, bit_src))
 
-        def on_result(data):
-            self._update_readback(data)
-            self.status_label.setText("Soft reset pulse sent.")
+    # ── internal ──────────────────────────────────────────────────────────────
 
-        def on_error(message):
-            self.status_label.setText("Soft reset failed.")
-            self._show_error("Soft reset failed", message, log=False)
+    def _enqueue(self, pri: int, fn: Callable, cb: Optional[Callable] = None):
+        self._q.put(_Job(pri, fn, cb))
 
-        self._submit_job(task, on_result=on_result, on_error=on_error,
-                         operation="Send soft reset")
+    def _loop(self):
+        while True:
+            job = self._q.get()
+            try:
+                result = job.fn()
+                if job.cb is not None and result is not None:
+                    job.cb(result)
+            except Exception as exc:
+                self._live = False
+                self.sig_error.emit(str(exc))
+                self.sig_disconnected.emit(str(exc))
 
-    def on_width_changed(self, _value: float):
-        self._refresh_preview_and_stats()
-        if not self.width_control.value_box.hasFocus():
-            self.maybe_auto_apply()
+    def _exec(self, cmd: str, timeout: float = 10.0) -> str:
+        _, stdout, stderr = self._ssh.exec_command(cmd, timeout=timeout)
+        out = stdout.read().decode()
+        err = stderr.read().decode().strip()
+        if err:
+            self.sig_log.emit(f"[stderr] {err}")
+        return out
 
-    def on_offset_changed(self):
-        self._refresh_preview_and_stats()
-        self.maybe_auto_apply()
+    def _rp_cmd(self) -> str:
+        return f"/root/rp_pulse_ctl 0x{self._base:08X}"
 
-    def maybe_auto_apply(self):
-        if self.auto_apply_toggle.isChecked():
-            self.auto_apply_timer.start()
+    # ── SSH operations (worker thread) ────────────────────────────────────────
 
-    def _auto_apply_timeout(self):
-        self._queue_apply(source="auto")
+    def _do_connect(self, host: str, port: int, user: str, key: Optional[str]):
+        self.sig_log.emit(f"Connecting to {user}@{host}:{port} …")
+        for obj in (self._sftp, self._ssh):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        kwargs: dict = dict(
+            hostname=host, port=port, username=user,
+            timeout=12, banner_timeout=20, auth_timeout=12,
+        )
+        if key:
+            kwargs["key_filename"] = key
+        client.connect(**kwargs)
+        self._ssh  = client
+        self._sftp = client.open_sftp()
+        self._live = True
+        self.sig_log.emit("SSH connected.")
+        self.sig_connected.emit()
 
-    def apply_now(self):
-        if not self.connected:
-            self._record_logbook("WARN", "Apply skipped because the board is not connected.")
-            return
-        if self.auto_apply_timer.isActive():
-            self.auto_apply_timer.stop()
-        self._queue_apply(source="manual")
+    def _do_disconnect(self):
+        self._live = False
+        for obj in (self._sftp, self._ssh):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        self._sftp = self._ssh = None
+        self.sig_disconnected.emit("user request")
 
-    def _queue_apply(self, source: str):
-        if not self.connected:
-            return
-        self._pending_apply_state = self._capture_apply_state()
-        if not self._apply_in_flight:
-            self.status_label.setText("Auto-applying…" if source == "auto" else "Applying…")
-            self._start_next_apply()
-        else:
-            self.status_label.setText("Apply queued…")
+    def _do_read(self) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} read"))
 
-    def _start_next_apply(self):
-        if self._pending_apply_state is None:
-            self._apply_in_flight = False
-            return
+    def _do_write(self, width: int, offset: int, enable: bool) -> dict:
+        ctrl = CTRL_ENABLE if enable else 0
+        return json.loads(self._exec(
+            f"{self._rp_cmd()} write {width} {offset} {ctrl}"
+        ))
 
-        state = self._pending_apply_state
-        self._pending_apply_state = None
-        self._apply_in_flight = True
-        self.status_label.setText("Applying…")
+    def _do_reset(self) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} soft_reset"))
 
-        def task():
-            data = self.remote.helper(
-                self.base_addr, "write",
-                state.width_cycles,
-                state.phase_step_offset,
-                state.control_word,
+    def _do_upload(self, c_src: str, bit_src: Optional[str]):
+        self.sig_log.emit("Uploading rp_pulse_ctl.c …")
+        self._sftp.put(c_src, "/root/rp_pulse_ctl.c")
+        self.sig_log.emit("Compiling on board …")
+        self._exec(
+            "gcc -O2 -o /root/rp_pulse_ctl /root/rp_pulse_ctl.c",
+            timeout=60,
+        )
+        self.sig_log.emit("Compiled OK.")
+        if bit_src and Path(bit_src).exists():
+            self.sig_log.emit("Uploading FPGA bitfile …")
+            self._sftp.put(bit_src, "/root/red_pitaya_top.bit.bin")
+            self.sig_log.emit("Loading bitfile …")
+            self._exec(
+                "/opt/redpitaya/bin/fpgautil -b /root/red_pitaya_top.bit.bin",
+                timeout=30,
             )
-            return state, data
+            self.sig_log.emit("FPGA loaded.")
 
-        def on_result(payload):
-            apply_state, data = payload
-            self._update_readback(data)
-            actual_delta_f = phase_step_offset_to_hz(apply_state.phase_step_offset)
-            self.status_label.setText(
-                f"Applied — width {apply_state.width_cycles} cyc, "
-                f"shift {actual_delta_f:+.6f} Hz."
-            )
 
-        def on_error(message):
-            self.status_label.setText("Apply failed.")
-            self._show_error("Apply failed", message, log=False)
+# ─────────────────────────────────────────────────────────────────────────────
+# Colour palette & shared style helpers
+# ─────────────────────────────────────────────────────────────────────────────
+_BG     = "#0d1117"
+_PANEL  = "#161b22"
+_ACCENT = "#00d4ff"
+_GREEN  = "#3fb950"
+_AMBER  = "#d29922"
+_RED    = "#f85149"
+_TEXT   = "#e6edf3"
+_DIM    = "#8b949e"
+_BORDER = "#30363d"
+_MONO   = "Menlo, Consolas, 'Courier New', monospace"
 
-        def on_finished():
-            if self._pending_apply_state is not None:
-                self._start_next_apply()
-            else:
-                self._apply_in_flight = False
 
-        self._submit_job(
-            task, on_result=on_result, on_error=on_error, on_finished=on_finished,
-            operation=(
-                f"Apply pulse settings "
-                f"(width={state.width_cycles}, "
-                f"shift={phase_step_offset_to_hz(state.phase_step_offset):+.6f} Hz, "
-                f"step_offset={state.phase_step_offset:+d}, "
-                f"control=0x{state.control_word:X})"
-            ),
+def _mono_font(size: int = 10, bold: bool = False) -> QFont:
+    for fam in ("Menlo", "Consolas", "Courier New"):
+        f = QFont(fam, size)
+        if f.exactMatch():
+            f.setBold(bold)
+            return f
+    f = QFont("monospace", size)
+    f.setBold(bold)
+    return f
+
+
+def _group_style() -> str:
+    return f"""
+        QGroupBox {{
+            color: {_ACCENT};
+            border: 1px solid {_BORDER};
+            border-radius: 6px;
+            margin-top: 14px;
+            padding: 10px 8px 8px 8px;
+            font-family: {_MONO};
+            font-size: 9px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+        }}
+    """
+
+
+def _btn_style(color: str = _ACCENT) -> str:
+    return f"""
+        QPushButton {{
+            background: {_PANEL}; color: {color};
+            border: 1px solid {color}; border-radius: 4px;
+            padding: 4px 10px;
+            font-family: {_MONO}; font-size: 10px;
+        }}
+        QPushButton:hover   {{ background: #1c2333; }}
+        QPushButton:pressed {{ background: #0d1824; }}
+        QPushButton:disabled {{ color: {_DIM}; border-color: {_BORDER}; }}
+    """
+
+
+def _le_style() -> str:
+    return f"""
+        QLineEdit {{
+            background: {_BG}; color: {_TEXT};
+            border: 1px solid {_BORDER}; border-radius: 4px;
+            padding: 3px 6px;
+            font-family: {_MONO}; font-size: 10px;
+        }}
+        QLineEdit:focus {{ border-color: {_ACCENT}; }}
+    """
+
+
+def _spin_style() -> str:
+    return f"""
+        QDoubleSpinBox {{
+            background: {_BG}; color: {_TEXT};
+            border: 1px solid {_BORDER}; border-radius: 4px;
+            padding: 3px;
+            font-family: {_MONO}; font-size: 10px;
+        }}
+        QDoubleSpinBox:focus {{ border-color: {_ACCENT}; }}
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+            width: 16px;
+        }}
+    """
+
+
+def _slider_style(accent: str = _ACCENT) -> str:
+    return f"""
+        QSlider::groove:horizontal {{
+            height: 4px; background: {_BORDER}; border-radius: 2px;
+        }}
+        QSlider::handle:horizontal {{
+            width: 14px; height: 14px; margin: -5px 0;
+            background: {accent}; border-radius: 7px;
+        }}
+        QSlider::sub-page:horizontal {{
+            background: {accent}; border-radius: 2px;
+        }}
+    """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BigDisplay — large labelled readout
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BigDisplay(QFrame):
+    """
+    Displays a single measurement (frequency, duration, etc.) in a large font.
+    Four of these form the top row of the UI.
+    """
+
+    def __init__(self, title: str, sub_hint: str = "",
+                 accent: str = _ACCENT, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._accent = accent
+        self.setFrameShape(QFrame.NoFrame)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {_PANEL};
+                border: 1px solid {_BORDER};
+                border-radius: 8px;
+            }}
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(4)
+
+        title_lbl = QLabel(title.upper())
+        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl.setFont(_mono_font(8))
+        title_lbl.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
+        lay.addWidget(title_lbl)
+
+        self._val = QLabel("---")
+        self._val.setAlignment(Qt.AlignCenter)
+        self._val.setFont(_mono_font(26, bold=True))
+        self._val.setStyleSheet(f"color: {accent}; background: transparent; border: none;")
+        self._val.setMinimumWidth(230)
+        self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        lay.addWidget(self._val)
+
+        self._sub = QLabel(sub_hint)
+        self._sub.setAlignment(Qt.AlignCenter)
+        self._sub.setFont(_mono_font(9))
+        self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
+        lay.addWidget(self._sub)
+
+    def set_data(self, value: str, sub: str = "",
+                 color: Optional[str] = None):
+        self._val.setText(value)
+        c = color or self._accent
+        self._val.setStyleSheet(f"color: {c}; background: transparent; border: none;")
+        if sub is not None:
+            self._sub.setText(sub)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ParamSlider — horizontal slider paired with a spinbox
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ParamSlider(QWidget):
+    """Combines a QSlider and a QDoubleSpinBox that stay synchronised."""
+
+    changed = Signal(float)
+
+    def __init__(self, label: str, lo: float, hi: float,
+                 decimals: int = 2, suffix: str = "",
+                 accent: str = _ACCENT, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._lo  = lo
+        self._hi  = hi
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        lbl = QLabel(f"{label}:")
+        lbl.setFixedWidth(90)
+        lbl.setFont(_mono_font(10))
+        lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        row.addWidget(lbl)
+
+        self._sl = QSlider(Qt.Horizontal)
+        self._sl.setRange(0, 10000)
+        self._sl.setStyleSheet(_slider_style(accent))
+        row.addWidget(self._sl, 1)
+
+        self._sp = QDoubleSpinBox()
+        self._sp.setRange(lo, hi)
+        self._sp.setDecimals(decimals)
+        if suffix:
+            self._sp.setSuffix(f" {suffix}")
+        self._sp.setFixedWidth(115)
+        self._sp.setStyleSheet(_spin_style())
+        row.addWidget(self._sp)
+
+        self._sl.valueChanged.connect(self._from_slider)
+        self._sp.valueChanged.connect(self._from_spin)
+
+    def _frac(self, v: float) -> float:
+        span = self._hi - self._lo
+        return (v - self._lo) / span if span else 0.0
+
+    def _from_slider(self, tick: int):
+        v = self._lo + tick / 10000.0 * (self._hi - self._lo)
+        self._sp.blockSignals(True)
+        self._sp.setValue(v)
+        self._sp.blockSignals(False)
+        self.changed.emit(v)
+
+    def _from_spin(self, v: float):
+        self._sl.blockSignals(True)
+        self._sl.setValue(int(self._frac(v) * 10000))
+        self._sl.blockSignals(False)
+        self.changed.emit(v)
+
+    def value(self) -> float:
+        return self._sp.value()
+
+    def set_value(self, v: float):
+        self._sp.blockSignals(True)
+        self._sl.blockSignals(True)
+        self._sp.setValue(v)
+        self._sl.setValue(int(self._frac(v) * 10000))
+        self._sp.blockSignals(False)
+        self._sl.blockSignals(False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MainWindow
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Red Pitaya — TTL Frequency Divider")
+        self.setMinimumSize(920, 620)
+
+        self._period_c = 0   # last known period in FPGA clock cycles
+        self._live     = False
+
+        # Backend
+        self._be = SshBackend(self)
+        self._be.sig_connected.connect(self._on_connected)
+        self._be.sig_disconnected.connect(self._on_disconnected)
+        self._be.sig_status.connect(self._on_status)
+        self._be.sig_log.connect(self._log)
+        self._be.sig_error.connect(self._on_error)
+
+        # Debounce timer — delays auto-apply 300 ms after last slider move
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self._do_apply)
+
+        # Poll timer — adaptive interval updated by _on_status
+        self._poll = QTimer(self)
+        self._poll.setInterval(800)
+        self._poll.timeout.connect(self._be.poll)
+
+        self._build_ui()
+        self._set_global_style()
+
+        # Ctrl+Return → apply
+        act = QAction(self)
+        act.setShortcut(QKeySequence("Ctrl+Return"))
+        act.triggered.connect(self._do_apply)
+        self.addAction(act)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        cw = QWidget()
+        self.setCentralWidget(cw)
+        root = QVBoxLayout(cw)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(self._build_connection())
+        root.addLayout(self._build_displays())
+        root.addWidget(self._build_controls())
+        root.addWidget(self._build_log())
+
+    def _make_group(self, title: str) -> QGroupBox:
+        g = QGroupBox(title)
+        g.setStyleSheet(_group_style())
+        return g
+
+    def _build_connection(self) -> QGroupBox:
+        g = self._make_group("Connection")
+        row = QHBoxLayout(g)
+        row.setSpacing(6)
+
+        self._w_host = QLineEdit("rp-xxxxxx.local")
+        self._w_port = QLineEdit("22");   self._w_port.setFixedWidth(55)
+        self._w_user = QLineEdit("root"); self._w_user.setFixedWidth(70)
+        self._w_key  = QLineEdit();       self._w_key.setPlaceholderText("SSH key (optional)")
+
+        btn_key = QPushButton("…"); btn_key.setFixedWidth(28)
+        btn_key.clicked.connect(self._pick_key)
+
+        self._btn_conn = QPushButton("Connect"); self._btn_conn.setFixedWidth(95)
+        self._btn_conn.clicked.connect(self._toggle_connect)
+
+        self._lbl_status = QLabel("●  Disconnected")
+        self._lbl_status.setFont(_mono_font(10))
+        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
+
+        for w, lbl in ((self._w_host, "Host:"), (self._w_port, "Port:"),
+                       (self._w_user, "User:"), (self._w_key, "Key:")):
+            cap = QLabel(lbl)
+            cap.setFont(_mono_font(9))
+            cap.setStyleSheet(f"color: {_DIM}; background: transparent;")
+            row.addWidget(cap)
+            row.addWidget(w)
+
+        row.addWidget(btn_key)
+        row.addWidget(self._btn_conn)
+        row.addWidget(self._lbl_status)
+        row.addStretch()
+
+        for le in (self._w_host, self._w_port, self._w_user, self._w_key):
+            le.setStyleSheet(_le_style())
+        for b in (self._btn_conn, btn_key):
+            b.setStyleSheet(_btn_style())
+        return g
+
+    def _build_displays(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self._d_in  = BigDisplay("Input Frequency",  "measured input period",  _ACCENT)
+        self._d_out = BigDisplay("Output Frequency",  "NCO output",             _GREEN)
+        self._d_dur = BigDisplay("Pulse Duration",    "pulse high-time",        _AMBER)
+        self._d_dut = BigDisplay("Duty Cycle",        "width / period",         _AMBER)
+        for d in (self._d_in, self._d_out, self._d_dur, self._d_dut):
+            row.addWidget(d, 1)
+        return row
+
+    def _build_controls(self) -> QGroupBox:
+        g = self._make_group("Pulse Controls")
+        lay = QVBoxLayout(g)
+        lay.setSpacing(8)
+
+        self._sl_width  = ParamSlider("Width",  0.001, 0.999, 4, "%",  _ACCENT)
+        self._sl_offset = ParamSlider("Offset", -200.0, 200.0, 4, "Hz", _ACCENT)
+        self._sl_width.set_value(0.5)
+        self._sl_offset.set_value(0.0)
+        self._sl_width.changed.connect(self._param_changed)
+        self._sl_offset.changed.connect(self._param_changed)
+
+        btns = QHBoxLayout(); btns.setSpacing(10)
+        self._cb_en   = QCheckBox("Enable Output")
+        self._cb_auto = QCheckBox("Auto-Apply"); self._cb_auto.setChecked(True)
+        self._btn_apply  = QPushButton("Apply Now   Ctrl+↵")
+        self._btn_reset  = QPushButton("Soft Reset")
+        self._btn_upload = QPushButton("Upload && Compile")
+
+        for cb in (self._cb_en, self._cb_auto):
+            cb.setFont(_mono_font(10))
+            cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
+            btns.addWidget(cb)
+        for b in (self._btn_apply, self._btn_reset, self._btn_upload):
+            b.setStyleSheet(_btn_style())
+            btns.addWidget(b)
+        btns.addStretch()
+
+        self._cb_en.toggled.connect(self._param_changed)
+        self._btn_apply.clicked.connect(self._do_apply)
+        self._btn_reset.clicked.connect(self._be.soft_reset)
+        self._btn_upload.clicked.connect(self._do_upload)
+
+        lay.addWidget(self._sl_width)
+        lay.addWidget(self._sl_offset)
+        lay.addLayout(btns)
+        return g
+
+    def _build_log(self) -> QGroupBox:
+        g = self._make_group("Log")
+        lay = QVBoxLayout(g)
+        self._log_box = QTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setMaximumHeight(120)
+        self._log_box.setFont(_mono_font(9))
+        self._log_box.setStyleSheet(
+            f"background: {_BG}; color: {_DIM}; border: none; border-radius: 4px;"
+        )
+        lay.addWidget(self._log_box)
+        return g
+
+    def _set_global_style(self):
+        self.setStyleSheet(
+            f"QMainWindow, QWidget {{ background: {_BG}; color: {_TEXT}; }}"
         )
 
-    def _update_readback(self, data):
-        control     = int(data.get("control", 0))
-        filt_period = int(data.get("period_avg", data.get("filt_period", 0)))
-        status      = int(data.get("status", 0))
-        period_valid   = (status >> 1) & 0x1
-        timeout_flag   = (status >> 2) & 0x1
-        period_stable  = (status >> 3) & 0x1
-        freerun_active = (status >> 4) & 0x1
-        enable         = control & CONTROL_PULSE_ENABLE
+    # ── connection handling ───────────────────────────────────────────────────
 
-        # NCO readback (signed 48-bit, sign-extend if needed)
-        _limit = 2 ** (NCO_WIDTH - 1)
-        phase_step_raw = int(data.get("phase_step", 0))
-        if phase_step_raw >= _limit:
-            phase_step_raw -= 2 ** NCO_WIDTH
-        phase_step_base_raw = int(data.get("phase_step_base", 0))
-        if phase_step_base_raw >= _limit:
-            phase_step_base_raw -= 2 ** NCO_WIDTH
+    def _pick_key(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select SSH private key", str(Path.home() / ".ssh")
+        )
+        if path:
+            self._w_key.setText(path)
 
-        self._period_valid = bool(period_valid)
-        self._timeout_flag = bool(timeout_flag)
-
-        if period_valid and filt_period > 0:
-            self._period_cycles = filt_period
-
-        filt_freq = CLOCK_HZ / filt_period if filt_period > 0 else 0.0
-        # Output freq = input freq + live NCO delta
-        live_delta_f = phase_step_offset_to_hz(phase_step_raw)
-        out_freq = filt_freq + live_delta_f if filt_period > 0 else 0.0
-
-        self.stat_input.set_value(fmt_freq_hz(filt_freq) if filt_period > 0 else "—")
-        self.stat_input.set_footer("from hardware")
-        self.stat_output.set_value(fmt_freq_hz(out_freq) if filt_period > 0 else "—")
-        self.stat_output.set_footer("NCO output" if freerun_active else "awaiting lock")
-        self.stat_duty.set_value(f"{self.width_control.value() * 100:.1f} %")
-        self.stat_duty.set_footer("of output period")
-
-        if freerun_active:
-            self.stat_status.set_value("RUNNING")
-            self.stat_status.set_footer(f"shift {live_delta_f:+.4f} Hz")
-        elif period_stable:
-            self.stat_status.set_value("LOCKING")
-            self.stat_status.set_footer("period stable, transitioning")
-        elif period_valid:
-            self.stat_status.set_value("MEASURING")
-            self.stat_status.set_footer("waiting for stability")
+    def _toggle_connect(self):
+        if self._live:
+            self._be.start_disconnect()
         else:
-            self.stat_status.set_value("WAITING")
-            self.stat_status.set_footer("no valid trigger")
+            if not _HAS_PARAMIKO:
+                self._log("ERROR: paramiko not installed — run: pip install paramiko")
+                return
+            host = self._w_host.text().strip()
+            port = int(self._w_port.text().strip() or "22")
+            user = self._w_user.text().strip() or "root"
+            key  = self._w_key.text().strip() or None
+            self._btn_conn.setEnabled(False)
+            self._lbl_status.setText("●  Connecting …")
+            self._lbl_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
+            self._be.start_connect(host, port, user, key, DEFAULT_BASE)
 
-        self.enable_toggle.blockSignals(True)
-        self.enable_toggle.setChecked(bool(enable))
-        self.enable_toggle.blockSignals(False)
+    @Slot()
+    def _on_connected(self):
+        self._live = True
+        self._btn_conn.setText("Disconnect")
+        self._btn_conn.setEnabled(True)
+        self._lbl_status.setText("●  Connected")
+        self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
+        self._poll.start()
+        self._log("Connected.")
 
-        self._refresh_preview_and_stats()
+    @Slot(str)
+    def _on_disconnected(self, reason: str):
+        self._live = False
+        self._poll.stop()
+        self._btn_conn.setText("Connect")
+        self._btn_conn.setEnabled(True)
+        self._lbl_status.setText("●  Disconnected")
+        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
+        self._log(f"Disconnected: {reason}")
 
-        warnings: list[str] = []
-        if not period_valid:
-            warnings.append("No valid trigger period.")
-        if timeout_flag:
-            warnings.append("Trigger timeout detected on STATUS.bit2.")
-        self.freq_warning_label.setText("  ".join(f"\u26a0  {text}" for text in warnings))
+    # ── parameter controls ────────────────────────────────────────────────────
 
-    def closeEvent(self, event):
-        self._record_logbook("INFO", "Application closing.")
-        self._stop_poll()
-        self.executor.shutdown(wait=False, cancel_futures=True)
-        if self.connected and self.remote.host and RemoteCtl._USE_CONTROL_MASTER:
-            try:
-                subprocess.run(
-                    ["ssh", "-O", "exit",
-                     "-o", f"ControlPath={RemoteCtl._CONTROL_PATH}",
-                     f"{self.remote.user}@{self.remote.host}"],
-                    capture_output=True, timeout=5,
-                )
-            except Exception:
-                pass
-        super().closeEvent(event)
+    def _param_changed(self, *_):
+        """Called on any slider/spinbox/checkbox change."""
+        if self._cb_auto.isChecked():
+            self._debounce.start()   # restart 300 ms window
+        self._update_local_displays()
 
+    def _update_local_displays(self):
+        """Immediately refresh duration & duty from local slider state."""
+        if self._period_c <= 0:
+            return
+        frac = self._sl_width.value()
+        wc   = duty_to_cycles(frac, self._period_c)
+        self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
+        self._d_dut.set_data(f"{frac * 100:.2f} %")
+
+    def _do_apply(self):
+        if not self._live:
+            return
+        frac   = self._sl_width.value()
+        off_hz = self._sl_offset.value()
+        enable = self._cb_en.isChecked()
+        period = max(self._period_c, 1000)   # safe fallback before first poll
+        wc     = duty_to_cycles(frac, period)
+        self._be.apply(wc, hz_to_phase(off_hz), enable)
+        self._log(
+            f"Apply  width={frac * 100:.2f}%  "
+            f"offset={off_hz:+.4f} Hz  "
+            f"enable={enable}"
+        )
+
+    def _do_upload(self):
+        if not self._live:
+            return
+        here    = Path(__file__).parent
+        c_src   = str(here / "rp_pulse_ctl.c")
+        bit_src = str(here / "red_pitaya_top.bit.bin")
+        self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
+
+    # ── status update from hardware ───────────────────────────────────────────
+
+    @Slot(dict)
+    def _on_status(self, d: dict):
+        period = int(d.get("period_avg") or d.get("period") or 0)
+
+        if period > 0:
+            self._period_c = period
+            in_hz  = CLK_HZ / period
+            stable = bool(d.get("period_stable"))
+
+            self._d_in.set_data(
+                fmt_freq(in_hz),
+                "stable" if stable else "acquiring …",
+                _ACCENT if stable else _AMBER,
+            )
+
+            step   = int(d.get("phase_step") or d.get("phase_step_base") or 0)
+            out_hz = in_hz + phase_to_hz(step)
+            delta  = out_hz - in_hz
+            self._d_out.set_data(fmt_freq(out_hz), f"offset {delta:+.4f} Hz")
+
+            wc = int(d.get("width") or 0)
+            if wc > 0:
+                self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
+                self._d_dut.set_data(f"{wc / period * 100:.2f} %")
+
+            # Faster polling while signal is unstable
+            self._poll.setInterval(400 if not stable else 800)
+        else:
+            self._d_in.set_data("---", "no input signal", _RED)
+            self._poll.setInterval(400)
+
+    # ── error / log ───────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_error(self, msg: str):
+        self._lbl_status.setText("●  Error")
+        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
+        self._log(f"ERROR  {msg}")
+
+    @Slot(str)
+    def _log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        self._log_box.append(f"[{ts}]  {msg}")
+        sb = self._log_box.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Red Pitaya Pulse Control")
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    app.setApplicationName("RP Pulse GUI")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
