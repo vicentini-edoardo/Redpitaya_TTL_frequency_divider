@@ -52,6 +52,7 @@ DEFAULT_BASE = 0x40600000
 CTRL_ENABLE  = 0x01
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
+PHASE_RES_HZ = CLK_HZ / 2**PHASE_BITS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Math helpers
@@ -66,6 +67,9 @@ def phase_to_hz(word: int) -> float:
     return word * CLK_HZ / 2**PHASE_BITS
 
 
+MAX_SHIFT_HZ = phase_to_hz(_PHASE_MAX - 1)
+
+
 def duty_to_cycles(frac: float, period: int) -> int:
     return max(1, min(period - 1, int(round(frac * period))))
 
@@ -78,6 +82,13 @@ def fmt_freq(hz: float) -> str:
     if hz < 1e6:
         return f"{hz / 1e3:.6f} kHz"
     return f"{hz / 1e6:.6f} MHz"
+
+
+def fmt_signed_freq(hz: float) -> str:
+    if abs(hz) < PHASE_RES_HZ / 2:
+        return "+0.000000 Hz"
+    sign = "+" if hz >= 0 else "-"
+    return f"{sign}{fmt_freq(abs(hz))}"
 
 
 def fmt_dur(s: float) -> str:
@@ -437,7 +448,8 @@ class ParamSlider(QWidget):
 
     def __init__(self, label: str, lo: float, hi: float,
                  decimals: int = 2, suffix: str = "",
-                 accent: str = _ACCENT, parent: Optional[QWidget] = None):
+                 accent: str = _ACCENT, parent: Optional[QWidget] = None,
+                 spin_width: int = 115, single_step: Optional[float] = None):
         super().__init__(parent)
         self._lo  = lo
         self._hi  = hi
@@ -460,9 +472,11 @@ class ParamSlider(QWidget):
         self._sp = QDoubleSpinBox()
         self._sp.setRange(lo, hi)
         self._sp.setDecimals(decimals)
+        if single_step is not None:
+            self._sp.setSingleStep(single_step)
         if suffix:
             self._sp.setSuffix(f" {suffix}")
-        self._sp.setFixedWidth(115)
+        self._sp.setFixedWidth(spin_width)
         self._sp.setStyleSheet(_spin_style())
         row.addWidget(self._sp)
 
@@ -615,11 +629,19 @@ class MainWindow(QMainWindow):
         lay.setSpacing(8)
 
         self._sl_width  = ParamSlider("Width",  0.001, 0.999, 4, "%",  _ACCENT)
-        self._sl_offset = ParamSlider("Offset", -200.0, 200.0, 4, "Hz", _ACCENT)
+        self._sl_offset = ParamSlider(
+            "Freq shift", -MAX_SHIFT_HZ, MAX_SHIFT_HZ, 6, "Hz", _ACCENT,
+            spin_width=165, single_step=1.0,
+        )
         self._sl_width.set_value(0.5)
         self._sl_offset.set_value(0.0)
         self._sl_width.changed.connect(self._param_changed)
         self._sl_offset.changed.connect(self._param_changed)
+
+        self._lbl_shift = QLabel()
+        self._lbl_shift.setFont(_mono_font(9))
+        self._lbl_shift.setWordWrap(True)
+        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
 
         btns = QHBoxLayout(); btns.setSpacing(10)
         self._cb_en   = QCheckBox("Enable Output")
@@ -644,7 +666,9 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(self._sl_width)
         lay.addWidget(self._sl_offset)
+        lay.addWidget(self._lbl_shift)
         lay.addLayout(btns)
+        self._update_shift_detail()
         return g
 
     def _build_log(self) -> QGroupBox:
@@ -720,12 +744,29 @@ class MainWindow(QMainWindow):
 
     def _update_local_displays(self):
         """Immediately refresh duration & duty from local slider state."""
+        self._update_shift_detail()
         if self._period_c <= 0:
             return
         frac = self._sl_width.value()
         wc   = duty_to_cycles(frac, self._period_c)
         self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
         self._d_dut.set_data(f"{frac * 100:.2f} %")
+
+    def _update_shift_detail(self):
+        requested_hz = self._sl_offset.value()
+        offset_word = hz_to_phase(requested_hz)
+        actual_hz = phase_to_hz(offset_word)
+        if self._period_c > 0:
+            input_hz = CLK_HZ / self._period_c
+            output_hz = input_hz + actual_hz
+            out_text = f", target output {fmt_freq(output_hz)}" if output_hz > 0 else ""
+        else:
+            out_text = ""
+        self._lbl_shift.setText(
+            f"Frequency shift: requested {requested_hz:+.6f} Hz, "
+            f"actual {actual_hz:+.6f} Hz, register {offset_word:+d}, "
+            f"resolution {PHASE_RES_HZ:.9f} Hz/LSB{out_text}"
+        )
 
     def _do_apply(self):
         if not self._live:
@@ -735,10 +776,13 @@ class MainWindow(QMainWindow):
         enable = self._cb_en.isChecked()
         period = max(self._period_c, 1000)   # safe fallback before first poll
         wc     = duty_to_cycles(frac, period)
-        self._be.apply(wc, hz_to_phase(off_hz), enable)
+        offset_word = hz_to_phase(off_hz)
+        actual_hz = phase_to_hz(offset_word)
+        self._be.apply(wc, offset_word, enable)
         self._log(
             f"Apply  width={frac * 100:.2f}%  "
-            f"offset={off_hz:+.4f} Hz  "
+            f"shift={actual_hz:+.6f} Hz  "
+            f"phase_offset={offset_word:+d}  "
             f"enable={enable}"
         )
 
@@ -767,10 +811,13 @@ class MainWindow(QMainWindow):
                 _ACCENT if stable else _AMBER,
             )
 
-            step   = int(d.get("phase_step") or d.get("phase_step_base") or 0)
-            out_hz = in_hz + phase_to_hz(step)
-            delta  = out_hz - in_hz
-            self._d_out.set_data(fmt_freq(out_hz), f"offset {delta:+.4f} Hz")
+            step_base = int(d.get("phase_step_base") or 0)
+            step_live = int(d.get("phase_step") or step_base)
+            step_off  = int(d.get("phase_step_offset") or (step_live - step_base))
+            out_hz = phase_to_hz(step_live)
+            delta  = phase_to_hz(step_off)
+            self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
+            self._update_shift_detail()
 
             wc = int(d.get("width") or 0)
             if wc > 0:
