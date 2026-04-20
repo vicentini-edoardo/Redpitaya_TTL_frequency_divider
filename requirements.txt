@@ -1,1 +1,2 @@
-PySide6
+PySide6-Essentials>=6.6
+paramiko>=3.0
