@@ -418,7 +418,6 @@ class BigDisplay(QFrame):
         self._val.setAlignment(Qt.AlignCenter)
         self._val.setFont(_mono_font(26, bold=True))
         self._val.setStyleSheet(f"color: {accent}; background: transparent; border: none;")
-        self._val.setMinimumWidth(230)
         self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay.addWidget(self._val)
 
@@ -521,7 +520,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Red Pitaya — TTL Frequency Divider")
-        self.setMinimumSize(920, 620)
+        self.setMinimumSize(960, 680)
 
         self._period_c = 0   # last known period in FPGA clock cycles
         self._live     = False
@@ -564,8 +563,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(12)
 
         root.addWidget(self._build_connection())
-        root.addLayout(self._build_displays())
-        root.addWidget(self._build_controls())
+        root.addLayout(self._build_main_area(), 1)
         root.addWidget(self._build_log())
 
     def _make_group(self, title: str) -> QGroupBox:
@@ -578,7 +576,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(g)
         row.setSpacing(6)
 
-        self._w_host = QLineEdit("rp-xxxxxx.local")
+        self._w_host = QLineEdit("rp-f06a51.local")
         self._w_port = QLineEdit("22");   self._w_port.setFixedWidth(55)
         self._w_user = QLineEdit("root"); self._w_user.setFixedWidth(70)
         self._w_key  = QLineEdit();       self._w_key.setPlaceholderText("SSH key (optional)")
@@ -612,36 +610,31 @@ class MainWindow(QMainWindow):
             b.setStyleSheet(_btn_style())
         return g
 
-    def _build_displays(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        self._d_in  = BigDisplay("Input Frequency",  "measured input period",  _ACCENT)
-        self._d_out = BigDisplay("Output Frequency",  "NCO output",             _GREEN)
-        self._d_dur = BigDisplay("Pulse Duration",    "pulse high-time",        _AMBER)
-        self._d_dut = BigDisplay("Duty Cycle",        "width / period",         _AMBER)
-        for d in (self._d_in, self._d_out, self._d_dur, self._d_dut):
-            row.addWidget(d, 1)
-        return row
+    def _build_main_area(self) -> QVBoxLayout:
+        outer = QVBoxLayout()
+        outer.setSpacing(8)
 
-    def _build_controls(self) -> QGroupBox:
-        g = self._make_group("Pulse Controls")
-        lay = QVBoxLayout(g)
-        lay.setSpacing(8)
+        # Two-column layout
+        cols = QHBoxLayout()
+        cols.setSpacing(10)
 
-        self._sl_width  = ParamSlider("Width",  0.001, 0.999, 4, "%",  _ACCENT)
-        self._sl_width.set_value(0.5)
-        self._sl_width.changed.connect(self._param_changed)
+        # ── Left: Input Freq → Freq-shift spinbox → Output Freq ──────────────
+        left = QVBoxLayout()
+        left.setSpacing(8)
+
+        self._d_in = BigDisplay(
+            "Input Frequency", "measured input period", _ACCENT
+        )
+        left.addWidget(self._d_in, 1)
 
         freq_row = QHBoxLayout()
         freq_row.setContentsMargins(0, 0, 0, 0)
         freq_row.setSpacing(8)
-
         freq_lbl = QLabel("Freq shift:")
         freq_lbl.setFixedWidth(90)
         freq_lbl.setFont(_mono_font(10))
         freq_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         freq_row.addWidget(freq_lbl)
-
         self._sp_offset = QDoubleSpinBox()
         self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
         self._sp_offset.setDecimals(6)
@@ -654,15 +647,45 @@ class MainWindow(QMainWindow):
         self._sp_offset.valueChanged.connect(self._param_changed)
         freq_row.addWidget(self._sp_offset)
         freq_row.addStretch()
+        left.addLayout(freq_row)
 
+        self._d_out = BigDisplay("Output Frequency", "NCO output", _GREEN)
+        left.addWidget(self._d_out, 1)
+
+        # ── Right: Pulse Duration → Width slider → Duty Cycle ────────────────
+        right = QVBoxLayout()
+        right.setSpacing(8)
+
+        self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
+        right.addWidget(self._d_dur, 1)
+
+        self._sl_width = ParamSlider("Width", 0.001, 0.999, 4, "%", _ACCENT)
+        self._sl_width.set_value(0.5)
+        self._sl_width.changed.connect(self._param_changed)
+        right.addWidget(self._sl_width)
+
+        self._d_dut = BigDisplay("Duty Cycle", "width / period", _AMBER)
+        right.addWidget(self._d_dut, 1)
+
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        outer.addLayout(cols, 1)
+
+        # ── Shift detail label ────────────────────────────────────────────────
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
         self._lbl_shift.setWordWrap(True)
-        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        self._lbl_shift.setStyleSheet(
+            f"color: {_DIM}; background: transparent;"
+        )
+        outer.addWidget(self._lbl_shift)
 
-        btns = QHBoxLayout(); btns.setSpacing(10)
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btns = QHBoxLayout()
+        btns.setSpacing(10)
         self._cb_en   = QCheckBox("Enable Output")
-        self._cb_auto = QCheckBox("Auto-Apply"); self._cb_auto.setChecked(True)
+        self._cb_auto = QCheckBox("Auto-Apply")
+        self._cb_auto.setChecked(True)
         self._btn_apply  = QPushButton("Apply Now   Ctrl+↵")
         self._btn_reset  = QPushButton("Soft Reset")
         self._btn_upload = QPushButton("Upload && Compile")
@@ -681,12 +704,9 @@ class MainWindow(QMainWindow):
         self._btn_reset.clicked.connect(self._be.soft_reset)
         self._btn_upload.clicked.connect(self._do_upload)
 
-        lay.addWidget(self._sl_width)
-        lay.addLayout(freq_row)
-        lay.addWidget(self._lbl_shift)
-        lay.addLayout(btns)
+        outer.addLayout(btns)
         self._update_shift_detail()
-        return g
+        return outer
 
     def _build_log(self) -> QGroupBox:
         g = self._make_group("Log")
