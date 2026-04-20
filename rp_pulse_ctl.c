@@ -12,8 +12,8 @@
  *   0x04  reserved
  *   0x08  width             pulse width in 125 MHz clock cycles
  *   0x0C  reserved
- *   0x10  status            bit 0 = busy, bit 1 = period_valid, bit 2 = timeout,
- *                           bit 3 = period_stable, bit 4 = freerun_active
+ *   0x10  status            bit 0 = busy, bit 1 = period_valid, bit 2 = period_stable,
+ *                           bit 3 = timeout, bit 4 = freerun_active
  *   0x14  period            last raw measured input period (cycles)
  *   0x18  period_avg        IIR-filtered measured input period (cycles)
  *   0x1C  phase_step_offset_lo  bits [31:0]  of signed 48-bit NCO offset
@@ -90,7 +90,7 @@ static void wr48(volatile uint8_t *base, off_t lo_off, off_t hi_off, int64_t val
 /* Print all registers as a JSON object. The GUI parses this output. */
 static void print_json(volatile uint8_t *base) {
     const uint32_t status         = rd32(base, REG_STATUS);
-    const uint32_t period_stable  = (status >> 3) & 0x1u;
+    const uint32_t period_stable  = (status >> 2) & 0x1u;
     const uint32_t freerun_active = (status >> 4) & 0x1u;
     const int64_t  step_offset    = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
     const int64_t  step_base      = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
