@@ -629,14 +629,31 @@ class MainWindow(QMainWindow):
         lay.setSpacing(8)
 
         self._sl_width  = ParamSlider("Width",  0.001, 0.999, 4, "%",  _ACCENT)
-        self._sl_offset = ParamSlider(
-            "Freq shift", -MAX_SHIFT_HZ, MAX_SHIFT_HZ, 6, "Hz", _ACCENT,
-            spin_width=165, single_step=1.0,
-        )
         self._sl_width.set_value(0.5)
-        self._sl_offset.set_value(0.0)
         self._sl_width.changed.connect(self._param_changed)
-        self._sl_offset.changed.connect(self._param_changed)
+
+        freq_row = QHBoxLayout()
+        freq_row.setContentsMargins(0, 0, 0, 0)
+        freq_row.setSpacing(8)
+
+        freq_lbl = QLabel("Freq shift:")
+        freq_lbl.setFixedWidth(90)
+        freq_lbl.setFont(_mono_font(10))
+        freq_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        freq_row.addWidget(freq_lbl)
+
+        self._sp_offset = QDoubleSpinBox()
+        self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
+        self._sp_offset.setDecimals(6)
+        self._sp_offset.setSingleStep(1.0)
+        self._sp_offset.setSuffix(" Hz")
+        self._sp_offset.setFixedHeight(44)
+        self._sp_offset.setMinimumWidth(260)
+        self._sp_offset.setFont(_mono_font(15, bold=True))
+        self._sp_offset.setStyleSheet(_spin_style())
+        self._sp_offset.valueChanged.connect(self._param_changed)
+        freq_row.addWidget(self._sp_offset)
+        freq_row.addStretch()
 
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
@@ -665,7 +682,7 @@ class MainWindow(QMainWindow):
         self._btn_upload.clicked.connect(self._do_upload)
 
         lay.addWidget(self._sl_width)
-        lay.addWidget(self._sl_offset)
+        lay.addLayout(freq_row)
         lay.addWidget(self._lbl_shift)
         lay.addLayout(btns)
         self._update_shift_detail()
@@ -753,7 +770,7 @@ class MainWindow(QMainWindow):
         self._d_dut.set_data(f"{frac * 100:.2f} %")
 
     def _update_shift_detail(self):
-        requested_hz = self._sl_offset.value()
+        requested_hz = self._sp_offset.value()
         offset_word = hz_to_phase(requested_hz)
         actual_hz = phase_to_hz(offset_word)
         if self._period_c > 0:
@@ -772,7 +789,7 @@ class MainWindow(QMainWindow):
         if not self._live:
             return
         frac   = self._sl_width.value()
-        off_hz = self._sl_offset.value()
+        off_hz = self._sp_offset.value()
         enable = self._cb_en.isChecked()
         period = max(self._period_c, 1000)   # safe fallback before first poll
         wc     = duty_to_cycles(frac, period)
