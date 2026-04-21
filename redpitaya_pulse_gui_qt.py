@@ -659,8 +659,8 @@ class MainWindow(QMainWindow):
         self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
         right.addWidget(self._d_dur, 1)
 
-        self._sl_width = ParamSlider("Width", 0.001, 0.999, 4, "%", _ACCENT)
-        self._sl_width.set_value(0.5)
+        self._sl_width = ParamSlider("Width", 0.1, 99.9, 2, "%", _ACCENT)
+        self._sl_width.set_value(50.0)
         self._sl_width.changed.connect(self._param_changed)
         right.addWidget(self._sl_width)
 
@@ -784,10 +784,10 @@ class MainWindow(QMainWindow):
         self._update_shift_detail()
         if self._period_c <= 0:
             return
-        frac = self._sl_width.value()
+        frac = self._sl_width.value() / 100.0
         wc   = duty_to_cycles(frac, self._period_c)
         self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
-        self._d_dut.set_data(f"{frac * 100:.2f} %")
+        self._d_dut.set_data(f"{self._sl_width.value():.2f} %")
 
     def _update_shift_detail(self):
         requested_hz = self._sp_offset.value()
@@ -808,16 +808,16 @@ class MainWindow(QMainWindow):
     def _do_apply(self):
         if not self._live:
             return
-        frac   = self._sl_width.value()
+        frac   = self._sl_width.value() / 100.0
         off_hz = self._sp_offset.value()
         enable = self._cb_en.isChecked()
-        period = max(self._period_c, 1000)   # safe fallback before first poll
+        period = self._period_c if self._period_c > 0 else 1000
         wc     = duty_to_cycles(frac, period)
         offset_word = hz_to_phase(off_hz)
         actual_hz = phase_to_hz(offset_word)
         self._be.apply(wc, offset_word, enable)
         self._log(
-            f"Apply  width={frac * 100:.2f}%  "
+            f"Apply  width={self._sl_width.value():.2f}%  "
             f"shift={actual_hz:+.6f} Hz  "
             f"phase_offset={offset_word:+d}  "
             f"enable={enable}"
