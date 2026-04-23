@@ -524,6 +524,7 @@ class MainWindow(QMainWindow):
 
         self._period_c = 0   # last known period in FPGA clock cycles
         self._live     = False
+        self._refresh_input_pending = False
 
         # Backend
         self._be = SshBackend(self)
@@ -686,23 +687,25 @@ class MainWindow(QMainWindow):
         self._cb_en   = QCheckBox("Enable Output")
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
-        self._btn_apply  = QPushButton("Apply Now   Ctrl+↵")
-        self._btn_reset  = QPushButton("Soft Reset")
-        self._btn_upload = QPushButton("Upload && Compile")
+        self._btn_measure = QPushButton("Measure Input")
+        self._btn_apply   = QPushButton("Apply Now   Ctrl+↵")
+        self._btn_reset   = QPushButton("Soft Reset")
+        self._btn_upload  = QPushButton("Upload && Compile")
 
         for cb in (self._cb_en, self._cb_auto):
             cb.setFont(_mono_font(10))
             cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
             btns.addWidget(cb)
-        for b in (self._btn_apply, self._btn_reset, self._btn_upload):
+        for b in (self._btn_measure, self._btn_apply, self._btn_reset, self._btn_upload):
             b.setStyleSheet(_btn_style())
             btns.addWidget(b)
         btns.addStretch()
 
         self._cb_en.toggled.connect(self._param_changed)
         self._btn_apply.clicked.connect(self._do_apply)
-        self._btn_reset.clicked.connect(self._be.soft_reset)
+        self._btn_reset.clicked.connect(self._do_soft_reset)
         self._btn_upload.clicked.connect(self._do_upload)
+        self._btn_measure.clicked.connect(self._do_measure_input)
 
         outer.addLayout(btns)
         self._update_shift_detail()
@@ -758,12 +761,15 @@ class MainWindow(QMainWindow):
         self._btn_conn.setEnabled(True)
         self._lbl_status.setText("●  Connected")
         self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
+        self._refresh_input_pending = True
         self._poll.start()
+        self._be.poll()   # kick off immediate first read rather than waiting 800 ms
         self._log("Connected.")
 
     @Slot(str)
     def _on_disconnected(self, reason: str):
         self._live = False
+        self._refresh_input_pending = False
         self._poll.stop()
         self._btn_conn.setText("Connect")
         self._btn_conn.setEnabled(True)
@@ -823,6 +829,20 @@ class MainWindow(QMainWindow):
             f"enable={enable}"
         )
 
+    def _do_measure_input(self):
+        if not self._live:
+            return
+        self._refresh_input_pending = True
+        self._d_in.set_data("…", "measuring", _AMBER)
+        self._be.poll()
+        self._log("Measure Input requested.")
+
+    def _do_soft_reset(self):
+        if not self._live:
+            return
+        self._refresh_input_pending = True
+        self._be.soft_reset()
+
     def _do_upload(self):
         if not self._live:
             return
@@ -836,18 +856,29 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def _on_status(self, d: dict):
         period = int(d.get("period_avg") or d.get("period") or 0)
+        stable = bool(d.get("period_stable"))
 
+        # Only update the displayed input frequency when explicitly requested.
+        if self._refresh_input_pending:
+            if period > 0:
+                self._period_c = period
+                in_hz = CLK_HZ / period
+                self._d_in.set_data(
+                    fmt_freq(in_hz),
+                    "stable" if stable else "acquiring …",
+                    _ACCENT if stable else _AMBER,
+                )
+                self._refresh_input_pending = False
+                self._log(
+                    f"Input measured: {fmt_freq(in_hz)} "
+                    f"({'stable' if stable else 'acquiring'})"
+                )
+            else:
+                # No signal yet; keep the flag set so the next poll tries again.
+                self._d_in.set_data("---", "no input signal", _RED)
+
+        # Output, width/duty, and adaptive poll interval update on every tick.
         if period > 0:
-            self._period_c = period
-            in_hz  = CLK_HZ / period
-            stable = bool(d.get("period_stable"))
-
-            self._d_in.set_data(
-                fmt_freq(in_hz),
-                "stable" if stable else "acquiring …",
-                _ACCENT if stable else _AMBER,
-            )
-
             step_base = int(d.get("phase_step_base") or 0)
             step_live = int(d.get("phase_step") or step_base)
             step_off  = int(d.get("phase_step_offset") or (step_live - step_base))
@@ -861,10 +892,8 @@ class MainWindow(QMainWindow):
                 self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
                 self._d_dut.set_data(f"{wc / period * 100:.2f} %")
 
-            # Faster polling while signal is unstable
             self._poll.setInterval(400 if not stable else 800)
         else:
-            self._d_in.set_data("---", "no input signal", _RED)
             self._poll.setInterval(400)
 
     # ── error / log ───────────────────────────────────────────────────────────
