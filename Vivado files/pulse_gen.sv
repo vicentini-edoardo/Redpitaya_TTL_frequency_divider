@@ -1,5 +1,5 @@
 `timescale 1ns / 1ps
-// pulse_gen - NCO-based pulse generator referenced to an external trigger.
+// pulse_gen - NCO-based pulse generator with reciprocal frequency counting.
 //
 // Clock domain: fclk_clk0 (125 MHz).
 //   All control inputs and status outputs share this clock with
@@ -8,17 +8,18 @@
 // Operation (two phases):
 //
 //   MEASURE phase (!freerun_active):
-//     Incoming trigger edges are timed by a free-running counter.
-//     A first-order IIR (alpha = 1/8) smooths the measured period.
-//     After STABLE_COUNT (8) consecutive valid periods, period_stable asserts.
+//     Incoming trigger edges (both rising and falling) are counted over a fixed
+//     time window (10 ms, 100 ms, 500 ms, or 1000 ms selected via reg_window).
+//     period_avg = window_cycles * 2 / edge_count (averaging both edges)
+//     After first complete window, period_stable asserts.
 //     An iterative divider (49 cycles) computes phase_step_base = 2^48 / period_avg.
-//     Once period_stable and the first division have completed, transitions to FREERUN.
+//     Once period_stable and division complete, transitions to FREERUN.
 //
 //   FREERUN phase (freerun_active):
 //     48-bit NCO: phase_acc += phase_step each clock.
 //     phase_step = phase_step_base + phase_step_offset (live; changes take effect immediately).
 //     Carry-out of bit 47 triggers a new output pulse of pulse_width cycles.
-//     phase_step_base is recomputed whenever a new valid period measurement arrives.
+//     phase_step_base is recomputed after each measurement window completes.
 //
 //   Resetting:
 //     soft_reset or deasserting enable clears freerun_active, resets the NCO,
@@ -34,6 +35,7 @@ module pulse_gen
   input  logic        enable,
   input  logic        soft_reset,
   input  logic [31:0] pulse_width,
+  input  logic [ 1:0] window_select,
 
   input  logic signed [47:0] phase_step_offset,
 
@@ -55,13 +57,26 @@ module pulse_gen
 
   localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = 32'd125_000_000;
   localparam logic [31:0] MIN_PERIOD_CYCLES     = 32'd200;
-  localparam int unsigned AVG_SHIFT             = 3;
-  localparam int unsigned STABLE_COUNT          = 8;
+
+  // Window sizes in clock cycles (125 MHz clock)
+  // 0: 10 ms   = 1,250,000 cycles
+  // 1: 100 ms  = 12,500,000 cycles
+  // 2: 500 ms  = 62,500,000 cycles
+  // 3: 1000 ms = 125,000,000 cycles
+  logic [31:0] window_cycles;
+  always_comb begin
+    case (window_select)
+      2'd0:    window_cycles = 32'd1_250_000;
+      2'd1:    window_cycles = 32'd12_500_000;
+      2'd2:    window_cycles = 32'd62_500_000;
+      default: window_cycles = 32'd125_000_000;
+    endcase
+  end
 
   // ----------------------------------------------------------------
-  // 2-FF synchronizer for trig_in
+  // 2-FF synchronizer for trig_in, detect both edges
   // ----------------------------------------------------------------
-  logic trig_meta, trig_sync, trig_sync_d, trig_rise;
+  logic trig_meta, trig_sync, trig_sync_d, trig_rise, trig_fall, trig_edge;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -76,79 +91,72 @@ module pulse_gen
   end
 
   assign trig_rise     = trig_sync & ~trig_sync_d;
+  assign trig_fall     = ~trig_sync & trig_sync_d;
+  assign trig_edge     = trig_rise | trig_fall;
   assign trig_rise_dbg = trig_rise;
 
   // ----------------------------------------------------------------
-  // IIR average - combinational
+  // Reciprocal frequency counter: count edges over fixed time window
   // ----------------------------------------------------------------
-  logic [31:0] period_cnt;
-  logic signed [32:0] avg_error_c, avg_step_c, avg_ext_c;
-  logic [31:0] period_avg_next;
-
-  always_comb begin
-    avg_error_c     = $signed({1'b0, period_cnt}) - $signed({1'b0, period_avg_cycles});
-    avg_step_c      = avg_error_c >>> AVG_SHIFT;
-    avg_ext_c       = $signed({1'b0, period_avg_cycles}) + avg_step_c;
-    period_avg_next = (avg_ext_c < 0) ? 32'd0 : avg_ext_c[31:0];
-  end
-
-  // ----------------------------------------------------------------
-  // Period measurement + IIR + warm-up counter
-  // ----------------------------------------------------------------
-  logic        seen_first_trigger;
-  logic [3:0]  stable_cnt;
+  logic [31:0] clk_cnt;
+  logic [31:0] edge_cnt;
+  logic        window_active;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
-      period_cnt         <= 32'd0;
-      period_cycles      <= 32'd0;
-      period_avg_cycles  <= 32'd0;
-      period_valid       <= 1'b0;
-      period_stable      <= 1'b0;
-      stable_cnt         <= 4'd0;
-      timeout_flag       <= 1'b0;
-      seen_first_trigger <= 1'b0;
+      clk_cnt         <= 32'd0;
+      edge_cnt        <= 32'd0;
+      period_cycles   <= 32'd0;
+      period_avg_cycles <= 32'd0;
+      period_valid    <= 1'b0;
+      period_stable   <= 1'b0;
+      timeout_flag    <= 1'b0;
+      window_active   <= 1'b0;
     end else begin
       if (soft_reset || !enable) begin
-        period_cnt         <= 32'd0;
-        period_cycles      <= 32'd0;
-        period_avg_cycles  <= 32'd0;
-        period_valid       <= 1'b0;
-        period_stable      <= 1'b0;
-        stable_cnt         <= 4'd0;
-        timeout_flag       <= 1'b0;
-        seen_first_trigger <= 1'b0;
+        clk_cnt         <= 32'd0;
+        edge_cnt        <= 32'd0;
+        period_cycles   <= 32'd0;
+        period_avg_cycles <= 32'd0;
+        period_valid    <= 1'b0;
+        period_stable   <= 1'b0;
+        timeout_flag    <= 1'b0;
+        window_active   <= 1'b0;
       end else begin
-        if (trig_rise) begin
-          if (!seen_first_trigger) begin
-            seen_first_trigger <= 1'b1;
-            period_cnt         <= 32'd0;
-            timeout_flag       <= 1'b0;
-          end else begin
-            if (period_cnt >= MIN_PERIOD_CYCLES) begin
-              period_cycles     <= period_cnt;
-              timeout_flag      <= 1'b0;
-              period_valid      <= 1'b1;
-              period_avg_cycles <= period_valid ? period_avg_next : period_cnt;
-              if (!period_stable) begin
-                if (stable_cnt == 4'(STABLE_COUNT - 1))
-                  period_stable <= 1'b1;
-                else
-                  stable_cnt <= stable_cnt + 4'd1;
-              end
-              period_cnt <= 32'd0;
-            end
+        if (!window_active) begin
+          // Start first window when first edge detected
+          if (trig_edge) begin
+            window_active <= 1'b1;
+            clk_cnt       <= 32'd0;
+            edge_cnt      <= 32'd1;
+            timeout_flag  <= 1'b0;
           end
         end else begin
-          if (seen_first_trigger) begin
-            if (period_cnt != 32'hFFFF_FFFF)
-              period_cnt <= period_cnt + 32'd1;
-            if (period_cnt >= PERIOD_TIMEOUT_CYCLES) begin
-              period_valid  <= 1'b0;
-              period_stable <= 1'b0;
-              stable_cnt    <= 4'd0;
-              timeout_flag  <= 1'b1;
+          // Count edges and clock cycles until window complete
+          if (trig_edge) begin
+            edge_cnt <= edge_cnt + 32'd1;
+          end
+
+          if (clk_cnt >= window_cycles - 1) begin
+            // Window complete: compute period_avg = window_cycles / (edge_cnt / 2)
+            // = 2 * window_cycles / edge_cnt (accounts for both edges)
+            // Avoid divide by zero
+            if (edge_cnt >= 4) begin
+              period_cycles     <= edge_cnt;
+              period_valid      <= 1'b1;
+              period_stable     <= 1'b1;  // Stable immediately with long averaging
+              period_avg_cycles <= window_cycles / (edge_cnt >> 1);
+              timeout_flag      <= 1'b0;
+            end else begin
+              period_valid      <= 1'b0;
+              period_stable     <= 1'b0;
+              timeout_flag      <= 1'b1;
             end
+            window_active <= 1'b0;
+            clk_cnt       <= 32'd0;
+            edge_cnt      <= 32'd0;
+          end else begin
+            clk_cnt <= clk_cnt + 32'd1;
           end
         end
       end

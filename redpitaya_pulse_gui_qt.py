@@ -27,7 +27,7 @@ try:
     from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
     from PySide6.QtGui import QAction, QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
+        QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
         QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
         QSizePolicy, QSlider, QTextEdit, QVBoxLayout, QWidget,
     )
@@ -89,6 +89,21 @@ def fmt_signed_freq(hz: float) -> str:
         return "+0.000000 Hz"
     sign = "+" if hz >= 0 else "-"
     return f"{sign}{fmt_freq(abs(hz))}"
+
+
+def suggest_window(f_shift_hz: float) -> int:
+    """Suggest measurement window based on frequency shift.
+    Returns 0=10ms, 1=100ms, 2=500ms, 3=1000ms
+    """
+    if f_shift_hz <= 0:
+        return 1  # Default to 100 ms
+    if f_shift_hz < 10:
+        return 3  # 1000 ms for f_shift < 10 Hz
+    if f_shift_hz < 100:
+        return 2  # 500 ms for 10-100 Hz
+    if f_shift_hz < 1000:
+        return 1  # 100 ms for 100 Hz - 1 kHz
+    return 0  # 10 ms for >= 1 kHz
 
 
 def fmt_dur(s: float) -> str:
@@ -177,6 +192,12 @@ class SshBackend(QObject):
                           lambda: self._do_write(width_cycles, offset_word, enable),
                           self.sig_status.emit)
 
+    def set_window(self, window: int):
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_window(window),
+                          self.sig_status.emit)
+
     def soft_reset(self):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
@@ -260,6 +281,9 @@ class SshBackend(QObject):
 
     def _do_reset(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} soft_reset"))
+
+    def _do_window(self, window: int) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} window {window}"))
 
     def _do_upload(self, c_src: str, bit_src: Optional[str]):
         self.sig_log.emit("Uploading rp_pulse_ctl.c …")
@@ -524,7 +548,7 @@ class MainWindow(QMainWindow):
 
         self._period_c = 0   # last known period in FPGA clock cycles
         self._live     = False
-        self._refresh_input_pending = False
+        self._window_select = 1  # default: 100 ms
 
         # Backend
         self._be = SshBackend(self)
@@ -650,6 +674,31 @@ class MainWindow(QMainWindow):
         freq_row.addStretch()
         left.addLayout(freq_row)
 
+        # Window selection row
+        window_row = QHBoxLayout()
+        window_row.setContentsMargins(0, 0, 0, 0)
+        window_row.setSpacing(8)
+        window_lbl = QLabel("Meas. window:")
+        window_lbl.setFixedWidth(90)
+        window_lbl.setFont(_mono_font(10))
+        window_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        window_row.addWidget(window_lbl)
+        self._cb_window = QComboBox()
+        self._cb_window.addItems(["10 ms", "100 ms", "500 ms", "1000 ms"])
+        self._cb_window.setCurrentIndex(1)  # Default: 100 ms
+        self._cb_window.setFixedHeight(24)
+        self._cb_window.setFixedWidth(100)
+        self._cb_window.setFont(_mono_font(10))
+        self._cb_window.setStyleSheet(_spin_style())
+        self._cb_window.currentIndexChanged.connect(self._on_window_changed)
+        window_row.addWidget(self._cb_window)
+        self._lbl_window_suggest = QLabel()
+        self._lbl_window_suggest.setFont(_mono_font(9))
+        self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
+        window_row.addWidget(self._lbl_window_suggest)
+        window_row.addStretch()
+        left.addLayout(window_row)
+
         self._d_out = BigDisplay("Output Frequency", "NCO output", _GREEN)
         left.addWidget(self._d_out, 1)
 
@@ -761,7 +810,8 @@ class MainWindow(QMainWindow):
         self._btn_conn.setEnabled(True)
         self._lbl_status.setText("●  Connected")
         self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
-        self._refresh_input_pending = True
+        # Set initial window selection
+        self._be.set_window(self._cb_window.currentIndex())
         self._poll.start()
         self._be.poll()   # kick off immediate first read rather than waiting 800 ms
         self._log("Connected.")
@@ -784,6 +834,14 @@ class MainWindow(QMainWindow):
         if self._cb_auto.isChecked():
             self._debounce.start()   # restart 300 ms window
         self._update_local_displays()
+        self._update_window_suggestion()
+
+    def _on_window_changed(self, idx: int):
+        """Called when user changes window selection."""
+        self._window_select = idx
+        if self._live:
+            self._be.set_window(idx)
+        self._update_window_suggestion()
 
     def _update_local_displays(self):
         """Immediately refresh duration & duty from local slider state."""
@@ -810,6 +868,19 @@ class MainWindow(QMainWindow):
             f"actual {actual_hz:+.6f} Hz, register {offset_word:+d}, "
             f"resolution {PHASE_RES_HZ:.9f} Hz/LSB{out_text}"
         )
+
+    def _update_window_suggestion(self):
+        """Update window suggestion based on frequency shift."""
+        f_shift = abs(self._sp_offset.value())
+        suggested = suggest_window(f_shift)
+        window_names = ["10 ms", "100 ms", "500 ms", "1000 ms"]
+        current = self._cb_window.currentIndex()
+        if current == suggested:
+            self._lbl_window_suggest.setText(f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
+            self._lbl_window_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
+        else:
+            self._lbl_window_suggest.setText(f"suggested: {window_names[suggested]} for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
+            self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
 
     def _do_apply(self):
         if not self._live:
@@ -855,6 +926,14 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_status(self, d: dict):
+        # Update window selection from FPGA if it changed
+        window_from_fpga = int(d.get("window_select") or 1)
+        if window_from_fpga != self._cb_window.currentIndex():
+            self._cb_window.blockSignals(True)
+            self._cb_window.setCurrentIndex(window_from_fpga)
+            self._cb_window.blockSignals(False)
+            self._window_select = window_from_fpga
+
         period = int(d.get("period_avg") or d.get("period") or 0)
         stable = bool(d.get("period_stable"))
 
