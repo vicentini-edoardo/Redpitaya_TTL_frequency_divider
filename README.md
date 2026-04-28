@@ -1,8 +1,8 @@
-# Red Pitaya TTL Shifter
+# Red Pitaya TTL Frequency Divider
 
 Desktop tools for controlling a custom Red Pitaya FPGA TTL pulse/NCO shifter over SSH.
 
-The main application is `redpitaya_pulse_gui_qt.py`, a PySide6 GUI that connects to a Red Pitaya, uploads and compiles the board-side register helper, optionally loads the FPGA bitstream, and provides live control of output enable, pulse width, and signed frequency shift. A terminal register monitor is also included for debugging.
+The main application is `redpitaya_pulse_gui_qt.py`, a PySide6 GUI that connects to a Red Pitaya, uploads and compiles the board-side register helper, optionally loads the FPGA bitstream, and provides live control of output enable, pulse width, signed frequency shift, and the reciprocal-counting measurement window. A terminal register monitor is also included for debugging.
 
 ![GUI screenshot](GUI.png)
 
@@ -20,6 +20,8 @@ External TTL signal -> DIO0_P -> FPGA pulse/NCO shifter -> DIO1_P -> shifted TTL
 | `redpitaya_pulse_gui_qt.py` | Main PySide6 desktop control GUI. |
 | `redpitaya_register_monitor.py` | Command-line live register monitor over OpenSSH. |
 | `rp_pulse_ctl.c` | Board-side C helper that reads/writes FPGA registers through `/dev/mem`. |
+| `Vivado files/` | FPGA RTL sources for the AXI register block and pulse/NCO datapath. |
+| `PHASE1_RECIPROCAL_COUNTING.md` | Notes for the reciprocal-counting measurement approach. |
 | `red_pitaya_top.bit.bin` | FPGA bitstream loaded by the GUI when present. |
 | `last/red_pitaya_top.bit.bin` | Previous/archived FPGA bitstream copy. |
 | `GUI.png` | README screenshot. |
@@ -39,15 +41,16 @@ The Qt GUI provides:
 - Output frequency readout from the live 48-bit NCO phase step.
 - Pulse width control as a fraction of the measured input period.
 - Signed frequency-shift control in Hz, converted to a signed 48-bit phase-step offset.
+- Measurement-window control with `10 ms`, `100 ms`, `500 ms`, and `1000 ms` options.
+- Suggested measurement window based on the requested frequency shift.
 - Output enable, auto-apply, manual apply, and soft reset controls.
 - Status and operation log inside the GUI.
 
 The command-line monitor provides:
 
 - Repeated register readback through the board-side helper.
-- Decoded control/status flags.
-- Raw and averaged input periods with derived input frequency.
-- Pulse width and additional helper payload fields for debugging register-level behavior.
+- Raw JSON-backed register snapshots over SSH for register-level debugging.
+- Decoded control/status information and measured periods when the payload fields are present.
 
 ## Hardware Assumptions
 
@@ -76,6 +79,7 @@ The GUI and monitor communicate with the FPGA through `/root/rp_pulse_ctl`. The 
 | `0x28` | `phase_step_base_hi` | High 16 bits of computed base phase step, read-only. |
 | `0x2C` | `phase_step_lo` | Low 32 bits of live phase step, read-only. |
 | `0x30` | `phase_step_hi` | High 16 bits of live phase step, read-only. |
+| `0x34` | `window_select` | Measurement window: `0=10 ms`, `1=100 ms`, `2=500 ms`, `3=1000 ms`. |
 
 Useful conversions:
 
@@ -118,13 +122,14 @@ When `red_pitaya_top.bit.bin` exists next to the GUI script, **Upload && Compile
 |---------|--------|
 | **Width** | Sets pulse high time as a fraction of the measured input period. |
 | **Freq shift** | Sets signed output frequency offset in Hz. The GUI shows requested Hz, quantized actual Hz, register word, and target output frequency when an input period is available. |
+| **Meas. window** | Selects the reciprocal-counting window used for input-period measurement. |
 | **Enable Output** | Writes control bit 0. |
 | **Auto-Apply** | Sends changed values after a 300 ms debounce. |
 | **Apply Now** | Writes current width, frequency shift, and enable state immediately. Shortcut: `Ctrl+Return`. |
 | **Soft Reset** | Pulses the FPGA soft-reset bit. |
 | **Upload && Compile** | Uploads and compiles the C helper, and loads the bitstream if present. |
 
-The display cards show measured input frequency, live output frequency, pulse duration, and duty cycle. Polling runs faster while the FPGA reports an unstable or missing period.
+The display cards show measured input frequency, live output frequency, pulse duration, and duty cycle. The GUI also shows whether the selected measurement window is already optimal for the current shift setting. Polling runs faster while the FPGA reports an unstable or missing period.
 
 ## Running the Register Monitor
 
@@ -165,6 +170,12 @@ Manual write:
 
 ```bash
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 write <width_cycles> <phase_step_offset> <control>'
+```
+
+Set measurement window manually:
+
+```bash
+ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 window <0|1|2|3>'
 ```
 
 ## Troubleshooting
