@@ -11,14 +11,15 @@
 //   0x0C RW  pulse_delay    (kept for address stability; unused by pulse_gen)
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] timeout, [3] period_stable,
 //                      [4] freerun_active
-//   0x14 RO  period_cycles       (instantaneous trigger period)
-//   0x18 RO  period_avg_cycles   (IIR-filtered period, alpha = 1/8)
+//   0x14 RO  period_cycles       (edge count from last window)
+//   0x18 RO  period_avg_cycles   (reciprocal-counted period in cycles)
 //   0x1C RW  phase_step_offset_lo   bits [31:0]  of signed 48-bit NCO offset
 //   0x20 RW  phase_step_offset_hi   bits [47:32] of signed 48-bit NCO offset (in [15:0])
 //   0x24 RO  phase_step_base_lo     bits [31:0]  of computed base step
 //   0x28 RO  phase_step_base_hi     bits [47:32] of computed base step (in [15:0])
 //   0x2C RO  phase_step_lo          bits [31:0]  of live phase_step
 //   0x30 RO  phase_step_hi          bits [47:32] of live phase_step (in [15:0])
+//   0x34 RW  window_select: [1:0] 0=10ms, 1=100ms, 2=500ms, 3=1000ms
 //
 // AXI4-Lite write handshake:
 //   aw_seen / w_seen track independent acceptance of AW and W channels.
@@ -64,6 +65,7 @@ module axi4lite_pulse_regs
   output logic [31:0] pulse_divider,
   output logic [31:0] pulse_width,
   output logic [31:0] pulse_delay,
+  output logic [ 1:0] window_select,
   output logic signed [47:0] phase_step_offset,
 
   // Status inputs <- pulse_gen
@@ -82,6 +84,7 @@ module axi4lite_pulse_regs
   logic [31:0] reg_divider;
   logic [31:0] reg_width;
   logic [31:0] reg_delay;
+  logic [ 1:0] reg_window_select;
   logic [31:0] reg_phase_step_offset_lo;
   logic [15:0] reg_phase_step_offset_hi;
 
@@ -103,6 +106,7 @@ module axi4lite_pulse_regs
   assign pulse_divider     = reg_divider;
   assign pulse_width       = reg_width;
   assign pulse_delay       = reg_delay;
+  assign window_select     = reg_window_select;
   assign phase_step_offset = $signed({reg_phase_step_offset_hi, reg_phase_step_offset_lo});
 
   always_ff @(posedge clk) begin
@@ -111,6 +115,7 @@ module axi4lite_pulse_regs
       reg_divider               <= 32'h00000001;
       reg_width                 <= 32'h00000001;
       reg_delay                 <= 32'h00000001;
+      reg_window_select         <= 2'b01;  // Default: 100 ms
       reg_phase_step_offset_lo  <= 32'h00000000;
       reg_phase_step_offset_hi  <= 16'h0000;
 
@@ -190,6 +195,10 @@ module axi4lite_pulse_regs
 
           // 4'd9..4'd12 (phase_step_base, phase_step): read-only, writes silently ignored
 
+          4'd13: begin  // 0x34 window_select
+            if (wstrb_latched[0]) reg_window_select <= wdata_latched[1:0];
+          end
+
           default: begin end
         endcase
 
@@ -217,6 +226,7 @@ module axi4lite_pulse_regs
           4'd10: s_axi_rdata <= {16'd0, phase_step_base[47:32]};
           4'd11: s_axi_rdata <= phase_step[31:0];
           4'd12: s_axi_rdata <= {16'd0, phase_step[47:32]};
+          4'd13: s_axi_rdata <= {30'd0, reg_window_select};
           default: s_axi_rdata <= 32'h00000000;
         endcase
         s_axi_rvalid <= 1'b1;
