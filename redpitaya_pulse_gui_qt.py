@@ -325,14 +325,14 @@ class SshBackend(QObject):
 # Colour palette & shared style helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _BG     = "#0d1117"
-_PANEL  = "#161b22"
+_PANEL  = "#131a24"
 _ACCENT = "#00d4ff"
 _GREEN  = "#3fb950"
 _AMBER  = "#d29922"
 _RED    = "#f85149"
 _TEXT   = "#e6edf3"
 _DIM    = "#8b949e"
-_BORDER = "#30363d"
+_BORDER = "#263241"
 _MONO   = "Menlo, Consolas, 'Courier New', monospace"
 
 
@@ -352,16 +352,17 @@ def _group_style() -> str:
         QGroupBox {{
             color: {_ACCENT};
             border: 1px solid {_BORDER};
-            border-radius: 6px;
-            margin-top: 14px;
-            padding: 10px 8px 8px 8px;
+            border-radius: 10px;
+            margin-top: 16px;
+            padding: 14px 12px 12px 12px;
             font-family: {_MONO};
-            font-size: 9px;
+            font-size: 10px;
+            font-weight: bold;
         }}
         QGroupBox::title {{
             subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 4px;
+            left: 14px;
+            padding: 0 6px;
         }}
     """
 
@@ -369,13 +370,13 @@ def _group_style() -> str:
 def _btn_style(color: str = _ACCENT) -> str:
     return f"""
         QPushButton {{
-            background: {_PANEL}; color: {color};
-            border: 1px solid {color}; border-radius: 4px;
-            padding: 4px 10px;
+            background: #111923; color: {color};
+            border: 1px solid {color}; border-radius: 7px;
+            padding: 6px 12px;
             font-family: {_MONO}; font-size: 10px;
         }}
-        QPushButton:hover   {{ background: #1c2333; }}
-        QPushButton:pressed {{ background: #0d1824; }}
+        QPushButton:hover   {{ background: #182536; }}
+        QPushButton:pressed {{ background: #0b1622; }}
         QPushButton:disabled {{ color: {_DIM}; border-color: {_BORDER}; }}
     """
 
@@ -394,15 +395,25 @@ def _le_style() -> str:
 
 def _spin_style() -> str:
     return f"""
-        QDoubleSpinBox {{
-            background: {_BG}; color: {_TEXT};
-            border: 1px solid {_BORDER}; border-radius: 4px;
-            padding: 3px;
+        QDoubleSpinBox, QComboBox {{
+            background: #0b111a; color: {_TEXT};
+            border: 1px solid {_BORDER}; border-radius: 7px;
+            padding: 5px 8px;
             font-family: {_MONO}; font-size: 10px;
         }}
-        QDoubleSpinBox:focus {{ border-color: {_ACCENT}; }}
+        QDoubleSpinBox:focus, QComboBox:focus {{ border-color: {_ACCENT}; }}
         QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
             width: 16px;
+        }}
+        QComboBox::drop-down {{
+            width: 22px;
+            border: none;
+        }}
+        QComboBox QAbstractItemView {{
+            background: #0b111a;
+            color: {_TEXT};
+            selection-background-color: #182536;
+            border: 1px solid {_BORDER};
         }}
     """
 
@@ -439,31 +450,31 @@ class BigDisplay(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(f"""
             QFrame {{
-                background: {_PANEL};
+                background: #101722;
                 border: 1px solid {_BORDER};
-                border-radius: 8px;
+                border-radius: 14px;
             }}
         """)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(4)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(8)
 
         title_lbl = QLabel(title.upper())
         title_lbl.setAlignment(Qt.AlignCenter)
-        title_lbl.setFont(_mono_font(8))
+        title_lbl.setFont(_mono_font(9, bold=True))
         title_lbl.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(title_lbl)
 
         self._val = QLabel("---")
         self._val.setAlignment(Qt.AlignCenter)
-        self._val.setFont(_mono_font(26, bold=True))
+        self._val.setFont(_mono_font(32, bold=True))
         self._val.setStyleSheet(f"color: {accent}; background: transparent; border: none;")
         self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        lay.addWidget(self._val)
+        lay.addWidget(self._val, 1)
 
         self._sub = QLabel(sub_hint)
         self._sub.setAlignment(Qt.AlignCenter)
-        self._sub.setFont(_mono_font(9))
+        self._sub.setFont(_mono_font(10))
         self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(self._sub)
 
@@ -601,8 +612,8 @@ class MainWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 12)
+        root.setSpacing(10)
 
         root.addWidget(self._build_connection())
         root.addLayout(self._build_main_area(), 1)
@@ -660,9 +671,9 @@ class MainWindow(QMainWindow):
 
     def _build_main_area(self) -> QVBoxLayout:
         outer = QVBoxLayout()
-        outer.setSpacing(8)
+        outer.setSpacing(12)
 
-        # ── Four displays in a 2×2 grid, equal vertical sizes ───────────────────
+        # ── Four primary monitors in a 2×2 grid ───────────────────────────────
         self._d_in  = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
         self._d_dur = BigDisplay("Pulse Duration",   "pulse high-time",       _AMBER)
         self._d_out = BigDisplay("Output Frequency", "NCO output",            _GREEN)
@@ -670,10 +681,10 @@ class MainWindow(QMainWindow):
 
         for d in (self._d_in, self._d_dur, self._d_out, self._d_dut):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            d.setMinimumHeight(120)
+            d.setMinimumHeight(150)
 
         grid = QGridLayout()
-        grid.setSpacing(8)
+        grid.setSpacing(12)
         grid.addWidget(self._d_in,  0, 0)
         grid.addWidget(self._d_dur, 0, 1)
         grid.addWidget(self._d_out, 1, 0)
@@ -685,127 +696,125 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(grid, 1)
 
-        # ── Freq shift spinbox ─────────────────────────────────────────────────
-        freq_row = QHBoxLayout()
-        freq_row.setContentsMargins(0, 0, 0, 0)
-        freq_row.setSpacing(8)
+        controls = self._make_group("Controls")
+        controls_lay = QHBoxLayout(controls)
+        controls_lay.setContentsMargins(12, 12, 12, 12)
+        controls_lay.setSpacing(18)
+
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(10)
+        fields.setVerticalSpacing(8)
+
+        # ── Editable frequency shift ──────────────────────────────────────────
         freq_lbl = QLabel("Freq shift:")
         freq_lbl.setFixedWidth(90)
         freq_lbl.setFont(_mono_font(10))
         freq_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        freq_row.addWidget(freq_lbl)
+        fields.addWidget(freq_lbl, 0, 0)
         self._sp_offset = QDoubleSpinBox()
         self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
         self._sp_offset.setDecimals(6)
         self._sp_offset.setSingleStep(1.0)
         self._sp_offset.setSuffix(" Hz")
-        self._sp_offset.setFixedHeight(44)
-        self._sp_offset.setMinimumWidth(260)
+        self._sp_offset.setFixedHeight(46)
+        self._sp_offset.setMinimumWidth(300)
         self._sp_offset.setFont(_mono_font(15, bold=True))
         self._sp_offset.setStyleSheet(_spin_style())
         self._sp_offset.valueChanged.connect(self._param_changed)
-        freq_row.addWidget(self._sp_offset)
-        freq_row.addStretch()
+        fields.addWidget(self._sp_offset, 0, 1)
 
-        # ── Width spinbox — same row as Freq shift, right-aligned (below Duty Cycle)
         width_lbl = QLabel("Width:")
+        width_lbl.setFixedWidth(90)
         width_lbl.setFont(_mono_font(10))
         width_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        freq_row.addWidget(width_lbl)
+        fields.addWidget(width_lbl, 0, 2)
         self._sp_width = QDoubleSpinBox()
         self._sp_width.setRange(0.1, 99.9)
         self._sp_width.setDecimals(2)
         self._sp_width.setSuffix(" %")
         self._sp_width.setValue(50.0)
-        self._sp_width.setFixedHeight(44)
-        self._sp_width.setMinimumWidth(140)
+        self._sp_width.setFixedHeight(46)
+        self._sp_width.setMinimumWidth(150)
         self._sp_width.setFont(_mono_font(15, bold=True))
         self._sp_width.setStyleSheet(_spin_style())
         self._sp_width.valueChanged.connect(self._param_changed)
-        freq_row.addWidget(self._sp_width)
-        outer.addLayout(freq_row)
+        fields.addWidget(self._sp_width, 0, 3)
 
-        # ── Window selection row ───────────────────────────────────────────────
-        window_row = QHBoxLayout()
-        window_row.setContentsMargins(0, 0, 0, 0)
-        window_row.setSpacing(8)
+        # ── Measurement window and suggestion ────────────────────────────────
         window_lbl = QLabel("Meas. window:")
         window_lbl.setFixedWidth(90)
         window_lbl.setFont(_mono_font(10))
         window_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        window_row.addWidget(window_lbl)
+        fields.addWidget(window_lbl, 1, 0)
         self._cb_window = QComboBox()
         self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"])
         self._cb_window.setCurrentIndex(2)  # Default: 100 ms
-        self._cb_window.setFixedHeight(24)
-        self._cb_window.setFixedWidth(100)
+        self._cb_window.setFixedHeight(38)
+        self._cb_window.setFixedWidth(118)
         self._cb_window.setFont(_mono_font(10))
         self._cb_window.setStyleSheet(_spin_style())
         self._cb_window.currentIndexChanged.connect(self._on_window_changed)
-        window_row.addWidget(self._cb_window)
+        fields.addWidget(self._cb_window, 1, 1)
         self._lbl_window_suggest = QLabel()
         self._lbl_window_suggest.setFont(_mono_font(9))
         self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
-        window_row.addWidget(self._lbl_window_suggest)
-        window_row.addStretch()
-        outer.addLayout(window_row)
+        fields.addWidget(self._lbl_window_suggest, 1, 2, 1, 2)
 
-        # ── Shift detail label ─────────────────────────────────────────────────
-        self._lbl_shift = QLabel()
-        self._lbl_shift.setFont(_mono_font(9))
-        self._lbl_shift.setWordWrap(True)
-        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        outer.addWidget(self._lbl_shift)
-
-        # ── Control buttons: Apply (left), Enable/Auto (center), Reset (right) ─
-        btns = QHBoxLayout()
-        btns.setSpacing(10)
-
-        # Left: Bigger Apply button
-        self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
-        self._btn_apply.setFixedWidth(220)
-        self._btn_apply.setFixedHeight(80)
-        self._btn_apply.setFont(_mono_font(11, bold=True))
-        self._btn_apply.setStyleSheet(_btn_style(_GREEN))
-        self._btn_apply.clicked.connect(self._do_apply)
-        btns.addWidget(self._btn_apply)
-
-        # Center: Enable and Auto-Apply stacked
-        center = QVBoxLayout()
-        center.setSpacing(4)
+        toggles = QHBoxLayout()
+        toggles.setSpacing(18)
         self._cb_en = QCheckBox("Enable Output")
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
         for cb in (self._cb_en, self._cb_auto):
             cb.setFont(_mono_font(10))
             cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-            center.addWidget(cb)
-        center.addStretch()
+            toggles.addWidget(cb)
+        toggles.addStretch()
         self._cb_en.toggled.connect(self._param_changed)
-        btns.addLayout(center)
+        fields.addLayout(toggles, 2, 0, 1, 4)
 
-        btns.addStretch()
+        # ── Shift detail label ─────────────────────────────────────────────────
+        self._lbl_shift = QLabel()
+        self._lbl_shift.setFont(_mono_font(9))
+        self._lbl_shift.setWordWrap(True)
+        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        fields.addWidget(self._lbl_shift, 3, 0, 1, 4)
+        fields.setColumnStretch(1, 1)
+        controls_lay.addLayout(fields, 1)
 
-        # Right: Soft Reset
+        actions = QVBoxLayout()
+        actions.setSpacing(8)
+        self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
+        self._btn_apply.setFixedWidth(210)
+        self._btn_apply.setFixedHeight(92)
+        self._btn_apply.setFont(_mono_font(13, bold=True))
+        self._btn_apply.setStyleSheet(_btn_style(_GREEN))
+        self._btn_apply.clicked.connect(self._do_apply)
+        actions.addWidget(self._btn_apply)
+
         self._btn_reset = QPushButton("Soft Reset")
-        self._btn_reset.setFixedWidth(100)
+        self._btn_reset.setFixedWidth(210)
+        self._btn_reset.setFixedHeight(34)
         self._btn_reset.setStyleSheet(_btn_style(_AMBER))
         self._btn_reset.clicked.connect(self._do_soft_reset)
-        btns.addWidget(self._btn_reset)
+        actions.addWidget(self._btn_reset)
+        actions.addStretch()
+        controls_lay.addLayout(actions)
 
-        outer.addLayout(btns)
+        outer.addWidget(controls)
         self._update_shift_detail()
         return outer
 
     def _build_log(self) -> QGroupBox:
         g = self._make_group("Log")
         lay = QVBoxLayout(g)
+        lay.setContentsMargins(10, 10, 10, 8)
         self._log_box = QTextEdit()
         self._log_box.setReadOnly(True)
-        self._log_box.setMaximumHeight(120)
+        self._log_box.setMaximumHeight(78)
         self._log_box.setFont(_mono_font(9))
         self._log_box.setStyleSheet(
-            f"background: {_BG}; color: {_DIM}; border: none; border-radius: 4px;"
+            f"background: #090e15; color: {_DIM}; border: none; border-radius: 6px;"
         )
         lay.addWidget(self._log_box)
         return g
