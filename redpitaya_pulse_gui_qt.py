@@ -93,17 +93,17 @@ def fmt_signed_freq(hz: float) -> str:
 
 def suggest_window(f_shift_hz: float) -> int:
     """Suggest measurement window based on frequency shift.
-    Returns 0=10ms, 1=100ms, 2=500ms, 3=1000ms
+    Returns 0=1ms, 1=10ms, 2=100ms, 3=500ms
     """
     if f_shift_hz <= 0:
-        return 1  # Default to 100 ms
+        return 2  # Default to 100 ms
     if f_shift_hz < 10:
-        return 3  # 1000 ms for f_shift < 10 Hz
+        return 3  # 500 ms for f_shift < 10 Hz
     if f_shift_hz < 100:
-        return 2  # 500 ms for 10-100 Hz
+        return 2  # 100 ms for 10-100 Hz
     if f_shift_hz < 1000:
-        return 1  # 100 ms for 100 Hz - 1 kHz
-    return 0  # 10 ms for >= 1 kHz
+        return 1  # 10 ms for 100 Hz - 1 kHz
+    return 0  # 1 ms for >= 1 kHz
 
 
 def fmt_dur(s: float) -> str:
@@ -169,6 +169,8 @@ class SshBackend(QObject):
         self._live  = False
         self._base  = DEFAULT_BASE
         self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
+        self._upload_pending: Optional[tuple] = None
+        self._upload_callback: Optional[Callable] = None
         self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
         self._thread.start()
 
@@ -202,9 +204,12 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
-    def upload(self, c_src: str, bit_src: Optional[str]):
+    def upload(self, c_src: str, bit_src: Optional[str], on_connected: Optional[Callable] = None):
         if self._live:
             self._enqueue(self.P_UPLOAD, lambda: self._do_upload(c_src, bit_src))
+        else:
+            self._upload_pending = (c_src, bit_src)
+            self._upload_callback = on_connected
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -257,6 +262,11 @@ class SshBackend(QObject):
         self._sftp = client.open_sftp()
         self._live = True
         self.sig_log.emit("SSH connected.")
+        if self._upload_pending:
+            c_src, bit_src = self._upload_pending
+            self._upload_pending = None
+            self.sig_log.emit("Starting pending upload…")
+            self._do_upload(c_src, bit_src)
         self.sig_connected.emit()
 
     def _do_disconnect(self):
@@ -548,7 +558,7 @@ class MainWindow(QMainWindow):
 
         self._period_c = 0   # last known period in FPGA clock cycles
         self._live     = False
-        self._window_select = 1  # default: 100 ms
+        self._window_select = 2  # default: 100 ms
 
         # Backend
         self._be = SshBackend(self)
@@ -612,6 +622,11 @@ class MainWindow(QMainWindow):
         self._btn_conn = QPushButton("Connect"); self._btn_conn.setFixedWidth(95)
         self._btn_conn.clicked.connect(self._toggle_connect)
 
+        self._btn_upload  = QPushButton("Upload && Compile")
+        self._btn_upload.setFixedWidth(150)
+        self._btn_upload.clicked.connect(self._do_upload)
+        self._btn_upload.setStyleSheet(_btn_style())
+
         self._lbl_status = QLabel("●  Disconnected")
         self._lbl_status.setFont(_mono_font(10))
         self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
@@ -626,6 +641,7 @@ class MainWindow(QMainWindow):
 
         row.addWidget(btn_key)
         row.addWidget(self._btn_conn)
+        row.addWidget(self._btn_upload)
         row.addWidget(self._lbl_status)
         row.addStretch()
 
@@ -639,19 +655,21 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout()
         outer.setSpacing(8)
 
-        # Two-column layout
-        cols = QHBoxLayout()
-        cols.setSpacing(10)
+        # ── Four displays in a row (same size) ──────────────────────────────────
+        displays_row = QHBoxLayout()
+        displays_row.setSpacing(8)
 
-        # ── Left: Input Freq → Freq-shift spinbox → Output Freq ──────────────
-        left = QVBoxLayout()
-        left.setSpacing(8)
+        self._d_in = BigDisplay("Input Frequency", "measured input period", _ACCENT)
+        self._d_out = BigDisplay("Output Frequency", "NCO output", _GREEN)
+        self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
+        self._d_dut = BigDisplay("Duty Cycle", "width / period", _AMBER)
 
-        self._d_in = BigDisplay(
-            "Input Frequency", "measured input period", _ACCENT
-        )
-        left.addWidget(self._d_in, 1)
+        for d in (self._d_in, self._d_out, self._d_dur, self._d_dut):
+            displays_row.addWidget(d, 1)
 
+        outer.addLayout(displays_row, 1)
+
+        # ── Freq shift spinbox ─────────────────────────────────────────────────
         freq_row = QHBoxLayout()
         freq_row.setContentsMargins(0, 0, 0, 0)
         freq_row.setSpacing(8)
@@ -672,9 +690,9 @@ class MainWindow(QMainWindow):
         self._sp_offset.valueChanged.connect(self._param_changed)
         freq_row.addWidget(self._sp_offset)
         freq_row.addStretch()
-        left.addLayout(freq_row)
+        outer.addLayout(freq_row)
 
-        # Window selection row
+        # ── Window selection row ───────────────────────────────────────────────
         window_row = QHBoxLayout()
         window_row.setContentsMargins(0, 0, 0, 0)
         window_row.setSpacing(8)
@@ -684,8 +702,8 @@ class MainWindow(QMainWindow):
         window_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         window_row.addWidget(window_lbl)
         self._cb_window = QComboBox()
-        self._cb_window.addItems(["10 ms", "100 ms", "500 ms", "1000 ms"])
-        self._cb_window.setCurrentIndex(1)  # Default: 100 ms
+        self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms"])
+        self._cb_window.setCurrentIndex(2)  # Default: 100 ms
         self._cb_window.setFixedHeight(24)
         self._cb_window.setFixedWidth(100)
         self._cb_window.setFont(_mono_font(10))
@@ -697,64 +715,56 @@ class MainWindow(QMainWindow):
         self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
         window_row.addWidget(self._lbl_window_suggest)
         window_row.addStretch()
-        left.addLayout(window_row)
+        outer.addLayout(window_row)
 
-        self._d_out = BigDisplay("Output Frequency", "NCO output", _GREEN)
-        left.addWidget(self._d_out, 1)
-
-        # ── Right: Pulse Duration → Width slider → Duty Cycle ────────────────
-        right = QVBoxLayout()
-        right.setSpacing(8)
-
-        self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
-        right.addWidget(self._d_dur, 1)
-
+        # ── Width slider ───────────────────────────────────────────────────────
         self._sl_width = ParamSlider("Width", 0.1, 99.9, 2, "%", _ACCENT)
         self._sl_width.set_value(50.0)
         self._sl_width.changed.connect(self._param_changed)
-        right.addWidget(self._sl_width)
+        outer.addWidget(self._sl_width)
 
-        self._d_dut = BigDisplay("Duty Cycle", "width / period", _AMBER)
-        right.addWidget(self._d_dut, 1)
-
-        cols.addLayout(left, 1)
-        cols.addLayout(right, 1)
-        outer.addLayout(cols, 1)
-
-        # ── Shift detail label ────────────────────────────────────────────────
+        # ── Shift detail label ─────────────────────────────────────────────────
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
         self._lbl_shift.setWordWrap(True)
-        self._lbl_shift.setStyleSheet(
-            f"color: {_DIM}; background: transparent;"
-        )
+        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
         outer.addWidget(self._lbl_shift)
 
-        # ── Buttons ───────────────────────────────────────────────────────────
+        # ── Control buttons: Apply (left), Enable/Auto (center), Reset (right) ─
         btns = QHBoxLayout()
         btns.setSpacing(10)
-        self._cb_en   = QCheckBox("Enable Output")
+
+        # Left: Bigger Apply button
+        self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
+        self._btn_apply.setFixedWidth(120)
+        self._btn_apply.setFixedHeight(80)
+        self._btn_apply.setFont(_mono_font(11, bold=True))
+        self._btn_apply.setStyleSheet(_btn_style(_GREEN))
+        self._btn_apply.clicked.connect(self._do_apply)
+        btns.addWidget(self._btn_apply)
+
+        # Center: Enable and Auto-Apply stacked
+        center = QVBoxLayout()
+        center.setSpacing(4)
+        self._cb_en = QCheckBox("Enable Output")
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
-        self._btn_measure = QPushButton("Measure Input")
-        self._btn_apply   = QPushButton("Apply Now   Ctrl+↵")
-        self._btn_reset   = QPushButton("Soft Reset")
-        self._btn_upload  = QPushButton("Upload && Compile")
-
         for cb in (self._cb_en, self._cb_auto):
             cb.setFont(_mono_font(10))
             cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-            btns.addWidget(cb)
-        for b in (self._btn_measure, self._btn_apply, self._btn_reset, self._btn_upload):
-            b.setStyleSheet(_btn_style())
-            btns.addWidget(b)
+            center.addWidget(cb)
+        center.addStretch()
+        self._cb_en.toggled.connect(self._param_changed)
+        btns.addLayout(center)
+
         btns.addStretch()
 
-        self._cb_en.toggled.connect(self._param_changed)
-        self._btn_apply.clicked.connect(self._do_apply)
+        # Right: Soft Reset
+        self._btn_reset = QPushButton("Soft Reset")
+        self._btn_reset.setFixedWidth(100)
+        self._btn_reset.setStyleSheet(_btn_style(_AMBER))
         self._btn_reset.clicked.connect(self._do_soft_reset)
-        self._btn_upload.clicked.connect(self._do_upload)
-        self._btn_measure.clicked.connect(self._do_measure_input)
+        btns.addWidget(self._btn_reset)
 
         outer.addLayout(btns)
         self._update_shift_detail()
@@ -808,6 +818,7 @@ class MainWindow(QMainWindow):
         self._live = True
         self._btn_conn.setText("Disconnect")
         self._btn_conn.setEnabled(True)
+        self._btn_upload.setEnabled(True)
         self._lbl_status.setText("●  Connected")
         self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
         # Set initial window selection
@@ -815,6 +826,9 @@ class MainWindow(QMainWindow):
         self._poll.start()
         self._be.poll()   # kick off immediate first read rather than waiting 800 ms
         self._log("Connected.")
+
+    def _on_upload_connected(self):
+        pass
 
     @Slot(str)
     def _on_disconnected(self, reason: str):
@@ -873,7 +887,7 @@ class MainWindow(QMainWindow):
         """Update window suggestion based on frequency shift."""
         f_shift = abs(self._sp_offset.value())
         suggested = suggest_window(f_shift)
-        window_names = ["10 ms", "100 ms", "500 ms", "1000 ms"]
+        window_names = ["1 ms", "10 ms", "100 ms", "500 ms"]
         current = self._cb_window.currentIndex()
         if current == suggested:
             self._lbl_window_suggest.setText(f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
@@ -915,12 +929,20 @@ class MainWindow(QMainWindow):
         self._be.soft_reset()
 
     def _do_upload(self):
-        if not self._live:
-            return
         here    = Path(__file__).parent
         c_src   = str(here / "rp_pulse_ctl.c")
         bit_src = str(here / "red_pitaya_top.bit.bin")
-        self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
+        if not self._live:
+            self._log("Not connected. Connecting first…")
+            self._btn_upload.setEnabled(False)
+            host = self._w_host.text().strip()
+            port = int(self._w_port.text().strip() or "22")
+            user = self._w_user.text().strip() or "root"
+            key  = self._w_key.text().strip() or None
+            self._be.upload(c_src, bit_src if Path(bit_src).exists() else None, self._on_upload_connected)
+            self._be.start_connect(host, port, user, key, DEFAULT_BASE)
+        else:
+            self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
 
     # ── status update from hardware ───────────────────────────────────────────
 
