@@ -91,7 +91,7 @@ logic        pulse_soft_reset;
 logic [31:0] pulse_divider;
 logic [31:0] pulse_width;
 logic [31:0] pulse_delay;
-logic [ 1:0] window_select;
+logic [31:0] meas_time_us;
 logic        pulse_busy;
 logic        pulse_out;
 
@@ -197,7 +197,7 @@ pulse_gen pulse_gen_i
   .trig_in           (exp_p_io[0]),
 
   .pulse_width        (pulse_width),
-  .window_select      (window_select),
+  .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
 
   .trig_rise_dbg      (trig_rise_dbg),
@@ -248,7 +248,7 @@ axi4lite_pulse_regs regs_i
   .pulse_divider       (pulse_divider),
   .pulse_width         (pulse_width),
   .pulse_delay         (pulse_delay),
-  .window_select       (window_select),
+  .meas_time_us        (meas_time_us),
   .phase_step_offset   (phase_step_offset),
 
   .pulse_busy          (pulse_busy),

@@ -16,6 +16,7 @@ Requires:  pip install PySide6 paramiko
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -28,7 +29,7 @@ try:
     from PySide6.QtGui import QAction, QFont, QKeySequence
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-        QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
+        QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
         QSizePolicy, QSlider, QTextEdit, QVBoxLayout, QWidget,
     )
 except ImportError as exc:
@@ -53,6 +54,9 @@ CTRL_ENABLE  = 0x01
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
 PHASE_RES_HZ = CLK_HZ / 2**PHASE_BITS
+
+# Measurement window options: combo index → duration in microseconds
+WINDOW_OPTIONS_US = [1_000, 10_000, 100_000, 500_000, 1_000_000]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Math helpers
@@ -93,12 +97,14 @@ def fmt_signed_freq(hz: float) -> str:
 
 def suggest_window(f_shift_hz: float) -> int:
     """Suggest measurement window based on frequency shift.
-    Returns 0=1ms, 1=10ms, 2=100ms, 3=500ms
+    Returns index 0=1ms, 1=10ms, 2=100ms, 3=500ms, 4=1000ms
     """
     if f_shift_hz <= 0:
         return 2  # Default to 100 ms
+    if f_shift_hz < 1:
+        return 4  # 1000 ms for sub-Hz shifts
     if f_shift_hz < 10:
-        return 3  # 500 ms for f_shift < 10 Hz
+        return 3  # 500 ms for 1-10 Hz
     if f_shift_hz < 100:
         return 2  # 100 ms for 10-100 Hz
     if f_shift_hz < 1000:
@@ -292,11 +298,11 @@ class SshBackend(QObject):
     def _do_reset(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} soft_reset"))
 
-    def _do_window(self, window: int) -> dict:
-        return json.loads(self._exec(f"{self._rp_cmd()} window {window}"))
+    def _do_window(self, meas_us: int) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} window {meas_us}"))
 
     def _do_upload(self, c_src: str, bit_src: Optional[str]):
-        self.sig_log.emit("Uploading rp_pulse_ctl.c …")
+        self.sig_log.emit(f"Uploading {Path(c_src).as_posix()} …")
         self._sftp.put(c_src, "/root/rp_pulse_ctl.c")
         self.sig_log.emit("Compiling on board …")
         self._exec(
@@ -559,6 +565,7 @@ class MainWindow(QMainWindow):
         self._period_c = 0   # last known period in FPGA clock cycles
         self._live     = False
         self._window_select = 2  # default: 100 ms
+        self._refresh_input_pending = False
 
         # Backend
         self._be = SshBackend(self)
@@ -655,19 +662,28 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout()
         outer.setSpacing(8)
 
-        # ── Four displays in a row (same size) ──────────────────────────────────
-        displays_row = QHBoxLayout()
-        displays_row.setSpacing(8)
+        # ── Four displays in a 2×2 grid, equal vertical sizes ───────────────────
+        self._d_in  = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
+        self._d_dur = BigDisplay("Pulse Duration",   "pulse high-time",       _AMBER)
+        self._d_out = BigDisplay("Output Frequency", "NCO output",            _GREEN)
+        self._d_dut = BigDisplay("Duty Cycle",       "width / period",        _AMBER)
 
-        self._d_in = BigDisplay("Input Frequency", "measured input period", _ACCENT)
-        self._d_out = BigDisplay("Output Frequency", "NCO output", _GREEN)
-        self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
-        self._d_dut = BigDisplay("Duty Cycle", "width / period", _AMBER)
+        for d in (self._d_in, self._d_dur, self._d_out, self._d_dut):
+            d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            d.setMinimumHeight(120)
 
-        for d in (self._d_in, self._d_out, self._d_dur, self._d_dut):
-            displays_row.addWidget(d, 1)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        grid.addWidget(self._d_in,  0, 0)
+        grid.addWidget(self._d_dur, 0, 1)
+        grid.addWidget(self._d_out, 1, 0)
+        grid.addWidget(self._d_dut, 1, 1)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
-        outer.addLayout(displays_row, 1)
+        outer.addLayout(grid, 1)
 
         # ── Freq shift spinbox ─────────────────────────────────────────────────
         freq_row = QHBoxLayout()
@@ -690,6 +706,23 @@ class MainWindow(QMainWindow):
         self._sp_offset.valueChanged.connect(self._param_changed)
         freq_row.addWidget(self._sp_offset)
         freq_row.addStretch()
+
+        # ── Width spinbox — same row as Freq shift, right-aligned (below Duty Cycle)
+        width_lbl = QLabel("Width:")
+        width_lbl.setFont(_mono_font(10))
+        width_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        freq_row.addWidget(width_lbl)
+        self._sp_width = QDoubleSpinBox()
+        self._sp_width.setRange(0.1, 99.9)
+        self._sp_width.setDecimals(2)
+        self._sp_width.setSuffix(" %")
+        self._sp_width.setValue(50.0)
+        self._sp_width.setFixedHeight(44)
+        self._sp_width.setMinimumWidth(140)
+        self._sp_width.setFont(_mono_font(15, bold=True))
+        self._sp_width.setStyleSheet(_spin_style())
+        self._sp_width.valueChanged.connect(self._param_changed)
+        freq_row.addWidget(self._sp_width)
         outer.addLayout(freq_row)
 
         # ── Window selection row ───────────────────────────────────────────────
@@ -702,7 +735,7 @@ class MainWindow(QMainWindow):
         window_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         window_row.addWidget(window_lbl)
         self._cb_window = QComboBox()
-        self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms"])
+        self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"])
         self._cb_window.setCurrentIndex(2)  # Default: 100 ms
         self._cb_window.setFixedHeight(24)
         self._cb_window.setFixedWidth(100)
@@ -717,12 +750,6 @@ class MainWindow(QMainWindow):
         window_row.addStretch()
         outer.addLayout(window_row)
 
-        # ── Width slider ───────────────────────────────────────────────────────
-        self._sl_width = ParamSlider("Width", 0.1, 99.9, 2, "%", _ACCENT)
-        self._sl_width.set_value(50.0)
-        self._sl_width.changed.connect(self._param_changed)
-        outer.addWidget(self._sl_width)
-
         # ── Shift detail label ─────────────────────────────────────────────────
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
@@ -736,7 +763,7 @@ class MainWindow(QMainWindow):
 
         # Left: Bigger Apply button
         self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
-        self._btn_apply.setFixedWidth(120)
+        self._btn_apply.setFixedWidth(220)
         self._btn_apply.setFixedHeight(80)
         self._btn_apply.setFont(_mono_font(11, bold=True))
         self._btn_apply.setStyleSheet(_btn_style(_GREEN))
@@ -822,7 +849,7 @@ class MainWindow(QMainWindow):
         self._lbl_status.setText("●  Connected")
         self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
         # Set initial window selection
-        self._be.set_window(self._cb_window.currentIndex())
+        self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
         self._poll.start()
         self._be.poll()   # kick off immediate first read rather than waiting 800 ms
         self._log("Connected.")
@@ -854,7 +881,7 @@ class MainWindow(QMainWindow):
         """Called when user changes window selection."""
         self._window_select = idx
         if self._live:
-            self._be.set_window(idx)
+            self._be.set_window(WINDOW_OPTIONS_US[idx])
         self._update_window_suggestion()
 
     def _update_local_displays(self):
@@ -862,10 +889,10 @@ class MainWindow(QMainWindow):
         self._update_shift_detail()
         if self._period_c <= 0:
             return
-        frac = self._sl_width.value() / 100.0
+        frac = self._sp_width.value() / 100.0
         wc   = duty_to_cycles(frac, self._period_c)
         self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
-        self._d_dut.set_data(f"{self._sl_width.value():.2f} %")
+        self._d_dut.set_data(f"{self._sp_width.value():.2f} %")
 
     def _update_shift_detail(self):
         requested_hz = self._sp_offset.value()
@@ -887,7 +914,7 @@ class MainWindow(QMainWindow):
         """Update window suggestion based on frequency shift."""
         f_shift = abs(self._sp_offset.value())
         suggested = suggest_window(f_shift)
-        window_names = ["1 ms", "10 ms", "100 ms", "500 ms"]
+        window_names = ["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"]
         current = self._cb_window.currentIndex()
         if current == suggested:
             self._lbl_window_suggest.setText(f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
@@ -899,7 +926,7 @@ class MainWindow(QMainWindow):
     def _do_apply(self):
         if not self._live:
             return
-        frac   = self._sl_width.value() / 100.0
+        frac   = self._sp_width.value() / 100.0
         off_hz = self._sp_offset.value()
         enable = self._cb_en.isChecked()
         period = self._period_c if self._period_c > 0 else 1000
@@ -908,7 +935,7 @@ class MainWindow(QMainWindow):
         actual_hz = phase_to_hz(offset_word)
         self._be.apply(wc, offset_word, enable)
         self._log(
-            f"Apply  width={self._sl_width.value():.2f}%  "
+            f"Apply  width={self._sp_width.value():.2f}%  "
             f"shift={actual_hz:+.6f} Hz  "
             f"phase_offset={offset_word:+d}  "
             f"enable={enable}"
@@ -929,9 +956,12 @@ class MainWindow(QMainWindow):
         self._be.soft_reset()
 
     def _do_upload(self):
-        here    = Path(__file__).parent
-        c_src   = str(here / "rp_pulse_ctl.c")
-        bit_src = str(here / "red_pitaya_top.bit.bin")
+        here    = Path(__file__).resolve().parent
+        c_src   = os.fspath(here / "rp_pulse_ctl.c")
+        bit_src = os.fspath(here / "red_pitaya_top.bit.bin")
+        if not Path(c_src).exists():
+            self._log(f"ERROR: source file not found: {Path(c_src).as_posix()}")
+            return
         if not self._live:
             self._log("Not connected. Connecting first…")
             self._btn_upload.setEnabled(False)
@@ -948,13 +978,20 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_status(self, d: dict):
-        # Update window selection from FPGA if it changed
-        window_from_fpga = int(d.get("window_select") or 1)
-        if window_from_fpga != self._cb_window.currentIndex():
-            self._cb_window.blockSignals(True)
-            self._cb_window.setCurrentIndex(window_from_fpga)
-            self._cb_window.blockSignals(False)
-            self._window_select = window_from_fpga
+        # Update window combo from FPGA meas_time_us if it changed
+        raw_us = d.get("meas_time_us")
+        if raw_us is not None:
+            us_val = int(raw_us)
+            try:
+                fpga_idx = WINDOW_OPTIONS_US.index(us_val)
+            except ValueError:
+                fpga_idx = min(range(len(WINDOW_OPTIONS_US)),
+                               key=lambda i: abs(WINDOW_OPTIONS_US[i] - us_val))
+            if fpga_idx != self._cb_window.currentIndex():
+                self._cb_window.blockSignals(True)
+                self._cb_window.setCurrentIndex(fpga_idx)
+                self._cb_window.blockSignals(False)
+                self._window_select = fpga_idx
 
         period = int(d.get("period_avg") or d.get("period") or 0)
         stable = bool(d.get("period_stable"))

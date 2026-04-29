@@ -35,7 +35,7 @@ module pulse_gen
   input  logic        enable,
   input  logic        soft_reset,
   input  logic [31:0] pulse_width,
-  input  logic [ 1:0] window_select,
+  input  logic [31:0] meas_time_us,
 
   input  logic signed [47:0] phase_step_offset,
 
@@ -58,19 +58,11 @@ module pulse_gen
   localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = 32'd125_000_000;
   localparam logic [31:0] MIN_PERIOD_CYCLES     = 32'd200;
 
-  // Window sizes in clock cycles (125 MHz clock)
-  // 0: 10 ms   = 1,250,000 cycles
-  // 1: 100 ms  = 12,500,000 cycles
-  // 2: 500 ms  = 62,500,000 cycles
-  // 3: 1000 ms = 125,000,000 cycles
+  // Measurement window in clock cycles: meas_time_us * 125 (125 MHz clock, 125 cycles/µs)
+  // Minimum enforced at 1 ms (125,000 cycles) to avoid division issues.
   logic [31:0] window_cycles;
   always_comb begin
-    case (window_select)
-      2'd0:    window_cycles = 32'd1_250_000;
-      2'd1:    window_cycles = 32'd12_500_000;
-      2'd2:    window_cycles = 32'd62_500_000;
-      default: window_cycles = 32'd125_000_000;
-    endcase
+    window_cycles = (meas_time_us >= 32'd1_000) ? meas_time_us * 32'd125 : 32'd125_000;
   end
 
   // ----------------------------------------------------------------

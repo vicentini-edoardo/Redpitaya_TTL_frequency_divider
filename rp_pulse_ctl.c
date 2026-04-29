@@ -47,7 +47,7 @@
 #define REG_PHASE_STEP_BASE_HI    0x28
 #define REG_PHASE_STEP_LO         0x2C
 #define REG_PHASE_STEP_HI         0x30
-#define REG_WINDOW_SELECT         0x34
+#define REG_MEAS_TIME_US          0x34
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -56,8 +56,8 @@ static void usage(const char *prog) {
         "  %s <base_addr> write <width> <phase_step_offset> <control>\n"
         "      phase_step_offset: signed 48-bit integer\n"
         "      delta_f (Hz) = phase_step_offset * 125000000 / 2^48\n"
-        "  %s <base_addr> window <0|1|2|3>\n"
-        "      0: 10 ms,  1: 100 ms, 2: 500 ms, 3: 1000 ms\n"
+        "  %s <base_addr> window <microseconds>\n"
+        "      e.g. 1000=1ms, 10000=10ms, 100000=100ms, 500000=500ms, 1000000=1000ms\n"
         "  %s <base_addr> soft_reset\n",
         prog, prog, prog, prog);
 }
@@ -95,13 +95,13 @@ static void print_json(volatile uint8_t *base) {
     const uint32_t status         = rd32(base, REG_STATUS);
     const uint32_t period_stable  = (status >> 2) & 0x1u;
     const uint32_t freerun_active = (status >> 4) & 0x1u;
-    const uint32_t window_sel     = rd32(base, REG_WINDOW_SELECT) & 0x3u;
+    const uint32_t meas_time_us   = rd32(base, REG_MEAS_TIME_US);
     const int64_t  step_offset    = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
     const int64_t  step_base      = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
     const int64_t  step_live      = rd48(base, REG_PHASE_STEP_LO,        REG_PHASE_STEP_HI);
 
     printf("{\"control\":%u,\"width\":%u,"
-           "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"window_select\":%u,"
+           "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
            "\"raw_period\":%u,\"period_avg\":%u,"
            "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld}\n",
            rd32(base, REG_CONTROL),
@@ -109,7 +109,7 @@ static void print_json(volatile uint8_t *base) {
            status,
            period_stable,
            freerun_active,
-           window_sel,
+           meas_time_us,
            rd32(base, REG_RAW_PERIOD),
            rd32(base, REG_FILT_PERIOD),
            (long long)step_offset,
@@ -180,15 +180,16 @@ int main(int argc, char **argv) {
         print_json(base);
 
     } else if (strcmp(argv[2], "window") == 0) {
-        /* Set measurement window: 0=10ms, 1=100ms, 2=500ms, 3=1000ms */
+        /* Set measurement window duration in microseconds (min 1000 = 1 ms) */
         if (argc != 4) {
             usage(argv[0]);
             munmap(map, (size_t)page_size);
             close(fd);
             return 1;
         }
-        uint32_t window_sel = (uint32_t)strtoul(argv[3], NULL, 0) & 0x3u;
-        wr32(base, REG_WINDOW_SELECT, window_sel);
+        uint32_t us = (uint32_t)strtoul(argv[3], NULL, 0);
+        if (us < 1000u) us = 1000u;
+        wr32(base, REG_MEAS_TIME_US, us);
         print_json(base);
 
     } else {

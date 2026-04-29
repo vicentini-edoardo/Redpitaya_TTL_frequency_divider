@@ -64,7 +64,7 @@ ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 write <width_cycles> <ph
 Manual measurement-window selection:
 
 ```bash
-ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 window <0|1|2|3>'
+ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 window <microseconds>'
 ```
 
 ## Architecture
@@ -86,7 +86,7 @@ Important module-level helpers:
 
 - `hz_to_phase(delta_hz)` / `phase_to_hz(word)` convert between Hz and the signed 48-bit NCO offset word.
 - `duty_to_cycles(frac, period)` converts width fraction to clock cycles, clamped to the valid range.
-- `suggest_window(f_shift_hz)` recommends one of the four reciprocal-counting windows.
+- `suggest_window(f_shift_hz)` recommends one of the five reciprocal-counting windows.
 
 Behavioral notes:
 
@@ -102,7 +102,7 @@ Invocation:
 ```text
 rp_pulse_ctl <base_addr> read
 rp_pulse_ctl <base_addr> write <width> <phase_step_offset> <control>
-rp_pulse_ctl <base_addr> window <0|1|2|3>
+rp_pulse_ctl <base_addr> window <0|1|2|3|4>
 rp_pulse_ctl <base_addr> soft_reset
 ```
 
@@ -124,7 +124,7 @@ Base address defaults to `0x40600000`.
 | `0x1C/0x20` | `phase_step_offset` | signed 48-bit NCO offset word |
 | `0x24/0x28` | `phase_step_base` | computed base step, read-only |
 | `0x2C/0x30` | `phase_step` | live phase step, read-only |
-| `0x34` | `window_select` | `0=10 ms`, `1=100 ms`, `2=500 ms`, `3=1000 ms` |
+| `0x34` | `meas_time_us` | measurement window duration in microseconds (e.g. `100000` = 100 ms) |
 
 Key conversions:
 
