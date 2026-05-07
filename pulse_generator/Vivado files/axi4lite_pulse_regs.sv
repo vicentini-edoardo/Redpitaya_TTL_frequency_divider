@@ -1,14 +1,16 @@
 `timescale 1ns / 1ps
-// axi4lite_pulse_regs - AXI4-Lite slave register file for pulse_gen.
+// axi4lite_pulse_regs - AXI4-Lite slave register file for the unified pulse/harmonic gen.
 //
 // Clock domain: fclk_clk0 (PS GP0 master clock).
 //               All register outputs drive pulse_gen on the same clock - no CDC needed.
 //
 // Register map (byte offset / 32-bit word):
-//   0x00 RW  control:  [0] pulse_enable, [1] soft_reset (self-clearing, reads 0)
-//   0x04 RW  pulse_divider  (kept for address stability; unused by pulse_gen)
-//   0x08 RW  pulse_width    (clock cycles, 8 ns/step)
-//   0x0C RW  pulse_delay    (kept for address stability; unused by pulse_gen)
+//   0x00 RW  control:  [0] enable, [1] soft_reset (self-clearing, reads 0),
+//                      [2] force_high (output forced to 1), [3] harmonic_mode
+//   0x04 RW  pulse_divider  (kept for address stability; unused)
+//   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
+//                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
+//   0x0C RW  pulse_delay    (kept for address stability; unused)
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] timeout, [3] period_stable,
 //                      [4] freerun_active
 //   0x14 RO  period_cycles       (edge count from last window)
@@ -19,17 +21,17 @@
 //   0x28 RO  phase_step_base_hi     bits [47:32] of computed base step (in [15:0])
 //   0x2C RO  phase_step_lo          bits [31:0]  of live phase_step
 //   0x30 RO  phase_step_hi          bits [47:32] of live phase_step (in [15:0])
-//   0x34 RW  meas_time_us: [31:0] measurement window duration in microseconds (e.g. 100000 = 100 ms)
+//   0x34 RW  meas_time_us: [31:0] measurement window duration in microseconds
 //
 // AXI4-Lite write handshake:
 //   aw_seen / w_seen track independent acceptance of AW and W channels.
 //   Both must arrive before the write is committed and BVALID is asserted.
 //
 // Notes:
-//   soft_reset (control[1]) is self-clearing - it asserts pulse_soft_reset
-//   for exactly one clock cycle and always reads back as 0.
-//   Writes to read-only or undefined addresses are silently accepted
-//   (BRESP = OKAY) to avoid AXI bus hangs on simple PS drivers.
+//   soft_reset (control[1]) is self-clearing - it asserts pulse_soft_reset for one cycle.
+//   force_high (control[2]) overrides the output pin HIGH regardless of NCO state.
+//   harmonic_mode (control[3]) selects output: NCO carry-out (0) vs phase_acc[47] (1).
+//   Writes to read-only or undefined addresses are silently accepted (BRESP=OKAY).
 
 module axi4lite_pulse_regs
 (
@@ -62,8 +64,10 @@ module axi4lite_pulse_regs
   // Control outputs -> pulse_gen
   output logic        pulse_enable,
   output logic        pulse_soft_reset,
+  output logic        force_high,
+  output logic        harmonic_mode,
   output logic [31:0] pulse_divider,
-  output logic [31:0] pulse_width,
+  output logic [31:0] width_n,       // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
   output logic [31:0] pulse_delay,
   output logic [31:0] meas_time_us,
   output logic signed [47:0] phase_step_offset,
@@ -82,7 +86,7 @@ module axi4lite_pulse_regs
 
   logic [31:0] reg_control;
   logic [31:0] reg_divider;
-  logic [31:0] reg_width;
+  logic [31:0] reg_width_n;
   logic [31:0] reg_delay;
   logic [31:0] reg_meas_time_us;
   logic [31:0] reg_phase_step_offset_lo;
@@ -103,8 +107,10 @@ module axi4lite_pulse_regs
   assign s_axi_rresp = 2'b00;
 
   assign pulse_enable      = reg_control[0];
+  assign force_high        = reg_control[2];
+  assign harmonic_mode     = reg_control[3];
   assign pulse_divider     = reg_divider;
-  assign pulse_width       = reg_width;
+  assign width_n           = reg_width_n;
   assign pulse_delay       = reg_delay;
   assign meas_time_us      = reg_meas_time_us;
   assign phase_step_offset = $signed({reg_phase_step_offset_hi, reg_phase_step_offset_lo});
@@ -113,7 +119,7 @@ module axi4lite_pulse_regs
     if (!rstn) begin
       reg_control               <= 32'h00000001;
       reg_divider               <= 32'h00000001;
-      reg_width                 <= 32'h00000001;
+      reg_width_n               <= 32'h00000001;
       reg_delay                 <= 32'h00000001;
       reg_meas_time_us          <= 32'd100_000;  // Default: 100 ms
       reg_phase_step_offset_lo  <= 32'h00000000;
@@ -151,9 +157,11 @@ module axi4lite_pulse_regs
         case (awaddr_latched[5:2])
           4'd0: begin
             if (wstrb_latched[0]) begin
-              reg_control[0] <= wdata_latched[0];
+              reg_control[0] <= wdata_latched[0];   // enable
+              reg_control[2] <= wdata_latched[2];   // force_high
+              reg_control[3] <= wdata_latched[3];   // harmonic_mode
               if (wdata_latched[1])
-                pulse_soft_reset <= 1'b1;
+                pulse_soft_reset <= 1'b1;           // soft_reset strobe
             end
           end
 
@@ -164,11 +172,11 @@ module axi4lite_pulse_regs
             if (wstrb_latched[3]) reg_divider[31:24] <= wdata_latched[31:24];
           end
 
-          4'd2: begin
-            if (wstrb_latched[0]) reg_width[ 7: 0] <= wdata_latched[ 7: 0];
-            if (wstrb_latched[1]) reg_width[15: 8] <= wdata_latched[15: 8];
-            if (wstrb_latched[2]) reg_width[23:16] <= wdata_latched[23:16];
-            if (wstrb_latched[3]) reg_width[31:24] <= wdata_latched[31:24];
+          4'd2: begin  // 0x08  width_n
+            if (wstrb_latched[0]) reg_width_n[ 7: 0] <= wdata_latched[ 7: 0];
+            if (wstrb_latched[1]) reg_width_n[15: 8] <= wdata_latched[15: 8];
+            if (wstrb_latched[2]) reg_width_n[23:16] <= wdata_latched[23:16];
+            if (wstrb_latched[3]) reg_width_n[31:24] <= wdata_latched[31:24];
           end
 
           4'd3: begin
@@ -187,10 +195,9 @@ module axi4lite_pulse_regs
             if (wstrb_latched[3]) reg_phase_step_offset_lo[31:24] <= wdata_latched[31:24];
           end
 
-          4'd8: begin  // 0x20 phase_step_offset_hi (bits [47:32] of offset, in [15:0])
+          4'd8: begin  // 0x20 phase_step_offset_hi (bits [47:32] in [15:0])
             if (wstrb_latched[0]) reg_phase_step_offset_hi[ 7:0] <= wdata_latched[ 7:0];
             if (wstrb_latched[1]) reg_phase_step_offset_hi[15:8] <= wdata_latched[15:8];
-            // strobe[2] and strobe[3] map above bit 15 - no register bits there
           end
 
           // 4'd9..4'd12 (phase_step_base, phase_step): read-only, writes silently ignored
@@ -215,9 +222,10 @@ module axi4lite_pulse_regs
       // ---- Read channel ----
       if (s_axi_arready && s_axi_arvalid) begin
         case (s_axi_araddr[5:2])
-          4'd0:  s_axi_rdata <= {reg_control[31:2], 1'b0, reg_control[0]};
+          // bit 1 (soft_reset) always reads 0; bits 0, 2, 3 read back as stored
+          4'd0:  s_axi_rdata <= {reg_control[31:4], reg_control[3], reg_control[2], 1'b0, reg_control[0]};
           4'd1:  s_axi_rdata <= reg_divider;
-          4'd2:  s_axi_rdata <= reg_width;
+          4'd2:  s_axi_rdata <= reg_width_n;
           4'd3:  s_axi_rdata <= reg_delay;
           4'd4:  s_axi_rdata <= {27'd0, freerun_active, timeout_flag,
                                          period_stable, period_valid, pulse_busy};

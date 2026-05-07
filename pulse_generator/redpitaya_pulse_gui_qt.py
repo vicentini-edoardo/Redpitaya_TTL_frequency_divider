@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya TTL frequency divider.
+redpitaya_pulse_gui_qt.py — PySide6 desktop GUI for the Red Pitaya TTL pulse generator.
 
 Architecture
 ------------
 - SshBackend  : persistent paramiko TCP connection, single worker thread, priority queue.
                 User writes (priority 0) always execute before polls (priority 9).
-                Works on Windows, macOS, and Linux without any OS-level SSH client.
 - MainWindow  : Qt UI on the main thread; communicates with the backend via signals only.
 
 Run with:  python redpitaya_pulse_gui_qt.py
@@ -30,7 +29,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-        QSizePolicy, QSlider, QTextEdit, QVBoxLayout, QWidget,
+        QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
     )
 except ImportError as exc:
     raise SystemExit(
@@ -47,15 +46,18 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardware constants
 # ─────────────────────────────────────────────────────────────────────────────
-CLK_HZ       = 125_000_000
-PHASE_BITS   = 48
-DEFAULT_BASE = 0x40600000
-CTRL_ENABLE  = 0x01
+CLK_HZ        = 125_000_000
+PHASE_BITS    = 48
+DEFAULT_BASE  = 0x40600000
 
-_PHASE_MAX = 2 ** (PHASE_BITS - 1)
+# control register bits
+CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
+CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
+# bit 3 (CTRL_HARMONIC = 0x08) is enforced by the C helper; not set here
+
+_PHASE_MAX   = 2 ** (PHASE_BITS - 1)
 PHASE_RES_HZ = CLK_HZ / 2**PHASE_BITS
 
-# Measurement window options: combo index → duration in microseconds
 WINDOW_OPTIONS_US = [1_000, 10_000, 100_000, 500_000, 1_000_000]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,20 +98,17 @@ def fmt_signed_freq(hz: float) -> str:
 
 
 def suggest_window(f_shift_hz: float) -> int:
-    """Suggest measurement window based on frequency shift.
-    Returns index 0=1ms, 1=10ms, 2=100ms, 3=500ms, 4=1000ms
-    """
     if f_shift_hz <= 0:
-        return 2  # Default to 100 ms
+        return 2
     if f_shift_hz < 1:
-        return 4  # 1000 ms for sub-Hz shifts
+        return 4
     if f_shift_hz < 10:
-        return 3  # 500 ms for 1-10 Hz
+        return 3
     if f_shift_hz < 100:
-        return 2  # 100 ms for 10-100 Hz
+        return 2
     if f_shift_hz < 1000:
-        return 1  # 10 ms for 100 Hz - 1 kHz
-    return 0  # 1 ms for >= 1 kHz
+        return 1
+    return 0
 
 
 def fmt_dur(s: float) -> str:
@@ -129,7 +128,6 @@ def fmt_dur(s: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _Job:
-    """Priority queue item. Lower pri number = higher urgency."""
     __slots__ = ("pri", "seq", "fn", "cb")
     _counter = 0
 
@@ -148,13 +146,11 @@ class SshBackend(QObject):
     """
     Maintains a single persistent paramiko SSH session.
 
-    All SSH I/O runs in one background thread fed by a priority queue:
+    Priority queue:
       P_USER (0)   – register writes triggered by the user
       P_UPLOAD (1) – file upload / compile
       P_INIT (2)   – connect / disconnect
       P_POLL (9)   – periodic register reads
-
-    Results are returned to the Qt main thread through signals.
     """
 
     P_USER   = 0
@@ -163,8 +159,8 @@ class SshBackend(QObject):
     P_POLL   = 9
 
     sig_connected    = Signal()
-    sig_disconnected = Signal(str)   # reason string
-    sig_status       = Signal(dict)  # parsed JSON from the board
+    sig_disconnected = Signal(str)
+    sig_status       = Signal(dict)
     sig_log          = Signal(str)
     sig_error        = Signal(str)
 
@@ -176,11 +172,10 @@ class SshBackend(QObject):
         self._base  = DEFAULT_BASE
         self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
         self._upload_pending: Optional[tuple] = None
-        self._upload_callback: Optional[Callable] = None
         self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
         self._thread.start()
 
-    # ── public API (called from Qt main thread) ───────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────────
 
     def start_connect(self, host: str, port: int, user: str,
                       key: Optional[str], base: int):
@@ -194,10 +189,18 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
 
-    def apply(self, width_cycles: int, offset_word: int, enable: bool):
+    def apply(self, width_cycles: int, offset_word: int):
+        """Send modulated-mode write (enable=1, force_high=0, harmonic_mode=0 via helper)."""
         if self._live:
             self._enqueue(self.P_USER,
-                          lambda: self._do_write(width_cycles, offset_word, enable),
+                          lambda: self._do_write(width_cycles, offset_word),
+                          self.sig_status.emit)
+
+    def set_control(self, ctrl: int):
+        """Set control register directly (for Laser Off / Laser On)."""
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_set_control(ctrl),
                           self.sig_status.emit)
 
     def set_window(self, window: int):
@@ -210,12 +213,11 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
-    def upload(self, c_src: str, bit_src: Optional[str], on_connected: Optional[Callable] = None):
+    def upload(self, c_src: str, bit_src: Optional[str]):
         if self._live:
             self._enqueue(self.P_UPLOAD, lambda: self._do_upload(c_src, bit_src))
         else:
             self._upload_pending = (c_src, bit_src)
-            self._upload_callback = on_connected
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -289,11 +291,13 @@ class SshBackend(QObject):
     def _do_read(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} read"))
 
-    def _do_write(self, width: int, offset: int, enable: bool) -> dict:
-        ctrl = CTRL_ENABLE if enable else 0
+    def _do_write(self, width: int, offset: int) -> dict:
         return json.loads(self._exec(
-            f"{self._rp_cmd()} write {width} {offset} {ctrl}"
+            f"{self._rp_cmd()} write {width} {offset} {CTRL_ENABLE}"
         ))
+
+    def _do_set_control(self, ctrl: int) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} control {ctrl}"))
 
     def _do_reset(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} soft_reset"))
@@ -305,10 +309,7 @@ class SshBackend(QObject):
         self.sig_log.emit(f"Uploading {Path(c_src).as_posix()} …")
         self._sftp.put(c_src, "/root/rp_pulse_ctl.c")
         self.sig_log.emit("Compiling on board …")
-        self._exec(
-            "gcc -O2 -o /root/rp_pulse_ctl /root/rp_pulse_ctl.c",
-            timeout=60,
-        )
+        self._exec("gcc -O2 -o /root/rp_pulse_ctl /root/rp_pulse_ctl.c", timeout=60)
         self.sig_log.emit("Compiled OK.")
         if bit_src and Path(bit_src).exists():
             self.sig_log.emit("Uploading FPGA bitfile …")
@@ -330,6 +331,7 @@ _ACCENT = "#00d4ff"
 _GREEN  = "#3fb950"
 _AMBER  = "#d29922"
 _RED    = "#f85149"
+_WHITE  = "#e6edf3"
 _TEXT   = "#e6edf3"
 _DIM    = "#8b949e"
 _BORDER = "#263241"
@@ -381,6 +383,29 @@ def _btn_style(color: str = _ACCENT) -> str:
     """
 
 
+def _mode_btn_style(color: str, active: bool) -> str:
+    """Style for the three output-mode buttons (OFF / MODULATED / ON)."""
+    if active:
+        return f"""
+            QPushButton {{
+                background: {color}28; color: {color};
+                border: 2px solid {color}; border-radius: 7px;
+                padding: 5px 16px;
+                font-family: {_MONO}; font-size: 10px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {color}38; }}
+        """
+    return f"""
+        QPushButton {{
+            background: #111923; color: {_DIM};
+            border: 1px solid {_BORDER}; border-radius: 7px;
+            padding: 5px 16px;
+            font-family: {_MONO}; font-size: 10px;
+        }}
+        QPushButton:hover {{ background: #182536; color: {color}; border-color: {color}; }}
+    """
+
+
 def _le_style() -> str:
     return f"""
         QLineEdit {{
@@ -402,33 +427,12 @@ def _spin_style() -> str:
             font-family: {_MONO}; font-size: 10px;
         }}
         QDoubleSpinBox:focus, QComboBox:focus {{ border-color: {_ACCENT}; }}
-        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-            width: 16px;
-        }}
-        QComboBox::drop-down {{
-            width: 22px;
-            border: none;
-        }}
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; }}
+        QComboBox::drop-down {{ width: 22px; border: none; }}
         QComboBox QAbstractItemView {{
-            background: #0b111a;
-            color: {_TEXT};
+            background: #0b111a; color: {_TEXT};
             selection-background-color: #182536;
             border: 1px solid {_BORDER};
-        }}
-    """
-
-
-def _slider_style(accent: str = _ACCENT) -> str:
-    return f"""
-        QSlider::groove:horizontal {{
-            height: 4px; background: {_BORDER}; border-radius: 2px;
-        }}
-        QSlider::handle:horizontal {{
-            width: 14px; height: 14px; margin: -5px 0;
-            background: {accent}; border-radius: 7px;
-        }}
-        QSlider::sub-page:horizontal {{
-            background: {accent}; border-radius: 2px;
         }}
     """
 
@@ -438,11 +442,6 @@ def _slider_style(accent: str = _ACCENT) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BigDisplay(QFrame):
-    """
-    Displays a single measurement (frequency, duration, etc.) in a large font.
-    Four of these form the top row of the UI.
-    """
-
     def __init__(self, title: str, sub_hint: str = "",
                  accent: str = _ACCENT, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -478,88 +477,12 @@ class BigDisplay(QFrame):
         self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(self._sub)
 
-    def set_data(self, value: str, sub: str = "",
-                 color: Optional[str] = None):
+    def set_data(self, value: str, sub: str = "", color: Optional[str] = None):
         self._val.setText(value)
         c = color or self._accent
         self._val.setStyleSheet(f"color: {c}; background: transparent; border: none;")
         if sub is not None:
             self._sub.setText(sub)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ParamSlider — horizontal slider paired with a spinbox
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ParamSlider(QWidget):
-    """Combines a QSlider and a QDoubleSpinBox that stay synchronised."""
-
-    changed = Signal(float)
-
-    def __init__(self, label: str, lo: float, hi: float,
-                 decimals: int = 2, suffix: str = "",
-                 accent: str = _ACCENT, parent: Optional[QWidget] = None,
-                 spin_width: int = 115, single_step: Optional[float] = None):
-        super().__init__(parent)
-        self._lo  = lo
-        self._hi  = hi
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        lbl = QLabel(f"{label}:")
-        lbl.setFixedWidth(90)
-        lbl.setFont(_mono_font(10))
-        lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        row.addWidget(lbl)
-
-        self._sl = QSlider(Qt.Horizontal)
-        self._sl.setRange(0, 10000)
-        self._sl.setStyleSheet(_slider_style(accent))
-        row.addWidget(self._sl, 1)
-
-        self._sp = QDoubleSpinBox()
-        self._sp.setRange(lo, hi)
-        self._sp.setDecimals(decimals)
-        if single_step is not None:
-            self._sp.setSingleStep(single_step)
-        if suffix:
-            self._sp.setSuffix(f" {suffix}")
-        self._sp.setFixedWidth(spin_width)
-        self._sp.setStyleSheet(_spin_style())
-        row.addWidget(self._sp)
-
-        self._sl.valueChanged.connect(self._from_slider)
-        self._sp.valueChanged.connect(self._from_spin)
-
-    def _frac(self, v: float) -> float:
-        span = self._hi - self._lo
-        return (v - self._lo) / span if span else 0.0
-
-    def _from_slider(self, tick: int):
-        v = self._lo + tick / 10000.0 * (self._hi - self._lo)
-        self._sp.blockSignals(True)
-        self._sp.setValue(v)
-        self._sp.blockSignals(False)
-        self.changed.emit(v)
-
-    def _from_spin(self, v: float):
-        self._sl.blockSignals(True)
-        self._sl.setValue(int(self._frac(v) * 10000))
-        self._sl.blockSignals(False)
-        self.changed.emit(v)
-
-    def value(self) -> float:
-        return self._sp.value()
-
-    def set_value(self, v: float):
-        self._sp.blockSignals(True)
-        self._sl.blockSignals(True)
-        self._sp.setValue(v)
-        self._sl.setValue(int(self._frac(v) * 10000))
-        self._sp.blockSignals(False)
-        self._sl.blockSignals(False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,15 +493,15 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Red Pitaya — TTL Frequency Divider")
-        self.setMinimumSize(960, 680)
+        self.setWindowTitle("Red Pitaya — TTL Pulse Generator")
+        self.setMinimumSize(960, 700)
 
-        self._period_c = 0   # last known period in FPGA clock cycles
-        self._live     = False
-        self._window_select = 2  # default: 100 ms
+        self._period_c  = 0
+        self._live      = False
+        self._window_select = 2
         self._refresh_input_pending = False
+        self._output_mode: str = "modulated"   # "off" | "modulated" | "on"
 
-        # Backend
         self._be = SshBackend(self)
         self._be.sig_connected.connect(self._on_connected)
         self._be.sig_disconnected.connect(self._on_disconnected)
@@ -586,13 +509,11 @@ class MainWindow(QMainWindow):
         self._be.sig_log.connect(self._log)
         self._be.sig_error.connect(self._on_error)
 
-        # Debounce timer — delays auto-apply 300 ms after last slider move
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(300)
         self._debounce.timeout.connect(self._do_apply)
 
-        # Poll timer — adaptive interval updated by _on_status
         self._poll = QTimer(self)
         self._poll.setInterval(800)
         self._poll.timeout.connect(self._be.poll)
@@ -600,7 +521,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._set_global_style()
 
-        # Ctrl+Return → apply
         act = QAction(self)
         act.setShortcut(QKeySequence("Ctrl+Return"))
         act.triggered.connect(self._do_apply)
@@ -640,7 +560,7 @@ class MainWindow(QMainWindow):
         self._btn_conn = QPushButton("Connect"); self._btn_conn.setFixedWidth(95)
         self._btn_conn.clicked.connect(self._toggle_connect)
 
-        self._btn_upload  = QPushButton("Upload && Compile")
+        self._btn_upload = QPushButton("Upload && Compile")
         self._btn_upload.setFixedWidth(150)
         self._btn_upload.clicked.connect(self._do_upload)
         self._btn_upload.setStyleSheet(_btn_style())
@@ -673,7 +593,6 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout()
         outer.setSpacing(12)
 
-        # ── Four primary monitors in a 2×2 grid ───────────────────────────────
         self._d_in  = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
         self._d_dur = BigDisplay("Pulse Duration",   "pulse high-time",       _AMBER)
         self._d_out = BigDisplay("Output Frequency", "NCO output",            _GREEN)
@@ -689,11 +608,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self._d_dur, 0, 1)
         grid.addWidget(self._d_out, 1, 0)
         grid.addWidget(self._d_dut, 1, 1)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-
+        grid.setRowStretch(0, 1); grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
         outer.addLayout(grid, 1)
 
         controls = self._make_group("Controls")
@@ -701,16 +617,49 @@ class MainWindow(QMainWindow):
         controls_lay.setContentsMargins(12, 12, 12, 12)
         controls_lay.setSpacing(18)
 
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+
+        # ── Output mode bar ───────────────────────────────────────────────────
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+
+        mode_lbl = QLabel("Output mode:")
+        mode_lbl.setFont(_mono_font(10, bold=True))
+        mode_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        mode_row.addWidget(mode_lbl)
+
+        self._btn_off = QPushButton("■  LASER OFF")
+        self._btn_mod = QPushButton("~  MODULATED")
+        self._btn_on  = QPushButton("●  LASER ON")
+        for btn in (self._btn_off, self._btn_mod, self._btn_on):
+            btn.setFixedHeight(34)
+            btn.setFont(_mono_font(10))
+            mode_row.addWidget(btn)
+        mode_row.addStretch()
+
+        self._btn_off.clicked.connect(lambda: self._set_output_mode("off"))
+        self._btn_mod.clicked.connect(lambda: self._set_output_mode("modulated"))
+        self._btn_on.clicked.connect(lambda: self._set_output_mode("on"))
+        left_col.addLayout(mode_row)
+
+        # Divider
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {_BORDER};")
+        left_col.addWidget(sep)
+
+        # ── Parameter fields ──────────────────────────────────────────────────
         fields = QGridLayout()
         fields.setHorizontalSpacing(10)
         fields.setVerticalSpacing(8)
 
-        # ── Editable frequency shift ──────────────────────────────────────────
         freq_lbl = QLabel("Freq shift:")
         freq_lbl.setFixedWidth(90)
         freq_lbl.setFont(_mono_font(10))
         freq_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         fields.addWidget(freq_lbl, 0, 0)
+
         self._sp_offset = QDoubleSpinBox()
         self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
         self._sp_offset.setDecimals(6)
@@ -728,6 +677,7 @@ class MainWindow(QMainWindow):
         width_lbl.setFont(_mono_font(10))
         width_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         fields.addWidget(width_lbl, 0, 2)
+
         self._sp_width = QDoubleSpinBox()
         self._sp_width.setRange(0.1, 99.9)
         self._sp_width.setDecimals(2)
@@ -740,50 +690,49 @@ class MainWindow(QMainWindow):
         self._sp_width.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_width, 0, 3)
 
-        # ── Measurement window and suggestion ────────────────────────────────
         window_lbl = QLabel("Meas. window:")
         window_lbl.setFixedWidth(90)
         window_lbl.setFont(_mono_font(10))
         window_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         fields.addWidget(window_lbl, 1, 0)
+
         self._cb_window = QComboBox()
         self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"])
-        self._cb_window.setCurrentIndex(2)  # Default: 100 ms
+        self._cb_window.setCurrentIndex(2)
         self._cb_window.setFixedHeight(38)
         self._cb_window.setFixedWidth(118)
         self._cb_window.setFont(_mono_font(10))
         self._cb_window.setStyleSheet(_spin_style())
         self._cb_window.currentIndexChanged.connect(self._on_window_changed)
         fields.addWidget(self._cb_window, 1, 1)
+
         self._lbl_window_suggest = QLabel()
         self._lbl_window_suggest.setFont(_mono_font(9))
         self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
         fields.addWidget(self._lbl_window_suggest, 1, 2, 1, 2)
 
-        toggles = QHBoxLayout()
-        toggles.setSpacing(18)
-        self._cb_en = QCheckBox("Enable Output")
+        auto_row = QHBoxLayout()
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
-        for cb in (self._cb_en, self._cb_auto):
-            cb.setFont(_mono_font(10))
-            cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-            toggles.addWidget(cb)
-        toggles.addStretch()
-        self._cb_en.toggled.connect(self._param_changed)
-        fields.addLayout(toggles, 2, 0, 1, 4)
+        self._cb_auto.setFont(_mono_font(10))
+        self._cb_auto.setStyleSheet(f"color: {_TEXT}; background: transparent;")
+        auto_row.addWidget(self._cb_auto)
+        auto_row.addStretch()
+        fields.addLayout(auto_row, 2, 0, 1, 4)
 
-        # ── Shift detail label ─────────────────────────────────────────────────
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
         self._lbl_shift.setWordWrap(True)
         self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
         fields.addWidget(self._lbl_shift, 3, 0, 1, 4)
         fields.setColumnStretch(1, 1)
-        controls_lay.addLayout(fields, 1)
+
+        left_col.addLayout(fields)
+        controls_lay.addLayout(left_col, 1)
 
         actions = QVBoxLayout()
         actions.setSpacing(8)
+
         self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
         self._btn_apply.setFixedWidth(210)
         self._btn_apply.setFixedHeight(92)
@@ -802,6 +751,7 @@ class MainWindow(QMainWindow):
         controls_lay.addLayout(actions)
 
         outer.addWidget(controls)
+        self._update_mode_styles()
         self._update_shift_detail()
         return outer
 
@@ -824,7 +774,37 @@ class MainWindow(QMainWindow):
             f"QMainWindow, QWidget {{ background: {_BG}; color: {_TEXT}; }}"
         )
 
-    # ── connection handling ───────────────────────────────────────────────────
+    # ── Output mode ───────────────────────────────────────────────────────────
+
+    def _set_output_mode(self, mode: str):
+        self._output_mode = mode
+        self._update_mode_styles()
+        self._update_mode_controls()
+        if self._live:
+            if mode == "off":
+                self._be.set_control(0x00)
+                self._log("Laser OFF  (output = constant 0)")
+            elif mode == "on":
+                self._be.set_control(CTRL_FORCE_HIGH)
+                self._log("Laser ON   (output = constant 1)")
+            else:
+                # Modulated — trigger an immediate apply
+                self._do_apply()
+
+    def _update_mode_styles(self):
+        m = self._output_mode
+        self._btn_off.setStyleSheet(_mode_btn_style(_RED,   m == "off"))
+        self._btn_mod.setStyleSheet(_mode_btn_style(_GREEN, m == "modulated"))
+        self._btn_on.setStyleSheet(_mode_btn_style(_WHITE,  m == "on"))
+
+    def _update_mode_controls(self):
+        """Enable/disable modulation controls based on output mode."""
+        enabled = (self._output_mode == "modulated")
+        for w in (self._sp_offset, self._sp_width, self._cb_window,
+                  self._cb_auto, self._btn_apply):
+            w.setEnabled(enabled)
+
+    # ── Connection handling ───────────────────────────────────────────────────
 
     def _pick_key(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -857,14 +837,10 @@ class MainWindow(QMainWindow):
         self._btn_upload.setEnabled(True)
         self._lbl_status.setText("●  Connected")
         self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
-        # Set initial window selection
         self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
         self._poll.start()
-        self._be.poll()   # kick off immediate first read rather than waiting 800 ms
+        self._be.poll()
         self._log("Connected.")
-
-    def _on_upload_connected(self):
-        pass
 
     @Slot(str)
     def _on_disconnected(self, reason: str):
@@ -877,24 +853,21 @@ class MainWindow(QMainWindow):
         self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
         self._log(f"Disconnected: {reason}")
 
-    # ── parameter controls ────────────────────────────────────────────────────
+    # ── Parameter controls ────────────────────────────────────────────────────
 
     def _param_changed(self, *_):
-        """Called on any slider/spinbox/checkbox change."""
-        if self._cb_auto.isChecked():
-            self._debounce.start()   # restart 300 ms window
+        if self._output_mode == "modulated" and self._cb_auto.isChecked():
+            self._debounce.start()
         self._update_local_displays()
         self._update_window_suggestion()
 
     def _on_window_changed(self, idx: int):
-        """Called when user changes window selection."""
         self._window_select = idx
         if self._live:
             self._be.set_window(WINDOW_OPTIONS_US[idx])
         self._update_window_suggestion()
 
     def _update_local_displays(self):
-        """Immediately refresh duration & duty from local slider state."""
         self._update_shift_detail()
         if self._period_c <= 0:
             return
@@ -905,12 +878,11 @@ class MainWindow(QMainWindow):
 
     def _update_shift_detail(self):
         requested_hz = self._sp_offset.value()
-        offset_word = hz_to_phase(requested_hz)
-        actual_hz = phase_to_hz(offset_word)
+        offset_word  = hz_to_phase(requested_hz)
+        actual_hz    = phase_to_hz(offset_word)
         if self._period_c > 0:
-            input_hz = CLK_HZ / self._period_c
-            output_hz = input_hz + actual_hz
-            out_text = f", target output {fmt_freq(output_hz)}" if output_hz > 0 else ""
+            output_hz = CLK_HZ / self._period_c + actual_hz
+            out_text  = f", target output {fmt_freq(output_hz)}" if output_hz > 0 else ""
         else:
             out_text = ""
         self._lbl_shift.setText(
@@ -920,11 +892,10 @@ class MainWindow(QMainWindow):
         )
 
     def _update_window_suggestion(self):
-        """Update window suggestion based on frequency shift."""
-        f_shift = abs(self._sp_offset.value())
-        suggested = suggest_window(f_shift)
+        f_shift      = abs(self._sp_offset.value())
+        suggested    = suggest_window(f_shift)
         window_names = ["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"]
-        current = self._cb_window.currentIndex()
+        current      = self._cb_window.currentIndex()
         if current == suggested:
             self._lbl_window_suggest.setText(f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
             self._lbl_window_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
@@ -933,30 +904,19 @@ class MainWindow(QMainWindow):
             self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
 
     def _do_apply(self):
-        if not self._live:
+        if not self._live or self._output_mode != "modulated":
             return
-        frac   = self._sp_width.value() / 100.0
-        off_hz = self._sp_offset.value()
-        enable = self._cb_en.isChecked()
-        period = self._period_c if self._period_c > 0 else 1000
-        wc     = duty_to_cycles(frac, period)
+        frac        = self._sp_width.value() / 100.0
+        off_hz      = self._sp_offset.value()
+        period      = self._period_c if self._period_c > 0 else 1000
+        wc          = duty_to_cycles(frac, period)
         offset_word = hz_to_phase(off_hz)
-        actual_hz = phase_to_hz(offset_word)
-        self._be.apply(wc, offset_word, enable)
+        actual_hz   = phase_to_hz(offset_word)
+        self._be.apply(wc, offset_word)
         self._log(
             f"Apply  width={self._sp_width.value():.2f}%  "
-            f"shift={actual_hz:+.6f} Hz  "
-            f"phase_offset={offset_word:+d}  "
-            f"enable={enable}"
+            f"shift={actual_hz:+.6f} Hz  phase_offset={offset_word:+d}"
         )
-
-    def _do_measure_input(self):
-        if not self._live:
-            return
-        self._refresh_input_pending = True
-        self._d_in.set_data("…", "measuring", _AMBER)
-        self._be.poll()
-        self._log("Measure Input requested.")
 
     def _do_soft_reset(self):
         if not self._live:
@@ -972,22 +932,20 @@ class MainWindow(QMainWindow):
             self._log(f"ERROR: source file not found: {Path(c_src).as_posix()}")
             return
         if not self._live:
-            self._log("Not connected. Connecting first…")
-            self._btn_upload.setEnabled(False)
+            self._log("Not connected — queuing upload for after connect …")
             host = self._w_host.text().strip()
             port = int(self._w_port.text().strip() or "22")
             user = self._w_user.text().strip() or "root"
             key  = self._w_key.text().strip() or None
-            self._be.upload(c_src, bit_src if Path(bit_src).exists() else None, self._on_upload_connected)
+            self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
             self._be.start_connect(host, port, user, key, DEFAULT_BASE)
         else:
             self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
 
-    # ── status update from hardware ───────────────────────────────────────────
+    # ── Status update from hardware ───────────────────────────────────────────
 
     @Slot(dict)
     def _on_status(self, d: dict):
-        # Update window combo from FPGA meas_time_us if it changed
         raw_us = d.get("meas_time_us")
         if raw_us is not None:
             us_val = int(raw_us)
@@ -1002,10 +960,22 @@ class MainWindow(QMainWindow):
                 self._cb_window.blockSignals(False)
                 self._window_select = fpga_idx
 
+        # Sync output mode indicator from FPGA control register
+        ctrl = int(d.get("control") or 0)
+        if (ctrl >> 2) & 1:
+            fpga_mode = "on"
+        elif ctrl & 1:
+            fpga_mode = "modulated"
+        else:
+            fpga_mode = "off"
+        if fpga_mode != self._output_mode:
+            self._output_mode = fpga_mode
+            self._update_mode_styles()
+            self._update_mode_controls()
+
         period = int(d.get("period_avg") or d.get("period") or 0)
         stable = bool(d.get("period_stable"))
 
-        # Only update the displayed input frequency when explicitly requested.
         if self._refresh_input_pending:
             if period > 0:
                 self._period_c = period
@@ -1016,21 +986,16 @@ class MainWindow(QMainWindow):
                     _ACCENT if stable else _AMBER,
                 )
                 self._refresh_input_pending = False
-                self._log(
-                    f"Input measured: {fmt_freq(in_hz)} "
-                    f"({'stable' if stable else 'acquiring'})"
-                )
+                self._log(f"Input measured: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
             else:
-                # No signal yet; keep the flag set so the next poll tries again.
                 self._d_in.set_data("---", "no input signal", _RED)
 
-        # Output, width/duty, and adaptive poll interval update on every tick.
         if period > 0:
             step_base = int(d.get("phase_step_base") or 0)
             step_live = int(d.get("phase_step") or step_base)
             step_off  = int(d.get("phase_step_offset") or (step_live - step_base))
-            out_hz = phase_to_hz(step_live)
-            delta  = phase_to_hz(step_off)
+            out_hz    = phase_to_hz(step_live)
+            delta     = phase_to_hz(step_off)
             self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
             self._update_shift_detail()
 
@@ -1043,7 +1008,7 @@ class MainWindow(QMainWindow):
         else:
             self._poll.setInterval(400)
 
-    # ── error / log ───────────────────────────────────────────────────────────
+    # ── Error / log ───────────────────────────────────────────────────────────
 
     @Slot(str)
     def _on_error(self, msg: str):
