@@ -1,5 +1,13 @@
 # FPGA build artifacts
 VIVADO/
+Vivado/
+*.jou
+*.str
+*.cache/
+*.hw/
+*.runs/
+*.sim/
+*.gen/
 
 
 # Python
@@ -34,11 +42,28 @@ gui.log
 *.swo
 *~
 
+# Mode subfolders — consolidated into root rp_ctl.c / combined GUI
+harmonic_generator/
+pulse_generator/
+
 # C build artifacts
 *.o
 *.out
 rp_pulse_ctl
+rp_harmonic_ctl
+rp_ctl
 
 # Distribution / packaging
 *.tar.gz
 *.zip
+
+# macOS quarantine extended attributes
+**/.DS_Store
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Windows
+Thumbs.db

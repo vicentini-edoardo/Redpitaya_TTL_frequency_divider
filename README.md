@@ -1,98 +1,44 @@
-# Red Pitaya TTL Frequency Divider
+# Red Pitaya TTL Frequency Generator
 
-Desktop tools for controlling a custom Red Pitaya FPGA TTL pulse/NCO shifter over SSH.
+Desktop tools for controlling a custom Red Pitaya FPGA TTL signal generator over SSH.
 
-The main application is `redpitaya_pulse_gui_qt.py`, a PySide6 GUI that connects to a Red Pitaya, uploads and compiles the board-side register helper, optionally loads the FPGA bitstream, and provides live control of output enable, pulse width, signed frequency shift, and the reciprocal-counting measurement window. A terminal register monitor is also included for debugging.
+Two FPGA modes are supported by a **single unified FPGA bitfile** and a **single
+board-side C helper** (`rp_ctl.c`). The helper detects its operating mode from the
+binary name it is called as.
 
-![GUI screenshot](GUI.png)
+| Mode | Formula | Duty cycle |
+|------|---------|------------|
+| **Pulse / Freq-Shift** | f_out = f_in + f_shift | User-adjustable |
+| **Harmonic Generator** | f_out = N × f_in + f_shift | Fixed 50 % |
 
-```text
-External TTL signal -> DIO0_P -> FPGA pulse/NCO shifter -> DIO1_P -> shifted TTL output
-                                      ^
-                                      |
-                         SSH/SFTP from the desktop GUI
-```
+Both modes run from the same bitstream. Switching modes is instant — no re-flashing
+needed.
 
-## Project Contents
-
-| Path | Purpose |
-|------|---------|
-| `redpitaya_pulse_gui_qt.py` | Main PySide6 desktop control GUI. |
-| `redpitaya_register_monitor.py` | Command-line live register monitor over OpenSSH. |
-| `rp_pulse_ctl.c` | Board-side C helper that reads/writes FPGA registers through `/dev/mem`. |
-| `Vivado files/` | FPGA RTL sources for the AXI register block and pulse/NCO datapath. |
-| `PHASE1_RECIPROCAL_COUNTING.md` | Notes for the reciprocal-counting measurement approach. |
-| `red_pitaya_top.bit.bin` | FPGA bitstream loaded by the GUI when present. |
-| `last/red_pitaya_top.bit.bin` | Previous/archived FPGA bitstream copy. |
-| `GUI.png` | README screenshot. |
-| `requirements.txt` | Python packages needed by the Qt GUI. |
-
-## Functionality
-
-The Qt GUI provides:
-
-- Persistent SSH/SFTP connection using `paramiko`, with all board I/O kept off the UI thread.
-- Host, port, user, and optional private-key based connection settings.
-- One-click upload of `rp_pulse_ctl.c` to `/root/rp_pulse_ctl.c`.
-- Remote compile of `/root/rp_pulse_ctl` with `gcc`.
-- Optional upload and load of `red_pitaya_top.bit.bin` with `/opt/redpitaya/bin/fpgautil`.
-- Live polling of FPGA register state.
-- Input frequency readout from the measured FPGA period register.
-- Output frequency readout from the live 48-bit NCO phase step.
-- Pulse width control as a fraction of the measured input period.
-- Signed frequency-shift control in Hz, converted to a signed 48-bit phase-step offset.
-- Measurement-window control with `10 ms`, `100 ms`, `500 ms`, and `1000 ms` options.
-- Suggested measurement window based on the requested frequency shift.
-- Output enable, auto-apply, manual apply, and soft reset controls.
-- Status and operation log inside the GUI.
-
-The command-line monitor provides:
-
-- Repeated register readback through the board-side helper.
-- Raw JSON-backed register snapshots over SSH for register-level debugging.
-- Decoded control/status information and measured periods when the payload fields are present.
-
-## Hardware Assumptions
-
-- Board: Red Pitaya STEMlab 125-14 or compatible 125 MHz Red Pitaya target.
-- FPGA clock: 125 MHz.
-- Input: `DIO0_P` / `GND`.
-- Output: `DIO1_P` / `GND`.
-- Red Pitaya SSH access, normally as `root`.
-- `gcc` available on the Red Pitaya.
-- `/opt/redpitaya/bin/fpgautil` available when loading the bitstream from the GUI.
-
-## Register Map
-
-The GUI and monitor communicate with the FPGA through `/root/rp_pulse_ctl`. The default AXI base address is `0x40600000`.
-
-| Offset | Register | Description |
-|--------|----------|-------------|
-| `0x00` | `control` | Bit 0 = output enable, bit 1 = soft reset strobe. |
-| `0x08` | `width` | Pulse width in 125 MHz clock cycles. |
-| `0x10` | `status` | Bit 0 = busy, bit 1 = period valid, bit 2 = timeout, bit 3 = period stable, bit 4 = freerun active. |
-| `0x14` | `raw_period` | Last measured input period in clock cycles. |
-| `0x18` | `period_avg` | Filtered/averaged measured input period in clock cycles. |
-| `0x1C` | `phase_step_offset_lo` | Low 32 bits of signed 48-bit NCO frequency offset. |
-| `0x20` | `phase_step_offset_hi` | High 16 bits of signed 48-bit NCO frequency offset. |
-| `0x24` | `phase_step_base_lo` | Low 32 bits of computed base phase step, read-only. |
-| `0x28` | `phase_step_base_hi` | High 16 bits of computed base phase step, read-only. |
-| `0x2C` | `phase_step_lo` | Low 32 bits of live phase step, read-only. |
-| `0x30` | `phase_step_hi` | High 16 bits of live phase step, read-only. |
-| `0x34` | `window_select` | Measurement window: `0=10 ms`, `1=100 ms`, `2=500 ms`, `3=1000 ms`. |
-
-Useful conversions:
+Signal path for both modes:
 
 ```text
-input_frequency_hz = 125_000_000 / period_avg
-frequency_offset_hz = phase_step_offset * 125_000_000 / 2^48
-phase_step_offset = round(frequency_offset_hz * 2^48 / 125_000_000)
-pulse_width_cycles = round(width_fraction * period_avg)
+External TTL signal → DIO0_P → FPGA (period measurement + NCO) → DIO1_P → TTL output
+                                         ^
+                                         |
+                            SSH/SFTP from the desktop GUI
 ```
+
+---
+
+## Project layout
+
+```
+Redpitaya_TTL_frequency_divider/
+├── redpitaya_combined_gui_qt.py   # Two-tab PySide6 GUI (both modes, one SSH session)
+├── rp_ctl.c                       # Unified board-side C helper (pulse + harmonic)
+├── red_pitaya_top.bit.bin         # Unified FPGA bitstream
+├── requirements.txt               # Python dependencies (PySide6, paramiko)
+└── PHASE1_RECIPROCAL_COUNTING.md  # Reciprocal-counting design notes
+```
+
+---
 
 ## Installation
-
-Create a virtual environment and install the GUI dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -100,92 +46,134 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-`redpitaya_register_monitor.py` uses only the Python standard library, but it shells out to the system `ssh` command.
+---
 
 ## Running the GUI
 
 ```bash
-.venv/bin/python redpitaya_pulse_gui_qt.py
+.venv/bin/python redpitaya_combined_gui_qt.py
 ```
 
-1. Enter the Red Pitaya hostname or IP, for example `rp-xxxxxx.local`.
-2. Keep the default SSH port `22` and user `root` unless your board differs.
-3. Choose an SSH private key if passwordless key auth is required.
-4. Click **Connect**.
-5. Click **Upload && Compile** after connecting if `/root/rp_pulse_ctl` is missing or stale.
+Select the **Pulse / Freq-Shift** or **Harmonic Generator** tab.
+Click **Upload && Compile** on either tab to upload `rp_ctl.c`, compile it on the
+board, and flash the bitfile — this is needed once per board or after a firmware update.
+Switching between tabs changes the active mode instantly with no re-flashing.
 
-When `red_pitaya_top.bit.bin` exists next to the GUI script, **Upload && Compile** also uploads it to `/root/red_pitaya_top.bit.bin` and loads it with `fpgautil`.
+---
 
-## GUI Controls
+## Output modes
 
-| Control | Effect |
-|---------|--------|
-| **Width** | Sets pulse high time as a fraction of the measured input period. |
-| **Freq shift** | Sets signed output frequency offset in Hz. The GUI shows requested Hz, quantized actual Hz, register word, and target output frequency when an input period is available. |
-| **Meas. window** | Selects the reciprocal-counting window used for input-period measurement. |
-| **Enable Output** | Writes control bit 0. |
-| **Auto-Apply** | Sends changed values after a 300 ms debounce. |
-| **Apply Now** | Writes current width, frequency shift, and enable state immediately. Shortcut: `Ctrl+Return`. |
-| **Soft Reset** | Pulses the FPGA soft-reset bit. |
-| **Upload && Compile** | Uploads and compiles the C helper, and loads the bitstream if present. |
+Each tab has three output mode buttons:
 
-The display cards show measured input frequency, live output frequency, pulse duration, and duty cycle. The GUI also shows whether the selected measurement window is already optimal for the current shift setting. Polling runs faster while the FPGA reports an unstable or missing period.
+| Button | Effect |
+|--------|--------|
+| **■ LASER OFF** | Forces output LOW (constant 0). NCO stops. |
+| **~ MODULATED** | Normal NCO operation — f_out follows the configured formula. |
+| **● LASER ON** | Forces output HIGH (constant 1), overriding the NCO. |
 
-## Running the Register Monitor
+The hardware control register is polled continuously; the GUI always reflects the
+current board state.
 
-The monitor expects `/root/rp_pulse_ctl` to already exist on the board.
+---
+
+## Board-side helper
+
+`rp_ctl.c` compiles to a single binary that serves both modes. It is installed as
+`/root/rp_ctl` and symlinked to both `/root/rp_pulse_ctl` and `/root/rp_harmonic_ctl`.
+The binary detects its mode from the name it is called as.
+
+### Manual install
 
 ```bash
-python3 redpitaya_register_monitor.py --host rp-xxxxxx.local
+# Upload and compile
+scp rp_ctl.c root@rp-xxxxxx.local:/root/rp_ctl.c
+ssh root@rp-xxxxxx.local 'gcc -O2 -o /root/rp_ctl /root/rp_ctl.c && \
+    ln -sf /root/rp_ctl /root/rp_pulse_ctl && \
+    ln -sf /root/rp_ctl /root/rp_harmonic_ctl'
+
+# Flash the bitfile (needed once per board boot)
+scp red_pitaya_top.bit.bin root@rp-xxxxxx.local:/root/
+ssh root@rp-xxxxxx.local '/opt/redpitaya/bin/fpgautil -b /root/red_pitaya_top.bit.bin'
 ```
 
-Optional arguments:
+### Subcommands (same for both modes)
 
 ```bash
-python3 redpitaya_register_monitor.py \
-  --host rp-xxxxxx.local \
-  --user root \
-  --port 22 \
-  --base-addr 0x40600000 \
-  --interval 0.5 \
-  --count 20
-```
-
-## Board-Side Helper
-
-The GUI normally handles helper installation. To compile it manually on the board:
-
-```bash
-scp rp_pulse_ctl.c root@rp-xxxxxx.local:/root/rp_pulse_ctl.c
-ssh root@rp-xxxxxx.local 'gcc -O2 -o /root/rp_pulse_ctl /root/rp_pulse_ctl.c'
-```
-
-Manual readback:
-
-```bash
+# Pulse mode
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 read'
-```
-
-Manual write:
-
-```bash
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 write <width_cycles> <phase_step_offset> <control>'
+ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 control 0'   # Laser OFF
+ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 control 4'   # Laser ON
+
+# Harmonic mode
+ssh root@rp-xxxxxx.local '/root/rp_harmonic_ctl 0x40600000 read'
+ssh root@rp-xxxxxx.local '/root/rp_harmonic_ctl 0x40600000 write <mult_n> <phase_step_offset> <control>'
+ssh root@rp-xxxxxx.local '/root/rp_harmonic_ctl 0x40600000 control 0'   # Laser OFF
+ssh root@rp-xxxxxx.local '/root/rp_harmonic_ctl 0x40600000 control 4'   # Laser ON
 ```
 
-Set measurement window manually:
+---
 
-```bash
-ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 window <0|1|2|3>'
-```
+## FPGA register map
+
+Base address: `0x40600000`
+
+| Offset | Register | Notes |
+|--------|----------|-------|
+| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode |
+| `0x08` | `width_n` / `mult_n` | Pulse width in clock cycles (pulse) or harmonic order 1..5 (harmonic) |
+| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
+| `0x14` | `raw_period` | Last measured input period (cycles) |
+| `0x18` | `period_avg` | Reciprocal-counted period (cycles) |
+| `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset |
+| `0x24/0x28` | `phase_step_base` | `2^48 / period_avg` (read-only) |
+| `0x2C/0x30` | `phase_step` | Live `[N·]base + offset` (read-only) |
+| `0x34` | `meas_time_us` | Measurement window in µs (min 1000) |
+
+### control register bits
+
+| Bit | Name | Function |
+|-----|------|----------|
+| 0 | enable | Start/stop the NCO and period measurement |
+| 1 | soft_reset | Self-clearing reset; clears the NCO and restarts measurement |
+| 2 | force_high | Override output HIGH regardless of NCO state (LASER ON) |
+| 3 | harmonic_mode | 0 = pulse mode, 1 = harmonic mode (set by binary name) |
+
+---
+
+## Hardware assumptions
+
+- Board: Red Pitaya STEMlab 125-14 or compatible 125 MHz target.
+- FPGA clock: 125 MHz.
+- Input TTL signal: `DIO0_P` / `GND`.
+- Output TTL signal: `DIO1_P` / `GND`.
+- SSH access as `root`; `gcc` available on the board.
+- `/opt/redpitaya/bin/fpgautil` available for bitstream loading.
+
+---
+
+## Connecting
+
+1. Enter the Red Pitaya hostname (e.g. `rp-xxxxxx.local`), port `22`, user `root`.
+2. Optionally select an SSH private-key file.
+3. Click **Connect**.
+4. Click **Upload && Compile** on the desired tab if the board helpers are not yet installed.
+
+---
 
 ## Troubleshooting
 
-- If the GUI exits with a PySide6 error, reinstall dependencies with `python -m pip install -r requirements.txt`.
-- If Connect fails, verify hostname/IP, SSH credentials, and that the board accepts SSH from your computer.
-- If register reads fail, upload and compile `rp_pulse_ctl.c` again.
-- If the FPGA image does not load, confirm `/opt/redpitaya/bin/fpgautil` exists on the board and that `red_pitaya_top.bit.bin` is the correct bitstream for your Red Pitaya OS/image.
-- If input frequency shows `---`, verify the TTL input is present on `DIO0_P` and shares ground with the Red Pitaya.
+| Symptom | Fix |
+|---------|-----|
+| PySide6 import error | `pip install -r requirements.txt` |
+| Connect fails | Check hostname/IP, SSH credentials, and board reachability. |
+| Register reads fail | Re-run **Upload && Compile** to reinstall the C helper. |
+| FPGA image does not load | Confirm `fpgautil` exists on the board and the `.bit.bin` matches the board OS. |
+| Input frequency shows `---` | Verify TTL input on `DIO0_P` and shared ground. |
+| Output stuck LOW after mode switch | Click **~ MODULATED** to re-enable the NCO. |
+
+---
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

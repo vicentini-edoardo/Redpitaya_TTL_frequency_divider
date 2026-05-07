@@ -1,9 +1,12 @@
 `timescale 1ns / 1ps
 
 ////////////////////////////////////////////////////////////////////////////////
-// Red Pitaya TOP module. It connects external pins and PS part with
-// other application modules.
-// Authors: Matej Oblak, Iztok Jeras
+// Red Pitaya TOP module — unified pulse/harmonic generator.
+// Supports both f_out = f_in + f_shift (pulse mode, control[3]=0) and
+// f_out = N*f_in + f_shift at 50% duty (harmonic mode, control[3]=1).
+// control[2]=force_high overrides the output pin HIGH in both modes.
+// DIO0_P is the trigger input; DIO1_P is the NCO output.
+// Authors: Matej Oblak, Iztok Jeras (base); unified variant Edoardo Vicentini
 // (c) Red Pitaya  http://www.redpitaya.com
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -85,11 +88,13 @@ logic        m_axi_gp0_wready;
 logic [ 3:0] m_axi_gp0_wstrb;
 logic        m_axi_gp0_wvalid;
 
-// Pulse control and status
+// Control and status signals
 logic        pulse_enable;
 logic        pulse_soft_reset;
+logic        force_high;
+logic        harmonic_mode;
 logic [31:0] pulse_divider;
-logic [31:0] pulse_width;
+logic [31:0] width_n;
 logic [31:0] pulse_delay;
 logic [31:0] meas_time_us;
 logic        pulse_busy;
@@ -101,7 +106,6 @@ logic        period_valid;
 logic        period_stable;
 logic        timeout_flag;
 
-// NCO phase step registers
 logic signed [47:0] phase_step_offset;
 logic signed [47:0] phase_step_base;
 logic signed [47:0] phase_step;
@@ -109,10 +113,8 @@ logic        freerun_active;
 
 logic        trig_rise_dbg;
 
-// Drive the pulse output on exp_p_io[1]
-// exp_p_io[0] is the trigger input (no driver needed - used as input)
-// exp_p_io[2..7] are unused, left tri-stated
-assign exp_p_io[1] = pulse_out;
+// force_high overrides the output pin HIGH; exp_p_io[0] is trigger input.
+assign exp_p_io[1] = force_high | pulse_out;
 
 system_wrapper system_i
 (
@@ -193,10 +195,11 @@ pulse_gen pulse_gen_i
 
   .enable            (pulse_enable),
   .soft_reset        (pulse_soft_reset),
+  .harmonic_mode     (harmonic_mode),
 
   .trig_in           (exp_p_io[0]),
 
-  .pulse_width        (pulse_width),
+  .width_n            (width_n),
   .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
 
@@ -245,8 +248,10 @@ axi4lite_pulse_regs regs_i
 
   .pulse_enable        (pulse_enable),
   .pulse_soft_reset    (pulse_soft_reset),
+  .force_high          (force_high),
+  .harmonic_mode       (harmonic_mode),
   .pulse_divider       (pulse_divider),
-  .pulse_width         (pulse_width),
+  .width_n             (width_n),
   .pulse_delay         (pulse_delay),
   .meas_time_us        (meas_time_us),
   .phase_step_offset   (phase_step_offset),

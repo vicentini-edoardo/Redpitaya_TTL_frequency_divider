@@ -52,7 +52,11 @@ except ImportError:
 CLK_HZ       = 125_000_000
 PHASE_BITS   = 48
 DEFAULT_BASE = 0x40600000
-CTRL_ENABLE  = 0x01
+
+# control register bits
+CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
+CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
+# bit 3 (CTRL_HARMONIC = 0x08) is enforced by the C helper; not set here
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
 PHASE_RES_HZ = CLK_HZ / 2**PHASE_BITS
@@ -93,7 +97,6 @@ def fmt_signed_freq(hz: float) -> str:
 
 
 def suggest_window(f_shift_hz: float) -> int:
-    """Suggest measurement window index based on frequency shift magnitude."""
     if f_shift_hz <= 0:
         return 2
     if f_shift_hz < 1:
@@ -105,18 +108,6 @@ def suggest_window(f_shift_hz: float) -> int:
     if f_shift_hz < 1000:
         return 1
     return 0
-
-
-def fmt_dur(s: float) -> str:
-    if s <= 0:
-        return "---"
-    if s < 1e-6:
-        return f"{s * 1e9:.3f} ns"
-    if s < 1e-3:
-        return f"{s * 1e6:.3f} µs"
-    if s < 1.0:
-        return f"{s * 1e3:.3f} ms"
-    return f"{s:.6f} s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +159,6 @@ class SshBackend(QObject):
         self._base  = DEFAULT_BASE
         self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
         self._upload_pending: Optional[tuple] = None
-        self._upload_callback: Optional[Callable] = None
         self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
         self._thread.start()
 
@@ -186,10 +176,18 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
 
-    def apply(self, mult_n: int, offset_word: int, enable: bool):
+    def apply(self, mult_n: int, offset_word: int):
+        """Send modulated-mode write (enable=1, force_high=0, harmonic_mode=1 via helper)."""
         if self._live:
             self._enqueue(self.P_USER,
-                          lambda: self._do_write(mult_n, offset_word, enable),
+                          lambda: self._do_write(mult_n, offset_word),
+                          self.sig_status.emit)
+
+    def set_control(self, ctrl: int):
+        """Set control register directly (for Laser Off / Laser On)."""
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_set_control(ctrl),
                           self.sig_status.emit)
 
     def set_window(self, window: int):
@@ -202,12 +200,11 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
-    def upload(self, c_src: str, bit_src: Optional[str], on_connected: Optional[Callable] = None):
+    def upload(self, c_src: str, bit_src: Optional[str]):
         if self._live:
             self._enqueue(self.P_UPLOAD, lambda: self._do_upload(c_src, bit_src))
         else:
             self._upload_pending = (c_src, bit_src)
-            self._upload_callback = on_connected
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -281,11 +278,13 @@ class SshBackend(QObject):
     def _do_read(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} read"))
 
-    def _do_write(self, mult_n: int, offset: int, enable: bool) -> dict:
-        ctrl = CTRL_ENABLE if enable else 0
+    def _do_write(self, mult_n: int, offset: int) -> dict:
         return json.loads(self._exec(
-            f"{self._rp_cmd()} write {mult_n} {offset} {ctrl}"
+            f"{self._rp_cmd()} write {mult_n} {offset} {CTRL_ENABLE}"
         ))
+
+    def _do_set_control(self, ctrl: int) -> dict:
+        return json.loads(self._exec(f"{self._rp_cmd()} control {ctrl}"))
 
     def _do_reset(self) -> dict:
         return json.loads(self._exec(f"{self._rp_cmd()} soft_reset"))
@@ -322,6 +321,7 @@ _ACCENT = "#00d4ff"
 _GREEN  = "#3fb950"
 _AMBER  = "#d29922"
 _RED    = "#f85149"
+_WHITE  = "#e6edf3"
 _TEXT   = "#e6edf3"
 _DIM    = "#8b949e"
 _BORDER = "#263241"
@@ -373,6 +373,29 @@ def _btn_style(color: str = _ACCENT) -> str:
     """
 
 
+def _mode_btn_style(color: str, active: bool) -> str:
+    """Style for the three output-mode buttons (OFF / MODULATED / ON)."""
+    if active:
+        return f"""
+            QPushButton {{
+                background: {color}28; color: {color};
+                border: 2px solid {color}; border-radius: 7px;
+                padding: 5px 16px;
+                font-family: {_MONO}; font-size: 10px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {color}38; }}
+        """
+    return f"""
+        QPushButton {{
+            background: #111923; color: {_DIM};
+            border: 1px solid {_BORDER}; border-radius: 7px;
+            padding: 5px 16px;
+            font-family: {_MONO}; font-size: 10px;
+        }}
+        QPushButton:hover {{ background: #182536; color: {color}; border-color: {color}; }}
+    """
+
+
 def _le_style() -> str:
     return f"""
         QLineEdit {{
@@ -395,16 +418,10 @@ def _spin_style() -> str:
         }}
         QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {_ACCENT}; }}
         QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,
-        QSpinBox::up-button, QSpinBox::down-button {{
-            width: 16px;
-        }}
-        QComboBox::drop-down {{
-            width: 22px;
-            border: none;
-        }}
+        QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
+        QComboBox::drop-down {{ width: 22px; border: none; }}
         QComboBox QAbstractItemView {{
-            background: #0b111a;
-            color: {_TEXT};
+            background: #0b111a; color: {_TEXT};
             selection-background-color: #182536;
             border: 1px solid {_BORDER};
         }}
@@ -451,8 +468,7 @@ class BigDisplay(QFrame):
         self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(self._sub)
 
-    def set_data(self, value: str, sub: str = "",
-                 color: Optional[str] = None):
+    def set_data(self, value: str, sub: str = "", color: Optional[str] = None):
         self._val.setText(value)
         c = color or self._accent
         self._val.setStyleSheet(f"color: {c}; background: transparent; border: none;")
@@ -469,12 +485,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Red Pitaya — Harmonic Generator")
-        self.setMinimumSize(960, 680)
+        self.setMinimumSize(960, 700)
 
-        self._period_c = 0
-        self._live     = False
+        self._period_c  = 0
+        self._live      = False
         self._window_select = 2
         self._refresh_input_pending = False
+        self._output_mode: str = "modulated"   # "off" | "modulated" | "on"
 
         self._be = SshBackend(self)
         self._be.sig_connected.connect(self._on_connected)
@@ -567,11 +584,10 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout()
         outer.setSpacing(12)
 
-        # ── Four primary monitors ─────────────────────────────────────────────
-        self._d_in     = BigDisplay("Input Frequency",  "measured input period",   _ACCENT)
-        self._d_n      = BigDisplay("Harmonic N",       "applied multiplier",      _AMBER)
-        self._d_out    = BigDisplay("Output Frequency", "N·f_in + f_shift",        _GREEN)
-        self._d_status = BigDisplay("NCO Status",       "lock / acquiring",        _AMBER)
+        self._d_in     = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
+        self._d_n      = BigDisplay("Harmonic N",       "applied multiplier",    _AMBER)
+        self._d_out    = BigDisplay("Output Frequency", "N·f_in + f_shift",      _GREEN)
+        self._d_status = BigDisplay("NCO Status",       "lock / acquiring",      _AMBER)
 
         for d in (self._d_in, self._d_n, self._d_out, self._d_status):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -583,11 +599,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self._d_n,      0, 1)
         grid.addWidget(self._d_out,    1, 0)
         grid.addWidget(self._d_status, 1, 1)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-
+        grid.setRowStretch(0, 1); grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
         outer.addLayout(grid, 1)
 
         controls = self._make_group("Controls")
@@ -595,11 +608,43 @@ class MainWindow(QMainWindow):
         controls_lay.setContentsMargins(12, 12, 12, 12)
         controls_lay.setSpacing(18)
 
+        left_col = QVBoxLayout()
+        left_col.setSpacing(10)
+
+        # ── Output mode bar ───────────────────────────────────────────────────
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+
+        mode_lbl = QLabel("Output mode:")
+        mode_lbl.setFont(_mono_font(10, bold=True))
+        mode_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        mode_row.addWidget(mode_lbl)
+
+        self._btn_off = QPushButton("■  LASER OFF")
+        self._btn_mod = QPushButton("~  MODULATED")
+        self._btn_on  = QPushButton("●  LASER ON")
+        for btn in (self._btn_off, self._btn_mod, self._btn_on):
+            btn.setFixedHeight(34)
+            btn.setFont(_mono_font(10))
+            mode_row.addWidget(btn)
+        mode_row.addStretch()
+
+        self._btn_off.clicked.connect(lambda: self._set_output_mode("off"))
+        self._btn_mod.clicked.connect(lambda: self._set_output_mode("modulated"))
+        self._btn_on.clicked.connect(lambda: self._set_output_mode("on"))
+        left_col.addLayout(mode_row)
+
+        # Divider
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {_BORDER};")
+        left_col.addWidget(sep)
+
+        # ── Parameter fields ──────────────────────────────────────────────────
         fields = QGridLayout()
         fields.setHorizontalSpacing(10)
         fields.setVerticalSpacing(8)
 
-        # ── Frequency shift ───────────────────────────────────────────────────
         freq_lbl = QLabel("Freq shift:")
         freq_lbl.setFixedWidth(90)
         freq_lbl.setFont(_mono_font(10))
@@ -618,7 +663,6 @@ class MainWindow(QMainWindow):
         self._sp_offset.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_offset, 0, 1)
 
-        # ── Harmonic N ────────────────────────────────────────────────────────
         n_lbl = QLabel("Harmonic N:")
         n_lbl.setFixedWidth(90)
         n_lbl.setFont(_mono_font(10))
@@ -635,7 +679,6 @@ class MainWindow(QMainWindow):
         self._sp_n.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_n, 0, 3)
 
-        # ── Measurement window ────────────────────────────────────────────────
         window_lbl = QLabel("Meas. window:")
         window_lbl.setFixedWidth(90)
         window_lbl.setFont(_mono_font(10))
@@ -657,18 +700,14 @@ class MainWindow(QMainWindow):
         self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
         fields.addWidget(self._lbl_window_suggest, 1, 2, 1, 2)
 
-        toggles = QHBoxLayout()
-        toggles.setSpacing(18)
-        self._cb_en   = QCheckBox("Enable Output")
+        auto_row = QHBoxLayout()
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
-        for cb in (self._cb_en, self._cb_auto):
-            cb.setFont(_mono_font(10))
-            cb.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-            toggles.addWidget(cb)
-        toggles.addStretch()
-        self._cb_en.toggled.connect(self._param_changed)
-        fields.addLayout(toggles, 2, 0, 1, 4)
+        self._cb_auto.setFont(_mono_font(10))
+        self._cb_auto.setStyleSheet(f"color: {_TEXT}; background: transparent;")
+        auto_row.addWidget(self._cb_auto)
+        auto_row.addStretch()
+        fields.addLayout(auto_row, 2, 0, 1, 4)
 
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
@@ -676,10 +715,13 @@ class MainWindow(QMainWindow):
         self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
         fields.addWidget(self._lbl_shift, 3, 0, 1, 4)
         fields.setColumnStretch(1, 1)
-        controls_lay.addLayout(fields, 1)
+
+        left_col.addLayout(fields)
+        controls_lay.addLayout(left_col, 1)
 
         actions = QVBoxLayout()
         actions.setSpacing(8)
+
         self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
         self._btn_apply.setFixedWidth(210)
         self._btn_apply.setFixedHeight(92)
@@ -698,6 +740,7 @@ class MainWindow(QMainWindow):
         controls_lay.addLayout(actions)
 
         outer.addWidget(controls)
+        self._update_mode_styles()
         self._update_shift_detail()
         return outer
 
@@ -720,7 +763,35 @@ class MainWindow(QMainWindow):
             f"QMainWindow, QWidget {{ background: {_BG}; color: {_TEXT}; }}"
         )
 
-    # ── connection handling ───────────────────────────────────────────────────
+    # ── Output mode ───────────────────────────────────────────────────────────
+
+    def _set_output_mode(self, mode: str):
+        self._output_mode = mode
+        self._update_mode_styles()
+        self._update_mode_controls()
+        if self._live:
+            if mode == "off":
+                self._be.set_control(0x00)
+                self._log("Laser OFF  (output = constant 0)")
+            elif mode == "on":
+                self._be.set_control(CTRL_FORCE_HIGH)
+                self._log("Laser ON   (output = constant 1)")
+            else:
+                self._do_apply()
+
+    def _update_mode_styles(self):
+        m = self._output_mode
+        self._btn_off.setStyleSheet(_mode_btn_style(_RED,   m == "off"))
+        self._btn_mod.setStyleSheet(_mode_btn_style(_GREEN, m == "modulated"))
+        self._btn_on.setStyleSheet(_mode_btn_style(_WHITE,  m == "on"))
+
+    def _update_mode_controls(self):
+        enabled = (self._output_mode == "modulated")
+        for w in (self._sp_offset, self._sp_n, self._cb_window,
+                  self._cb_auto, self._btn_apply):
+            w.setEnabled(enabled)
+
+    # ── Connection handling ───────────────────────────────────────────────────
 
     def _pick_key(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -769,10 +840,10 @@ class MainWindow(QMainWindow):
         self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
         self._log(f"Disconnected: {reason}")
 
-    # ── parameter controls ────────────────────────────────────────────────────
+    # ── Parameter controls ────────────────────────────────────────────────────
 
     def _param_changed(self, *_):
-        if self._cb_auto.isChecked():
+        if self._output_mode == "modulated" and self._cb_auto.isChecked():
             self._debounce.start()
         self._update_shift_detail()
         self._update_window_suggestion()
@@ -801,33 +872,27 @@ class MainWindow(QMainWindow):
         )
 
     def _update_window_suggestion(self):
-        f_shift   = abs(self._sp_offset.value())
-        suggested = suggest_window(f_shift)
+        f_shift      = abs(self._sp_offset.value())
+        suggested    = suggest_window(f_shift)
         window_names = ["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"]
-        current = self._cb_window.currentIndex()
+        current      = self._cb_window.currentIndex()
         if current == suggested:
-            self._lbl_window_suggest.setText(
-                f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}"
-            )
+            self._lbl_window_suggest.setText(f"✓ optimal for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
             self._lbl_window_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
         else:
-            self._lbl_window_suggest.setText(
-                f"suggested: {window_names[suggested]} for {fmt_freq(f_shift) if f_shift > 0 else '---'}"
-            )
+            self._lbl_window_suggest.setText(f"suggested: {window_names[suggested]} for {fmt_freq(f_shift) if f_shift > 0 else '---'}")
             self._lbl_window_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
 
     def _do_apply(self):
-        if not self._live:
+        if not self._live or self._output_mode != "modulated":
             return
         n           = self._sp_n.value()
         off_hz      = self._sp_offset.value()
-        enable      = self._cb_en.isChecked()
         offset_word = hz_to_phase(off_hz)
         actual_hz   = phase_to_hz(offset_word)
-        self._be.apply(n, offset_word, enable)
+        self._be.apply(n, offset_word)
         self._log(
-            f"Apply  N={n}  shift={actual_hz:+.6f} Hz  "
-            f"phase_offset={offset_word:+d}  enable={enable}"
+            f"Apply  N={n}  shift={actual_hz:+.6f} Hz  phase_offset={offset_word:+d}"
         )
 
     def _do_soft_reset(self):
@@ -844,8 +909,7 @@ class MainWindow(QMainWindow):
             self._log(f"ERROR: source file not found: {Path(c_src).as_posix()}")
             return
         if not self._live:
-            self._log("Not connected. Connecting first…")
-            self._btn_upload.setEnabled(False)
+            self._log("Not connected — queuing upload for after connect …")
             host = self._w_host.text().strip()
             port = int(self._w_port.text().strip() or "22")
             user = self._w_user.text().strip() or "root"
@@ -855,11 +919,10 @@ class MainWindow(QMainWindow):
         else:
             self._be.upload(c_src, bit_src if Path(bit_src).exists() else None)
 
-    # ── status update from hardware ───────────────────────────────────────────
+    # ── Status update from hardware ───────────────────────────────────────────
 
     @Slot(dict)
     def _on_status(self, d: dict):
-        # Sync window combo from FPGA
         raw_us = d.get("meas_time_us")
         if raw_us is not None:
             us_val = int(raw_us)
@@ -874,11 +937,23 @@ class MainWindow(QMainWindow):
                 self._cb_window.blockSignals(False)
                 self._window_select = fpga_idx
 
+        # Sync output mode indicator from FPGA control register
+        ctrl = int(d.get("control") or 0)
+        if (ctrl >> 2) & 1:
+            fpga_mode = "on"
+        elif ctrl & 1:
+            fpga_mode = "modulated"
+        else:
+            fpga_mode = "off"
+        if fpga_mode != self._output_mode:
+            self._output_mode = fpga_mode
+            self._update_mode_styles()
+            self._update_mode_controls()
+
         period = int(d.get("period_avg") or d.get("period") or 0)
         stable = bool(d.get("period_stable"))
         mult_n = int(d.get("mult_n") or 1)
 
-        # Update input frequency display on explicit request
         if self._refresh_input_pending:
             if period > 0:
                 self._period_c = period
@@ -889,14 +964,10 @@ class MainWindow(QMainWindow):
                     _ACCENT if stable else _AMBER,
                 )
                 self._refresh_input_pending = False
-                self._log(
-                    f"Input measured: {fmt_freq(in_hz)} "
-                    f"({'stable' if stable else 'acquiring'})"
-                )
+                self._log(f"Input measured: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
             else:
                 self._d_in.set_data("---", "no input signal", _RED)
 
-        # Update displays every tick
         if period > 0:
             step_off  = int(d.get("phase_step_offset") or 0)
             step_live = int(d.get("phase_step") or 0)
@@ -916,7 +987,7 @@ class MainWindow(QMainWindow):
             self._d_status.set_data("NO INPUT", "waiting for signal", _RED)
             self._poll.setInterval(400)
 
-    # ── error / log ───────────────────────────────────────────────────────────
+    # ── Error / log ───────────────────────────────────────────────────────────
 
     @Slot(str)
     def _on_error(self, msg: str):
