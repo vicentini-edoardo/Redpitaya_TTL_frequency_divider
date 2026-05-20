@@ -10,9 +10,10 @@ Both modes are supported by a single unified FPGA bitfile. Switching between
 modes is instant — the C helper for the active tab sets the harmonic_mode bit.
 Click "Upload && Compile" on either tab to flash the bitfile if needed.
 
-Assets are read from the mode-specific subfolders next to this script:
-  pulse_generator/     — rp_pulse_ctl.c, red_pitaya_top.bit.bin
-  harmonic_generator/  — rp_harmonic_ctl.c, red_pitaya_top.bit.bin
+Assets are read from the same directory as this script:
+  rp_ctl.c                — unified board-side C helper (compiled as both rp_pulse_ctl and rp_harmonic_ctl)
+  red_pitaya_top.bit.bin  — unified FPGA bitfile
+  Vivado files/           — RTL source files
 
 Run with:  python redpitaya_combined_gui_qt.py
 Requires:  pip install PySide6 paramiko

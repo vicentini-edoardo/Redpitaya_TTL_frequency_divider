@@ -28,12 +28,15 @@ External TTL signal → DIO0_P → FPGA (period measurement + NCO) → DIO1_P �
 ## Project layout
 
 ```
-Redpitaya_TTL_frequency_divider/
+Redpitaya_TTL_shifter/
 ├── redpitaya_combined_gui_qt.py   # Two-tab PySide6 GUI (both modes, one SSH session)
 ├── rp_ctl.c                       # Unified board-side C helper (pulse + harmonic)
 ├── red_pitaya_top.bit.bin         # Unified FPGA bitstream
 ├── requirements.txt               # Python dependencies (PySide6, paramiko)
-└── PHASE1_RECIPROCAL_COUNTING.md  # Reciprocal-counting design notes
+└── Vivado files/                  # RTL source files
+    ├── pulse_gen.sv
+    ├── axi4lite_pulse_regs.sv
+    └── red_pitaya_top.sv
 ```
 
 ---

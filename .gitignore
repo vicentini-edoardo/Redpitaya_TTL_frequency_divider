@@ -1,6 +1,5 @@
 # FPGA build artifacts
 VIVADO/
-Vivado/
 *.jou
 *.str
 *.cache/
@@ -28,7 +27,6 @@ env/
 
 # Logs
 *.log
-gui.log
 
 # macOS
 .DS_Store
@@ -36,15 +34,14 @@ gui.log
 .LSOverride
 
 # Editor / IDE
-.vscode/
+.vscode/*.json.bak
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
 .idea/
 *.swp
 *.swo
 *~
-
-# Mode subfolders — consolidated into root rp_ctl.c / combined GUI
-harmonic_generator/
-pulse_generator/
 
 # C build artifacts
 *.o
