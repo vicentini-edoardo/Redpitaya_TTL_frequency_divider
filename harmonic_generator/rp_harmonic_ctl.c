@@ -33,9 +33,9 @@
  *   bit 2 (force_high)   — from <control> arg, bit 2
  *   bit 3 (harmonic_mode)— always 1 (harmonic mode)
  *
- * Output frequency: f_out = mult_n * 125000000 / period_avg + delta_f
- * NCO offset:       delta_f (Hz) = phase_step_offset * 125000000 / 2^48
- * NCO resolution:   ~0.44 mHz per LSB at 125 MHz
+ * Output frequency: f_out = mult_n * 124999999 / period_avg + delta_f
+ * NCO offset:       delta_f (Hz) = phase_step_offset * 124999999 / 2^48
+ * NCO resolution:   ~0.44 mHz per LSB at 124.999999 MHz
  * Output duty:      exactly 50% (MSB of NCO accumulator)
  */
 

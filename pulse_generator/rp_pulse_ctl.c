@@ -33,9 +33,9 @@
  *   bit 2 (force_high)   — from <control> arg, bit 2
  *   bit 3 (harmonic_mode)— always 0 (pulse mode)
  *
- * Frequency from period:  freq_hz = 125000000.0 / period_cycles
- * NCO offset formula:     delta_f = phase_step_offset * 125e6 / 2^48
- * NCO resolution:         ~0.44 mHz per LSB at 125 MHz
+ * Frequency from period:  freq_hz = 124999999.0 / period_cycles
+ * NCO offset formula:     delta_f = phase_step_offset * 124.999999e6 / 2^48
+ * NCO resolution:         ~0.44 mHz per LSB at 124.999999 MHz
  */
 
 #include <stdint.h>

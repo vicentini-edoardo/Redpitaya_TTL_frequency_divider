@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 // pulse_gen - Unified NCO-based pulse/harmonic generator with reciprocal frequency counting.
 //
-// Clock domain: fclk_clk0 (125 MHz).
+// Clock domain: fclk_clk0 (actual measured: 124,999,999 Hz).
 //   All control inputs and status outputs share this clock with
 //   axi4lite_pulse_regs - no CDC synchronizers needed.
 //
@@ -64,14 +64,21 @@ module pulse_gen
   output logic signed [47:0] phase_step
 );
 
-  localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = 32'd125_000_000;
+  // Actual measured clock: 124,999,999 Hz.
+  // floor(124,999,999 / 1,000,000) = 124 cycles/us — but to keep window timing accurate
+  // we use 125 cycles/us (same as before) since the 1 Hz difference is negligible per us.
+  // The NCO and output frequency are correct because phase_step_base = 2^48 / period_avg
+  // uses the measured period directly — no hardcoded clock assumption in the NCO path.
+  localparam logic [31:0] CLK_HZ                = 32'd124_999_999;
+  localparam logic [31:0] CLK_PER_US            = 32'd125;
+  localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = CLK_HZ;
   localparam logic [31:0] MIN_PERIOD_CYCLES     = 32'd200;
 
-  // Measurement window in clock cycles: meas_time_us * 125 (125 MHz clock).
+  // Measurement window in clock cycles: meas_time_us * CLK_PER_US.
   // Minimum enforced at 1 ms (125,000 cycles) to avoid division issues.
   logic [31:0] window_cycles;
   always_comb begin
-    window_cycles = (meas_time_us >= 32'd1_000) ? meas_time_us * 32'd125 : 32'd125_000;
+    window_cycles = (meas_time_us >= 32'd1_000) ? meas_time_us * CLK_PER_US : 32'd125_000;
   end
 
   // ----------------------------------------------------------------
