@@ -101,7 +101,7 @@ logic        pulse_busy;
 logic        pulse_out;
 
 logic [31:0] period_cycles;
-logic [31:0] period_avg_cycles;
+logic [31:0] edge_cnt_out;
 logic        period_valid;
 logic        period_stable;
 logic        timeout_flag;
@@ -209,7 +209,7 @@ pulse_gen pulse_gen_i
   .busy               (pulse_busy),
 
   .period_cycles      (period_cycles),
-  .period_avg_cycles  (period_avg_cycles),
+  .edge_cnt_out       (edge_cnt_out),
   .period_valid       (period_valid),
   .period_stable      (period_stable),
   .timeout_flag       (timeout_flag),
@@ -258,7 +258,7 @@ axi4lite_pulse_regs regs_i
 
   .pulse_busy          (pulse_busy),
   .period_cycles       (period_cycles),
-  .period_avg_cycles   (period_avg_cycles),
+  .edge_cnt_out        (edge_cnt_out),
   .period_valid        (period_valid),
   .period_stable       (period_stable),
   .timeout_flag        (timeout_flag),

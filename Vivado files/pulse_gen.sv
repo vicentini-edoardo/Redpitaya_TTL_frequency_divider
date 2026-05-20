@@ -10,9 +10,11 @@
 //   MEASURE phase (!freerun_active):
 //     Incoming trigger edges (both rising and falling) are counted over a fixed
 //     time window selected via meas_time_us.
-//     period_avg = window_cycles * 2 / edge_count (averaging both edges).
 //     After first complete window, period_stable asserts.
-//     An iterative divider (49 cycles) computes phase_step_base = 2^48 / period_avg.
+//     An iterative divider (48 cycles) computes:
+//       phase_step_base = 2^48 * (edge_count/2) / window_cycles
+//     This avoids the intermediate integer period_avg truncation that was the
+//     source of systematic frequency error for non-integer-period signals (e.g. 300 kHz).
 //     Once period_stable and division complete, transitions to FREERUN.
 //
 //   FREERUN phase (freerun_active):
@@ -22,7 +24,7 @@
 //     Pulse mode (harmonic_mode = 0):
 //       Carry-out of phase_acc triggers a pulse of width_n clock cycles.
 //       f_out ≈ f_in + phase_step_offset * f_clk / 2^48
-//       Duty cycle = width_n / period_avg.
+//       Duty cycle = width_n / (2^48 / phase_step_base).
 //
 //     Harmonic mode (harmonic_mode = 1):
 //       Output is phase_acc[47] (MSB) — exact 50% duty square wave.
@@ -54,7 +56,7 @@ module pulse_gen
   output logic        pulse_out,
 
   output logic [31:0] period_cycles,
-  output logic [31:0] period_avg_cycles,
+  output logic [31:0] edge_cnt_out,    // edge count from last window (reported at 0x18)
   output logic        period_valid,
   output logic        period_stable,
   output logic        timeout_flag,
@@ -67,8 +69,8 @@ module pulse_gen
   // Actual measured clock: 124,999,999 Hz.
   // floor(124,999,999 / 1,000,000) = 124 cycles/us — but to keep window timing accurate
   // we use 125 cycles/us (same as before) since the 1 Hz difference is negligible per us.
-  // The NCO and output frequency are correct because phase_step_base = 2^48 / period_avg
-  // uses the measured period directly — no hardcoded clock assumption in the NCO path.
+  // The NCO frequency is correct because phase_step_base = 2^48 * edge_half / window_cycles
+  // uses edge and window counts directly — no hardcoded clock assumption in the NCO path.
   localparam logic [31:0] CLK_HZ                = 32'd124_999_999;
   localparam logic [31:0] CLK_PER_US            = 32'd125;
   localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = CLK_HZ;
@@ -112,24 +114,24 @@ module pulse_gen
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
-      clk_cnt           <= 32'd0;
-      edge_cnt          <= 32'd0;
-      period_cycles     <= 32'd0;
-      period_avg_cycles <= 32'd0;
-      period_valid      <= 1'b0;
-      period_stable     <= 1'b0;
-      timeout_flag      <= 1'b0;
-      window_active     <= 1'b0;
+      clk_cnt       <= 32'd0;
+      edge_cnt      <= 32'd0;
+      period_cycles <= 32'd0;
+      edge_cnt_out  <= 32'd0;
+      period_valid  <= 1'b0;
+      period_stable <= 1'b0;
+      timeout_flag  <= 1'b0;
+      window_active <= 1'b0;
     end else begin
       if (soft_reset || !enable) begin
-        clk_cnt           <= 32'd0;
-        edge_cnt          <= 32'd0;
-        period_cycles     <= 32'd0;
-        period_avg_cycles <= 32'd0;
-        period_valid      <= 1'b0;
-        period_stable     <= 1'b0;
-        timeout_flag      <= 1'b0;
-        window_active     <= 1'b0;
+        clk_cnt       <= 32'd0;
+        edge_cnt      <= 32'd0;
+        period_cycles <= 32'd0;
+        edge_cnt_out  <= 32'd0;
+        period_valid  <= 1'b0;
+        period_stable <= 1'b0;
+        timeout_flag  <= 1'b0;
+        window_active <= 1'b0;
       end else begin
         if (!window_active) begin
           if (trig_edge) begin
@@ -145,11 +147,11 @@ module pulse_gen
 
           if (clk_cnt >= window_cycles - 1) begin
             if (edge_cnt >= 4) begin
-              period_cycles     <= edge_cnt;
-              period_valid      <= 1'b1;
-              period_stable     <= 1'b1;
-              period_avg_cycles <= window_cycles / (edge_cnt >> 1);
-              timeout_flag      <= 1'b0;
+              period_cycles <= edge_cnt;
+              edge_cnt_out  <= edge_cnt;
+              period_valid  <= 1'b1;
+              period_stable <= 1'b1;
+              timeout_flag  <= 1'b0;
             end else begin
               period_valid  <= 1'b0;
               period_stable <= 1'b0;
@@ -167,10 +169,14 @@ module pulse_gen
   end
 
   // ----------------------------------------------------------------
-  // Iterative divider: phase_step_base = 2^48 / period_avg_cycles
+  // Iterative divider: phase_step_base = 2^48 * (edge_cnt/2) / window_cycles
   //
-  // Processes the 49-bit dividend (2^48) MSB-first: bit 48 = 1, bits 47:0 = 0.
-  // One quotient bit resolved per clock; completes in 49 cycles.
+  // Avoids the integer truncation in the old formula (2^48 / (window/edge_half))
+  // by computing the fraction directly. Since edge_half/window < 1 (f_in << f_clk),
+  // we initialise rem = edge_half and shift in 48 zero-bits from the dividend,
+  // using window_cycles as divisor. This is equivalent to standard long-division of
+  // (edge_half << 48) / window_cycles but without needing an 80-bit shift register.
+  // 48 steps, one quotient bit per clock.
   // ----------------------------------------------------------------
   logic [5:0]  div_step;
   logic [31:0] div_rem;
@@ -180,12 +186,10 @@ module pulse_gen
   logic        div_base_valid;
   logic        period_valid_d;
 
-  logic        div_d_bit;
-  logic [32:0] div_new_rem;
+  logic [32:0] div_new_rem;   // {div_rem, 0} shifted left by 1
   logic [32:0] div_sub;
 
-  assign div_d_bit   = div_active && (div_step == 6'd0);
-  assign div_new_rem = {div_rem, div_d_bit};
+  assign div_new_rem = {div_rem, 1'b0};   // shift in 0 (dividend bits are all zero)
   assign div_sub     = div_new_rem - {1'b0, div_divisor};
 
   always_ff @(posedge clk) begin
@@ -204,13 +208,16 @@ module pulse_gen
       if (period_valid && !period_valid_d && !div_active) begin
         div_active  <= 1'b1;
         div_step    <= 6'd0;
-        div_rem     <= 32'd0;
+        // rem initialised to edge_half = edge_cnt>>1; since edge_half < window_cycles
+        // (f_in << f_clk) this is already < divisor, so no pre-subtraction needed.
+        div_rem     <= (edge_cnt_out >> 1);
         div_quot    <= 48'd0;
-        div_divisor <= (period_avg_cycles != 32'd0) ? period_avg_cycles : 32'd1;
+        div_divisor <= (window_cycles != 32'd0) ? window_cycles : 32'd1;
       end else if (div_active) begin
         if (!div_sub[32]) begin
+          // rem >= divisor: quotient bit = 1
           div_rem  <= div_sub[31:0];
-          if (div_step == 6'd48) begin
+          if (div_step == 6'd47) begin
             phase_step_base <= $signed({div_quot[46:0], 1'b1});
             div_active      <= 1'b0;
             div_base_valid  <= 1'b1;
@@ -219,8 +226,9 @@ module pulse_gen
             div_step <= div_step + 6'd1;
           end
         end else begin
+          // rem < divisor: quotient bit = 0
           div_rem  <= div_new_rem[31:0];
-          if (div_step == 6'd48) begin
+          if (div_step == 6'd47) begin
             phase_step_base <= $signed({div_quot[46:0], 1'b0});
             div_active      <= 1'b0;
             div_base_valid  <= 1'b1;

@@ -860,13 +860,14 @@ class PulsePanel(QWidget):
             self._update_mode_styles()
             self._update_mode_controls()
 
-        period = int(d.get("period_avg") or d.get("period") or 0)
-        stable = bool(d.get("period_stable"))
+        stable    = bool(d.get("period_stable"))
+        step_base = int(d.get("phase_step_base") or 0)
 
         if self._refresh_pending:
-            if period > 0:
-                self._period_c = period
-                in_hz = CLK_HZ / period
+            if step_base > 0:
+                # Derive period in clock cycles from phase_step_base (avoids integer truncation)
+                self._period_c = (1 << PHASE_BITS) // step_base
+                in_hz = phase_to_hz(step_base)
                 self._d_in.set_data(
                     fmt_freq(in_hz),
                     "stable" if stable else "acquiring …",
@@ -877,8 +878,7 @@ class PulsePanel(QWidget):
             else:
                 self._d_in.set_data("---", "no input signal", _RED)
 
-        if period > 0:
-            step_base = int(d.get("phase_step_base") or 0)
+        if step_base > 0:
             step_live = int(d.get("phase_step") or step_base)
             step_off  = int(d.get("phase_step_offset") or (step_live - step_base))
             out_hz    = phase_to_hz(step_live)
@@ -886,6 +886,7 @@ class PulsePanel(QWidget):
             self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
             self._update_shift_detail()
 
+            period = self._period_c if self._period_c > 0 else ((1 << PHASE_BITS) // step_base)
             wc = int(d.get("width") or 0)
             if wc > 0:
                 self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
@@ -1265,14 +1266,14 @@ class HarmonicPanel(QWidget):
             self._update_mode_styles()
             self._update_mode_controls()
 
-        period = int(d.get("period_avg") or d.get("period") or 0)
-        stable = bool(d.get("period_stable"))
-        mult_n = int(d.get("mult_n") or 1)
+        stable    = bool(d.get("period_stable"))
+        mult_n    = int(d.get("mult_n") or 1)
+        step_base = int(d.get("phase_step_base") or 0)
 
         if self._refresh_pending:
-            if period > 0:
-                self._period_c = period
-                in_hz = CLK_HZ / period
+            if step_base > 0:
+                self._period_c = (1 << PHASE_BITS) // step_base
+                in_hz = phase_to_hz(step_base)
                 self._d_in.set_data(
                     fmt_freq(in_hz),
                     "stable" if stable else "acquiring …",
@@ -1283,7 +1284,7 @@ class HarmonicPanel(QWidget):
             else:
                 self._d_in.set_data("---", "no input signal", _RED)
 
-        if period > 0:
+        if step_base > 0:
             step_off  = int(d.get("phase_step_offset") or 0)
             step_live = int(d.get("phase_step") or 0)
             out_hz    = phase_to_hz(step_live)

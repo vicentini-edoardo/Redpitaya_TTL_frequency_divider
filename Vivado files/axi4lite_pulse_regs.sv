@@ -13,8 +13,8 @@
 //   0x0C RW  pulse_delay    (kept for address stability; unused)
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] timeout, [3] period_stable,
 //                      [4] freerun_active
-//   0x14 RO  period_cycles       (edge count from last window)
-//   0x18 RO  period_avg_cycles   (reciprocal-counted period in cycles)
+//   0x14 RO  period_cycles   (edge count from last window, same as edge_cnt_out)
+//   0x18 RO  edge_cnt_out    (edge count from last window; f_in = CLK_HZ * (val/2) / window_cycles)
 //   0x1C RW  phase_step_offset_lo   bits [31:0]  of signed 48-bit NCO offset
 //   0x20 RW  phase_step_offset_hi   bits [47:32] of signed 48-bit NCO offset (in [15:0])
 //   0x24 RO  phase_step_base_lo     bits [31:0]  of computed base step
@@ -75,7 +75,7 @@ module axi4lite_pulse_regs
   // Status inputs <- pulse_gen
   input  logic        pulse_busy,
   input  logic [31:0] period_cycles,
-  input  logic [31:0] period_avg_cycles,
+  input  logic [31:0] edge_cnt_out,
   input  logic        period_valid,
   input  logic        period_stable,
   input  logic        timeout_flag,
@@ -186,7 +186,7 @@ module axi4lite_pulse_regs
             if (wstrb_latched[3]) reg_delay[31:24] <= wdata_latched[31:24];
           end
 
-          // 4'd4 (status), 4'd5 (period_cycles), 4'd6 (period_avg): read-only
+          // 4'd4 (status), 4'd5 (period_cycles), 4'd6 (edge_cnt_out): read-only
 
           4'd7: begin  // 0x1C phase_step_offset_lo
             if (wstrb_latched[0]) reg_phase_step_offset_lo[ 7: 0] <= wdata_latched[ 7: 0];
@@ -230,7 +230,7 @@ module axi4lite_pulse_regs
           4'd4:  s_axi_rdata <= {27'd0, freerun_active, timeout_flag,
                                          period_stable, period_valid, pulse_busy};
           4'd5:  s_axi_rdata <= period_cycles;
-          4'd6:  s_axi_rdata <= period_avg_cycles;
+          4'd6:  s_axi_rdata <= edge_cnt_out;
           4'd7:  s_axi_rdata <= reg_phase_step_offset_lo;
           4'd8:  s_axi_rdata <= {16'd0, reg_phase_step_offset_hi};
           4'd9:  s_axi_rdata <= phase_step_base[31:0];

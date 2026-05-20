@@ -24,7 +24,7 @@
  *   0x10  status            bit 0 = busy, bit 1 = period_valid, bit 2 = period_stable,
  *                           bit 3 = timeout, bit 4 = freerun_active
  *   0x14  period            last raw measured input period (cycles)
- *   0x18  period_avg        reciprocal-counted period (cycles)
+ *   0x18  edge_cnt          edge count from last measurement window
  *   0x1C  phase_step_offset_lo  bits [31:0]  of signed 48-bit NCO offset
  *   0x20  phase_step_offset_hi  bits [47:32] of signed 48-bit NCO offset (in [15:0])
  *   0x24  phase_step_base_lo    bits [31:0]  of computed base step (read-only)
@@ -36,14 +36,13 @@
  * JSON output fields (same for both modes):
  *   control, harmonic_mode, force_high, width, mult_n,
  *   status, period_stable, freerun_active, meas_time_us,
- *   raw_period, period_avg,
+ *   raw_period, edge_cnt,
  *   phase_step_offset, phase_step_base, phase_step
  *
- * Frequency conversions:
- *   input_hz  = 125000000.0 / period_avg
- *   output_hz = (harmonic ? mult_n : 1) * input_hz
- *               + phase_step_offset * 125e6 / 2^48
- *   NCO res   ≈ 0.44 mHz per LSB at 125 MHz
+ * Frequency conversions (use phase_step_base for accuracy):
+ *   input_hz  = 124999999.0 * phase_step_base / 2^48
+ *   output_hz = phase_step * 124999999.0 / 2^48
+ *   NCO res   ≈ 0.44 mHz per LSB at 124.999999 MHz
  */
 
 #include <stdint.h>
@@ -140,7 +139,7 @@ static void print_json(volatile uint8_t *base) {
     printf("{\"control\":%u,\"harmonic_mode\":%u,\"force_high\":%u,"
            "\"width\":%u,\"mult_n\":%u,"
            "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
-           "\"raw_period\":%u,\"period_avg\":%u,"
+           "\"raw_period\":%u,\"edge_cnt\":%u,"
            "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld}\n",
            control,
            harmonic_mode,
