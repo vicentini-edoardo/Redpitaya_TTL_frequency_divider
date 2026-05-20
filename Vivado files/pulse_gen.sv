@@ -50,10 +50,13 @@ module pulse_gen
 
   input  logic signed [47:0] phase_step_offset,
 
+  input  logic [31:0] trig_half_period,  // DIO2 free-running square wave: half-period in clk cycles (0=off)
+
   output logic        trig_rise_dbg,
 
   output logic        busy,
   output logic        pulse_out,
+  output logic        trig_out,
 
   output logic [31:0] period_cycles,
   output logic [31:0] edge_cnt_out,    // edge count from last window (reported at 0x18)
@@ -319,6 +322,29 @@ module pulse_gen
         else
           width_cnt <= width_cnt - 32'd1;
       end
+    end
+  end
+
+  // ----------------------------------------------------------------
+  // DIO2 free-running square wave (independent of NCO / enable)
+  //
+  // trig_half_period = CLK_HZ / (2 * f_hz), rounded.
+  // 0 → output held low (disabled).
+  // ----------------------------------------------------------------
+  logic [31:0] trig_cnt;
+
+  always_ff @(posedge clk) begin
+    if (!rstn) begin
+      trig_cnt <= 32'd0;
+      trig_out <= 1'b0;
+    end else if (trig_half_period == 32'd0) begin
+      trig_cnt <= 32'd0;
+      trig_out <= 1'b0;
+    end else if (trig_cnt >= trig_half_period - 1) begin
+      trig_cnt <= 32'd0;
+      trig_out <= ~trig_out;
+    end else begin
+      trig_cnt <= trig_cnt + 32'd1;
     end
   end
 

@@ -93,7 +93,6 @@ logic        pulse_enable;
 logic        pulse_soft_reset;
 logic        force_high;
 logic        harmonic_mode;
-logic [31:0] pulse_divider;
 logic [31:0] width_n;
 logic [31:0] pulse_delay;
 logic [31:0] meas_time_us;
@@ -112,9 +111,12 @@ logic signed [47:0] phase_step;
 logic        freerun_active;
 
 logic        trig_rise_dbg;
+logic [31:0] trig_half_period;
+logic        trig_out;
 
 // force_high overrides the output pin HIGH; exp_p_io[0] is trigger input.
 assign exp_p_io[1] = force_high | pulse_out;
+assign exp_p_io[2] = trig_out;   // DIO2: free-running square wave
 
 system_wrapper system_i
 (
@@ -203,9 +205,12 @@ pulse_gen pulse_gen_i
   .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
 
+  .trig_half_period   (trig_half_period),
+
   .trig_rise_dbg      (trig_rise_dbg),
 
   .pulse_out          (pulse_out),
+  .trig_out           (trig_out),
   .busy               (pulse_busy),
 
   .period_cycles      (period_cycles),
@@ -250,7 +255,7 @@ axi4lite_pulse_regs regs_i
   .pulse_soft_reset    (pulse_soft_reset),
   .force_high          (force_high),
   .harmonic_mode       (harmonic_mode),
-  .pulse_divider       (pulse_divider),
+  .trig_half_period    (trig_half_period),
   .width_n             (width_n),
   .pulse_delay         (pulse_delay),
   .meas_time_us        (meas_time_us),

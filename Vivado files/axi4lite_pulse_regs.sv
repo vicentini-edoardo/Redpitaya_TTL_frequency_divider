@@ -7,7 +7,7 @@
 // Register map (byte offset / 32-bit word):
 //   0x00 RW  control:  [0] enable, [1] soft_reset (self-clearing, reads 0),
 //                      [2] force_high (output forced to 1), [3] harmonic_mode
-//   0x04 RW  pulse_divider  (kept for address stability; unused)
+//   0x04 RW  trig_half_period: CLK_HZ/(2*f_hz) cycles for DIO2 square wave (0=off)
 //   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
 //                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
 //   0x0C RW  pulse_delay    (kept for address stability; unused)
@@ -66,8 +66,8 @@ module axi4lite_pulse_regs
   output logic        pulse_soft_reset,
   output logic        force_high,
   output logic        harmonic_mode,
-  output logic [31:0] pulse_divider,
-  output logic [31:0] width_n,       // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
+  output logic [31:0] trig_half_period,  // DIO2 square wave half-period in clk cycles (0=off)
+  output logic [31:0] width_n,           // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
   output logic [31:0] pulse_delay,
   output logic [31:0] meas_time_us,
   output logic signed [47:0] phase_step_offset,
@@ -109,7 +109,7 @@ module axi4lite_pulse_regs
   assign pulse_enable      = reg_control[0];
   assign force_high        = reg_control[2];
   assign harmonic_mode     = reg_control[3];
-  assign pulse_divider     = reg_divider;
+  assign trig_half_period  = reg_divider;
   assign width_n           = reg_width_n;
   assign pulse_delay       = reg_delay;
   assign meas_time_us      = reg_meas_time_us;
@@ -118,7 +118,7 @@ module axi4lite_pulse_regs
   always_ff @(posedge clk) begin
     if (!rstn) begin
       reg_control               <= 32'h00000001;
-      reg_divider               <= 32'h00000001;
+      reg_divider               <= 32'h00000000;  // trig_half_period=0 → DIO2 off at boot
       reg_width_n               <= 32'h00000001;
       reg_delay                 <= 32'h00000001;
       reg_meas_time_us          <= 32'd100_000;  // Default: 100 ms

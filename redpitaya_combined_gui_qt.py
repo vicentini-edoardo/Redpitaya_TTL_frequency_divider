@@ -114,6 +114,12 @@ def suggest_window(f_shift_hz: float) -> int:
     return 0
 
 
+def trig_hz_to_half_period(f_hz: float) -> int:
+    if f_hz <= 0:
+        return 0
+    return round(CLK_HZ / (2.0 * f_hz))
+
+
 def fmt_dur(s: float) -> str:
     if s <= 0:
         return "---"
@@ -224,6 +230,13 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_harmonic(ctrl),
+                          self.sig_status.emit)
+
+    def set_trig(self, half_period: int):
+        """Write trig_half_period register (DIO2 square wave). half_period=0 disables."""
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_set_trig(half_period),
                           self.sig_status.emit)
 
     def set_window(self, window_us: int):
@@ -360,6 +373,11 @@ class SshBackend(QObject):
 
     def _do_window(self, meas_us: int) -> dict:
         return json.loads(self._exec(f"{self._active_cmd()} window {meas_us}"))
+
+    def _do_set_trig(self, half_period: int) -> dict:
+        return json.loads(self._exec(
+            f"/root/rp_pulse_ctl 0x{self._base:08X} trig {half_period}"
+        ))
 
     def _do_upload_pulse(self, c_src: str, bit_src: Optional[str]):
         self.sig_log.emit(f"[Pulse] Uploading {Path(c_src).name} …")
@@ -1441,6 +1459,7 @@ class MainWindow(QMainWindow):
         self._tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self._tabs, 1)
 
+        root.addWidget(self._build_trigger())
         root.addWidget(self._build_log())
 
     def _build_connection(self) -> QGroupBox:
@@ -1487,6 +1506,80 @@ class MainWindow(QMainWindow):
         for b in (self._btn_conn, btn_key):
             b.setStyleSheet(_btn_style())
         return g
+
+    def _build_trigger(self) -> QGroupBox:
+        """DIO2 free-running square wave — independent of NCO mode."""
+        g = _make_group("DIO2 Trigger Output  (independent free-running square wave)")
+        row = QHBoxLayout(g)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(14)
+
+        lbl = QLabel("Frequency:")
+        lbl.setFont(_mono_font(10, bold=True))
+        lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        row.addWidget(lbl)
+
+        self._sp_trig = QDoubleSpinBox()
+        self._sp_trig.setRange(0.0, 1000.0)
+        self._sp_trig.setDecimals(3)
+        self._sp_trig.setSingleStep(1.0)
+        self._sp_trig.setSuffix(" Hz")
+        self._sp_trig.setSpecialValueText("Off")
+        self._sp_trig.setFixedHeight(36)
+        self._sp_trig.setMinimumWidth(180)
+        self._sp_trig.setFont(_mono_font(13, bold=True))
+        self._sp_trig.setStyleSheet(_spin_style())
+        self._sp_trig.setEnabled(False)
+        row.addWidget(self._sp_trig)
+
+        self._btn_trig_apply = QPushButton("Set")
+        self._btn_trig_apply.setFixedWidth(70)
+        self._btn_trig_apply.setFixedHeight(36)
+        self._btn_trig_apply.setStyleSheet(_btn_style(_GREEN))
+        self._btn_trig_apply.setEnabled(False)
+        self._btn_trig_apply.clicked.connect(self._on_trig_apply)
+        row.addWidget(self._btn_trig_apply)
+
+        self._lbl_trig_actual = QLabel("actual: —")
+        self._lbl_trig_actual.setFont(_mono_font(9))
+        self._lbl_trig_actual.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        row.addWidget(self._lbl_trig_actual)
+
+        row.addStretch()
+
+        self._be.sig_connected.connect(self._on_trig_connected)
+        self._be.sig_disconnected.connect(self._on_trig_disconnected)
+        self._be.sig_status.connect(self._on_trig_status)
+        return g
+
+    @Slot()
+    def _on_trig_connected(self):
+        self._sp_trig.setEnabled(True)
+        self._btn_trig_apply.setEnabled(True)
+
+    @Slot(str)
+    def _on_trig_disconnected(self, _reason: str):
+        self._sp_trig.setEnabled(False)
+        self._btn_trig_apply.setEnabled(False)
+        self._lbl_trig_actual.setText("actual: —")
+
+    @Slot(dict)
+    def _on_trig_status(self, d: dict):
+        raw = d.get("trig_half_period")
+        if raw is None:
+            return
+        half = int(raw)
+        if half == 0:
+            self._lbl_trig_actual.setText("actual: Off")
+        else:
+            actual_hz = CLK_HZ / (2.0 * half)
+            self._lbl_trig_actual.setText(f"actual: {actual_hz:.3f} Hz")
+
+    def _on_trig_apply(self):
+        f_hz = self._sp_trig.value()
+        half = trig_hz_to_half_period(f_hz)
+        self._be.set_trig(half)
+        self._log(f"[Trig] DIO2 → {f_hz:.3f} Hz  (half_period={half})")
 
     def _build_log(self) -> QGroupBox:
         g = _make_group("Log")

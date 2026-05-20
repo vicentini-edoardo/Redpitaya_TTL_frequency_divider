@@ -17,7 +17,7 @@
  * Register map (base address passed as first argument, default 0x40600000):
  *   0x00  control           bit 0 = enable, bit 1 = soft_reset (self-clearing),
  *                           bit 2 = force_high, bit 3 = harmonic_mode
- *   0x04  reserved
+ *   0x04  trig_half_period  CLK_HZ/(2*f_hz) cycles for DIO2 square wave (0=off)
  *   0x08  reg08             pulse: width_n (clock cycles)
  *                           harmonic: mult_n (bits [2:0], clamped to [1..5])
  *   0x0C  reserved
@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #define REG_CONTROL               0x00
+#define REG_TRIG_HALF_PERIOD      0x04
 #define REG_REG08                 0x08
 #define REG_STATUS                0x10
 #define REG_RAW_PERIOD            0x14
@@ -94,8 +95,11 @@ static void usage(const char *prog) {
         "      Set only the control register (0=off, 1=modulated, 4=force-high/on).\n"
         "  %s <base_addr> window <microseconds>\n"
         "      e.g. 1000=1ms  10000=10ms  100000=100ms  500000=500ms  1000000=1s\n"
+        "  %s <base_addr> trig <half_period_cycles>\n"
+        "      DIO2 square wave: half_period = round(124999999 / (2*f_hz)). 0=off.\n"
+        "      e.g. 62500000=1Hz  625000=100Hz  62500=1000Hz\n"
         "  %s <base_addr> soft_reset\n",
-        prog, prog, arg3, prog, prog, prog);
+        prog, prog, arg3, prog, prog, prog, prog);
 }
 
 static uint32_t rd32(volatile uint8_t *base, off_t off) {
@@ -123,21 +127,22 @@ static void wr48(volatile uint8_t *base, off_t lo_off, off_t hi_off, int64_t val
 }
 
 static void print_json(volatile uint8_t *base) {
-    const uint32_t control        = rd32(base, REG_CONTROL);
-    const uint32_t harmonic_mode  = (control >> 3) & 0x1u;
-    const uint32_t force_high     = (control >> 2) & 0x1u;
-    const uint32_t reg08          = rd32(base, REG_REG08);
-    const uint32_t mult_n         = (reg08 < 1u) ? 1u : (reg08 > 5u) ? 5u : reg08;
-    const uint32_t status         = rd32(base, REG_STATUS);
-    const uint32_t period_stable  = (status >> 3) & 0x1u;
-    const uint32_t freerun_active = (status >> 4) & 0x1u;
-    const uint32_t meas_time_us   = rd32(base, REG_MEAS_TIME_US);
-    const int64_t  step_offset    = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
-    const int64_t  step_base      = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
-    const int64_t  step_live      = rd48(base, REG_PHASE_STEP_LO,        REG_PHASE_STEP_HI);
+    const uint32_t control           = rd32(base, REG_CONTROL);
+    const uint32_t harmonic_mode     = (control >> 3) & 0x1u;
+    const uint32_t force_high        = (control >> 2) & 0x1u;
+    const uint32_t reg08             = rd32(base, REG_REG08);
+    const uint32_t mult_n            = (reg08 < 1u) ? 1u : (reg08 > 5u) ? 5u : reg08;
+    const uint32_t trig_half_period  = rd32(base, REG_TRIG_HALF_PERIOD);
+    const uint32_t status            = rd32(base, REG_STATUS);
+    const uint32_t period_stable     = (status >> 3) & 0x1u;
+    const uint32_t freerun_active    = (status >> 4) & 0x1u;
+    const uint32_t meas_time_us      = rd32(base, REG_MEAS_TIME_US);
+    const int64_t  step_offset       = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
+    const int64_t  step_base         = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
+    const int64_t  step_live         = rd48(base, REG_PHASE_STEP_LO,        REG_PHASE_STEP_HI);
 
     printf("{\"control\":%u,\"harmonic_mode\":%u,\"force_high\":%u,"
-           "\"width\":%u,\"mult_n\":%u,"
+           "\"width\":%u,\"mult_n\":%u,\"trig_half_period\":%u,"
            "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
            "\"raw_period\":%u,\"edge_cnt\":%u,"
            "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld}\n",
@@ -146,6 +151,7 @@ static void print_json(volatile uint8_t *base) {
            force_high,
            reg08,
            mult_n,
+           trig_half_period,
            status,
            period_stable,
            freerun_active,
@@ -246,6 +252,17 @@ int main(int argc, char **argv) {
         uint32_t us = (uint32_t)strtoul(argv[3], NULL, 0);
         if (us < 1000u) us = 1000u;
         wr32(base, REG_MEAS_TIME_US, us);
+        print_json(base);
+
+    } else if (strcmp(argv[2], "trig") == 0) {
+        if (argc != 4) {
+            usage(argv[0]);
+            munmap(map, (size_t)page_size);
+            close(fd);
+            return 1;
+        }
+        uint32_t half = (uint32_t)strtoul(argv[3], NULL, 0);
+        wr32(base, REG_TRIG_HALF_PERIOD, half);
         print_json(base);
 
     } else {
