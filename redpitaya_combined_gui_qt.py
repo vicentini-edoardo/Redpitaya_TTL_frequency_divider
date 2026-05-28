@@ -249,6 +249,11 @@ class SshBackend(QObject):
                 except Exception:
                     pass
         client = paramiko.SSHClient()
+        # AutoAddPolicy trusts any unknown host key on first contact. This is a
+        # deliberate convenience for a directly-cabled lab instrument (Red Pitaya
+        # boards have per-unit keys and are reached over a trusted local link);
+        # it does NOT authenticate the host, so do not use this over untrusted
+        # networks. Swap in RejectPolicy + known_hosts for a hardened deployment.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kw: dict = dict(hostname=host, port=port, username=user,
                         timeout=12, banner_timeout=20, auth_timeout=12)
@@ -925,6 +930,10 @@ class _NcoPanel(QWidget):
 
     # ── actions ────────────────────────────────────────────────────────────────
 
+    def apply(self):
+        """Public entry point (e.g. the Ctrl+Return shortcut) → mode-specific write."""
+        self._do_apply()
+
     def _do_soft_reset(self):
         if not self._live:
             return
@@ -1128,6 +1137,9 @@ class MainWindow(QMainWindow):
         self._poll = QTimer(self)
         self._poll.setInterval(700)
         self._poll.timeout.connect(self._be.poll)
+        # Match the poll cadence to the hardware measurement window so we don't
+        # re-read the same registers far faster than they can update.
+        self._be.sig_status.connect(self._adapt_poll_interval)
 
         self._build_ui()
         self.setStyleSheet(f"QMainWindow, QWidget {{ background: {_BG}; color: {_TEXT}; }}")
@@ -1369,10 +1381,24 @@ class MainWindow(QMainWindow):
     # ── Ctrl+Return routes to whichever tab is active ─────────────────────────
 
     def _active_panel_apply(self):
-        if self._tabs.currentIndex() == 0:
-            self._pulse_panel._do_apply()
-        else:
-            self._harmonic_panel._do_apply()
+        panel = self._tabs.currentWidget()
+        if isinstance(panel, _NcoPanel):
+            panel.apply()
+
+    # ── adaptive polling ──────────────────────────────────────────────────────
+
+    POLL_MIN_MS = 300    # keep the UI responsive for short windows
+    POLL_MAX_MS = 1000   # don't lag far behind a long measurement window
+
+    @Slot(dict)
+    def _adapt_poll_interval(self, d: dict):
+        """Track the active measurement window (clamped) as the poll period."""
+        raw = d.get("meas_time_us")
+        if raw is None:
+            return
+        interval = max(self.POLL_MIN_MS, min(self.POLL_MAX_MS, int(raw) // 1000))
+        if interval != self._poll.interval():
+            self._poll.setInterval(interval)
 
     # ── error / log ────────────────────────────────────────────────────────────
 
