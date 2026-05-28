@@ -526,21 +526,44 @@ class BigDisplay(QFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PulsePanel — f_out = f_in + f_shift, variable duty cycle
+# _NcoPanel — shared base for the Pulse and Harmonic tabs
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PulsePanel(QWidget):
-    """UI panel for pulse/frequency-shift mode (harmonic_mode=0)."""
+class _NcoPanel(QWidget):
+    """
+    Shared UI and logic for the two NCO control tabs.
+
+    Both tabs poll the same status dict, share the 2×2 monitor grid (left
+    column), the output-mode bar, the freq-shift/window/auto-apply controls and
+    the action column. Subclasses define ``MODE`` and a handful of hooks for the
+    parts that genuinely differ:
+
+      _out_hint()                 sub-text under the Output Frequency tile
+      _make_right_tiles()         the two mode-specific monitor tiles (returns top, bottom)
+      _build_secondary_field()    the row-0 col-2/3 input (Width % or Harmonic N); returns the widget
+      _be_set_control(ctrl)       route a control write to the mode's helper
+      _be_upload(c_src, bit_src)  route an upload to the mode's helper
+      _update_shift_detail()      mode-specific "target output" detail line
+      _do_apply()                 mode-specific modulated write
+      _update_status_tiles(...)   refresh the right tiles from a status dict
+      _update_status_noinput()    right tiles when no input signal is present
+      _update_local_displays()    right tiles from local control values (optional)
+      _on_disconnected_extra()    extra teardown (optional)
+    """
+
+    MODE: str = "pulse"   # "pulse" | "harmonic" — overridden by subclasses
 
     def __init__(self, backend: SshBackend, log_fn: Callable[[str], None],
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._be   = backend
-        self._log  = log_fn
+        self._log_fn = log_fn
         self._period_c  = 0
         self._live      = False
         self._refresh_pending = False
         self._output_mode: str = "modulated"   # "off" | "modulated" | "on"
+        self._tag = self.MODE.capitalize()
+        self._harmonic_json = 1 if self.MODE == "harmonic" else 0
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -554,6 +577,48 @@ class PulsePanel(QWidget):
         backend.sig_status.connect(self._on_status)
         backend.sig_mode_changed.connect(self._on_mode_changed)
 
+    def _log(self, msg: str):
+        self._log_fn(f"[{self._tag}] {msg}")
+
+    # ── mode-specific hooks (defaults are no-ops where sensible) ────────────────
+
+    def _out_hint(self) -> str:
+        return "NCO output"
+
+    def _make_right_tiles(self) -> tuple:
+        raise NotImplementedError
+
+    def _build_secondary_field(self, fields: QGridLayout) -> QWidget:
+        raise NotImplementedError
+
+    def _be_set_control(self, ctrl: int):
+        raise NotImplementedError
+
+    def _be_upload(self, c_src: str, bit_src: Optional[str]):
+        raise NotImplementedError
+
+    def _do_apply(self):
+        raise NotImplementedError
+
+    def _update_shift_detail(self):
+        raise NotImplementedError
+
+    def _update_status_tiles(self, d: dict, step_base: int, stable: bool):
+        pass
+
+    def _update_status_noinput(self):
+        pass
+
+    def _update_local_displays(self):
+        self._update_shift_detail()
+
+    def _on_disconnected_extra(self):
+        pass
+
+    def _warn_text(self, active_mode: str) -> str:
+        return (f"  Active helper: '{active_mode}' mode  —  "
+                f"click 'Upload && Compile ({self._tag} mode)' to switch")
+
     # ── UI ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -561,7 +626,7 @@ class PulsePanel(QWidget):
         root.setContentsMargins(0, 4, 0, 0)
         root.setSpacing(10)
 
-        # Mode mismatch warning
+        # Mode mismatch warning (shown when the active helper != this panel's mode)
         self._lbl_warn = QLabel()
         self._lbl_warn.setFont(_mono_font(9))
         self._lbl_warn.setAlignment(Qt.AlignCenter)
@@ -569,25 +634,28 @@ class PulsePanel(QWidget):
             f"background: #2a1500; color: {_AMBER}; "
             f"border: 1px solid {_AMBER}; border-radius: 6px; padding: 4px;"
         )
-        self._lbl_warn.setVisible(False)
+        if self._be.mode != self.MODE:
+            self._lbl_warn.setText(self._warn_text(self._be.mode))
+            self._lbl_warn.setVisible(True)
+        else:
+            self._lbl_warn.setVisible(False)
         root.addWidget(self._lbl_warn)
 
-        # Monitors 2×2
+        # Monitors 2×2 — left column shared, right column mode-specific
         self._d_in  = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
-        self._d_dur = BigDisplay("Pulse Duration",   "pulse high-time",       _AMBER)
-        self._d_out = BigDisplay("Output Frequency", "NCO output",            _GREEN)
-        self._d_dut = BigDisplay("Duty Cycle",       "width / period",        _AMBER)
+        self._d_out = BigDisplay("Output Frequency", self._out_hint(),        _GREEN)
+        self._d_tr, self._d_br = self._make_right_tiles()
 
-        for d in (self._d_in, self._d_dur, self._d_out, self._d_dut):
+        for d in (self._d_in, self._d_tr, self._d_out, self._d_br):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             d.setMinimumHeight(140)
 
         grid = QGridLayout()
         grid.setSpacing(10)
         grid.addWidget(self._d_in,  0, 0)
-        grid.addWidget(self._d_dur, 0, 1)
+        grid.addWidget(self._d_tr,  0, 1)
         grid.addWidget(self._d_out, 1, 0)
-        grid.addWidget(self._d_dut, 1, 1)
+        grid.addWidget(self._d_br,  1, 1)
         for i in range(2):
             grid.setRowStretch(i, 1)
             grid.setColumnStretch(i, 1)
@@ -631,7 +699,7 @@ class PulsePanel(QWidget):
         fields.setHorizontalSpacing(10)
         fields.setVerticalSpacing(8)
 
-        # Row 0: freq shift + width
+        # Row 0: freq shift (shared) + mode-specific secondary field
         fields.addWidget(_dim_label("Freq shift:"), 0, 0)
         self._sp_offset = QDoubleSpinBox()
         self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
@@ -645,18 +713,7 @@ class PulsePanel(QWidget):
         self._sp_offset.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_offset, 0, 1)
 
-        fields.addWidget(_dim_label("Width:"), 0, 2)
-        self._sp_width = QDoubleSpinBox()
-        self._sp_width.setRange(0.1, 99.9)
-        self._sp_width.setDecimals(2)
-        self._sp_width.setSuffix(" %")
-        self._sp_width.setValue(50.0)
-        self._sp_width.setFixedHeight(46)
-        self._sp_width.setMinimumWidth(140)
-        self._sp_width.setFont(_mono_font(15, bold=True))
-        self._sp_width.setStyleSheet(_spin_style())
-        self._sp_width.valueChanged.connect(self._param_changed)
-        fields.addWidget(self._sp_width, 0, 3)
+        self._secondary_widget = self._build_secondary_field(fields)
 
         # Row 1: measurement window
         fields.addWidget(_dim_label("Meas. window:"), 1, 0)
@@ -714,7 +771,7 @@ class PulsePanel(QWidget):
         self._btn_reset.clicked.connect(self._do_soft_reset)
         actions.addWidget(self._btn_reset)
 
-        self._btn_upload = QPushButton("Upload && Compile\n(Pulse mode)")
+        self._btn_upload = QPushButton(f"Upload && Compile\n({self._tag} mode)")
         self._btn_upload.setFixedWidth(210)
         self._btn_upload.setFixedHeight(44)
         self._btn_upload.setStyleSheet(_btn_style(_ACCENT))
@@ -736,11 +793,11 @@ class PulsePanel(QWidget):
         self._update_mode_controls()
         if self._live:
             if mode == "off":
-                self._be.set_control_pulse(0x00)
-                self._log("[Pulse] Laser OFF  (output = constant 0)")
+                self._be_set_control(0x00)
+                self._log("Laser OFF  (output = constant 0)")
             elif mode == "on":
-                self._be.set_control_pulse(CTRL_FORCE_HIGH)
-                self._log("[Pulse] Laser ON   (output = constant 1)")
+                self._be_set_control(CTRL_FORCE_HIGH)
+                self._log("Laser ON   (output = constant 1)")
             else:
                 self._do_apply()
 
@@ -752,7 +809,7 @@ class PulsePanel(QWidget):
 
     def _update_mode_controls(self):
         enabled = (self._output_mode == "modulated")
-        for w in (self._sp_offset, self._sp_width, self._cb_window,
+        for w in (self._sp_offset, self._secondary_widget, self._cb_window,
                   self._cb_auto, self._btn_apply):
             w.setEnabled(enabled)
 
@@ -761,7 +818,7 @@ class PulsePanel(QWidget):
     @Slot()
     def _on_connected(self):
         self._live = True
-        if self._be.mode == "pulse":
+        if self._be.mode == self.MODE:
             self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
 
     @Slot(str)
@@ -769,23 +826,22 @@ class PulsePanel(QWidget):
         self._live = False
         self._refresh_pending = False
         self._period_c = 0
+        self._on_disconnected_extra()
 
     @Slot(str)
     def _on_mode_changed(self, mode: str):
-        if mode == "pulse":
+        if mode == self.MODE:
             self._lbl_warn.setVisible(False)
             if self._live:
                 self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
         else:
-            self._lbl_warn.setText(
-                f"  FPGA helper active: '{mode}' mode  —  click 'Upload && Compile (Pulse mode)' to use this panel"
-            )
+            self._lbl_warn.setText(self._warn_text(mode))
             self._lbl_warn.setVisible(True)
 
     @Slot(dict)
     def _on_status(self, d: dict):
-        if int(d.get("harmonic_mode", 0)) != 0:
-            return  # JSON from harmonic helper; skip
+        if int(d.get("harmonic_mode", 0)) != self._harmonic_json:
+            return  # JSON from the other helper; skip
 
         raw_us = d.get("meas_time_us")
         if raw_us is not None:
@@ -827,7 +883,7 @@ class PulsePanel(QWidget):
                     _ACCENT if stable else _AMBER,
                 )
                 self._refresh_pending = False
-                self._log(f"[Pulse] Input: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
+                self._log(f"Input: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
             else:
                 self._d_in.set_data("---", "no input signal", _RED)
 
@@ -838,12 +894,9 @@ class PulsePanel(QWidget):
             delta     = phase_to_hz(step_off)
             self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
             self._update_shift_detail()
-
-            period = self._period_c if self._period_c > 0 else ((1 << PHASE_BITS) // step_base)
-            wc = int(d.get("width") or 0)
-            if wc > 0:
-                self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
-                self._d_dut.set_data(f"{wc / period * 100:.2f} %")
+            self._update_status_tiles(d, step_base, stable)
+        else:
+            self._update_status_noinput()
 
     # ── parameter controls ─────────────────────────────────────────────────────
 
@@ -854,9 +907,79 @@ class PulsePanel(QWidget):
         self._update_window_suggestion()
 
     def _on_window_changed(self, idx: int):
-        if self._live and self._be.mode == "pulse":
+        if self._live and self._be.mode == self.MODE:
             self._be.set_window(WINDOW_OPTIONS_US[idx])
         self._update_window_suggestion()
+
+    def _update_window_suggestion(self):
+        f_shift  = abs(self._sp_offset.value())
+        sug      = suggest_window(f_shift)
+        current  = self._cb_window.currentIndex()
+        freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
+        if current == sug:
+            self._lbl_win_suggest.setText(f"✓ optimal for {freq_str}")
+            self._lbl_win_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
+        else:
+            self._lbl_win_suggest.setText(f"suggested: {WINDOW_NAMES[sug]} for {freq_str}")
+            self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
+
+    # ── actions ────────────────────────────────────────────────────────────────
+
+    def _do_soft_reset(self):
+        if not self._live:
+            return
+        self._refresh_pending = True
+        self._be.soft_reset()
+        self._log("Soft reset sent.")
+
+    def _do_upload(self):
+        here    = Path(__file__).resolve().parent
+        c_src   = os.fspath(here / "rp_ctl.c")
+        bit_src = os.fspath(here / "red_pitaya_top.bit.bin")
+        if not Path(c_src).exists():
+            self._log(f"ERROR: {c_src} not found")
+            return
+        self._be_upload(c_src, bit_src if Path(bit_src).exists() else None)
+        self._log("Upload queued.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PulsePanel — f_out = f_in + f_shift, variable duty cycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PulsePanel(_NcoPanel):
+    """Pulse / frequency-shift mode (harmonic_mode=0): f_out = f_in + f_shift."""
+
+    MODE = "pulse"
+
+    def _out_hint(self) -> str:
+        return "NCO output"
+
+    def _make_right_tiles(self) -> tuple:
+        self._d_dur = BigDisplay("Pulse Duration", "pulse high-time", _AMBER)
+        self._d_dut = BigDisplay("Duty Cycle",     "width / period",  _AMBER)
+        return self._d_dur, self._d_dut
+
+    def _build_secondary_field(self, fields: QGridLayout) -> QWidget:
+        fields.addWidget(_dim_label("Width:"), 0, 2)
+        self._sp_width = QDoubleSpinBox()
+        self._sp_width.setRange(0.1, 99.9)
+        self._sp_width.setDecimals(2)
+        self._sp_width.setSuffix(" %")
+        self._sp_width.setValue(50.0)
+        self._sp_width.setFixedHeight(46)
+        self._sp_width.setMinimumWidth(140)
+        self._sp_width.setFont(_mono_font(15, bold=True))
+        self._sp_width.setStyleSheet(_spin_style())
+        self._sp_width.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_width, 0, 3)
+        return self._sp_width
+
+    def _be_set_control(self, ctrl: int):
+        self._be.set_control_pulse(ctrl)
+
+    def _be_upload(self, c_src: str, bit_src: Optional[str]):
+        self._be.upload_pulse(c_src, bit_src)
 
     def _update_local_displays(self):
         self._update_shift_detail()
@@ -866,6 +989,13 @@ class PulsePanel(QWidget):
         wc   = duty_to_cycles(frac, self._period_c)
         self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
         self._d_dut.set_data(f"{self._sp_width.value():.2f} %")
+
+    def _update_status_tiles(self, d: dict, step_base: int, stable: bool):
+        period = self._period_c if self._period_c > 0 else ((1 << PHASE_BITS) // step_base)
+        wc = int(d.get("width") or 0)
+        if wc > 0:
+            self._d_dur.set_data(fmt_dur(wc / CLK_HZ))
+            self._d_dut.set_data(f"{wc / period * 100:.2f} %")
 
     def _update_shift_detail(self):
         req_hz      = self._sp_offset.value()
@@ -881,21 +1011,6 @@ class PulsePanel(QWidget):
             f"register {offset_word:+d}, resolution {PHASE_RES_HZ:.9f} Hz/LSB{out_text}"
         )
 
-    def _update_window_suggestion(self):
-        f_shift  = abs(self._sp_offset.value())
-        sug      = suggest_window(f_shift)
-        names    = WINDOW_NAMES
-        current  = self._cb_window.currentIndex()
-        freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
-        if current == sug:
-            self._lbl_win_suggest.setText(f"✓ optimal for {freq_str}")
-            self._lbl_win_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
-        else:
-            self._lbl_win_suggest.setText(f"suggested: {names[sug]} for {freq_str}")
-            self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
-
-    # ── actions ────────────────────────────────────────────────────────────────
-
     def _do_apply(self):
         if not self._live or self._output_mode != "modulated":
             return
@@ -907,151 +1022,29 @@ class PulsePanel(QWidget):
         actual_hz   = phase_to_hz(offset_word)
         self._be.apply_pulse(wc, offset_word)
         self._log(
-            f"[Pulse] Apply  width={self._sp_width.value():.2f}%  "
+            f"Apply  width={self._sp_width.value():.2f}%  "
             f"shift={actual_hz:+.6f} Hz  offset={offset_word:+d}"
         )
-
-    def _do_soft_reset(self):
-        if not self._live:
-            return
-        self._refresh_pending = True
-        self._be.soft_reset()
-        self._log("[Pulse] Soft reset sent.")
-
-    def _do_upload(self):
-        here    = Path(__file__).resolve().parent
-        c_src   = os.fspath(here / "rp_ctl.c")
-        bit_src = os.fspath(here / "red_pitaya_top.bit.bin")
-        if not Path(c_src).exists():
-            self._log(f"[Pulse] ERROR: {c_src} not found")
-            return
-        self._be.upload_pulse(c_src, bit_src if Path(bit_src).exists() else None)
-        self._log("[Pulse] Upload queued.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HarmonicPanel — f_out = N × f_in + f_shift, 50% duty cycle
 # ─────────────────────────────────────────────────────────────────────────────
 
-class HarmonicPanel(QWidget):
-    """UI panel for harmonic generator mode (harmonic_mode=1)."""
+class HarmonicPanel(_NcoPanel):
+    """Harmonic generator mode (harmonic_mode=1): f_out = N × f_in + f_shift."""
 
-    def __init__(self, backend: SshBackend, log_fn: Callable[[str], None],
-                 parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._be   = backend
-        self._log  = log_fn
-        self._period_c  = 0
-        self._live      = False
-        self._refresh_pending = False
-        self._output_mode: str = "modulated"   # "off" | "modulated" | "on"
+    MODE = "harmonic"
 
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(300)
-        self._debounce.timeout.connect(self._do_apply)
+    def _out_hint(self) -> str:
+        return "N·f_in + f_shift"
 
-        self._build_ui()
+    def _make_right_tiles(self) -> tuple:
+        self._d_n      = BigDisplay("Harmonic N", "applied multiplier", _AMBER)
+        self._d_status = BigDisplay("NCO Status", "lock / acquiring",   _AMBER)
+        return self._d_n, self._d_status
 
-        backend.sig_connected.connect(self._on_connected)
-        backend.sig_disconnected.connect(self._on_disconnected)
-        backend.sig_status.connect(self._on_status)
-        backend.sig_mode_changed.connect(self._on_mode_changed)
-
-    # ── UI ─────────────────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 4, 0, 0)
-        root.setSpacing(10)
-
-        # Mode mismatch warning
-        self._lbl_warn = QLabel()
-        self._lbl_warn.setFont(_mono_font(9))
-        self._lbl_warn.setAlignment(Qt.AlignCenter)
-        self._lbl_warn.setStyleSheet(
-            f"background: #2a1500; color: {_AMBER}; "
-            f"border: 1px solid {_AMBER}; border-radius: 6px; padding: 4px;"
-        )
-        self._lbl_warn.setText(
-            "  Active helper: 'pulse' mode  —  click 'Upload && Compile (Harmonic mode)' to switch"
-        )
-        self._lbl_warn.setVisible(True)
-        root.addWidget(self._lbl_warn)
-
-        # Monitors 2×2
-        self._d_in     = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
-        self._d_n      = BigDisplay("Harmonic N",       "applied multiplier",    _AMBER)
-        self._d_out    = BigDisplay("Output Frequency", "N·f_in + f_shift",      _GREEN)
-        self._d_status = BigDisplay("NCO Status",       "lock / acquiring",      _AMBER)
-
-        for d in (self._d_in, self._d_n, self._d_out, self._d_status):
-            d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            d.setMinimumHeight(140)
-
-        grid = QGridLayout()
-        grid.setSpacing(10)
-        grid.addWidget(self._d_in,     0, 0)
-        grid.addWidget(self._d_n,      0, 1)
-        grid.addWidget(self._d_out,    1, 0)
-        grid.addWidget(self._d_status, 1, 1)
-        for i in range(2):
-            grid.setRowStretch(i, 1)
-            grid.setColumnStretch(i, 1)
-        root.addLayout(grid, 1)
-
-        # Controls group
-        controls = _make_group("Controls")
-        cl = QHBoxLayout(controls)
-        cl.setContentsMargins(12, 12, 12, 12)
-        cl.setSpacing(18)
-
-        left_col = QVBoxLayout()
-        left_col.setSpacing(10)
-
-        # ── Output mode bar ───────────────────────────────────────────────────
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        mode_lbl = QLabel("Output mode:")
-        mode_lbl.setFont(_mono_font(10, bold=True))
-        mode_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        mode_row.addWidget(mode_lbl)
-        self._btn_off = QPushButton("■  LASER OFF")
-        self._btn_mod = QPushButton("~  MODULATED")
-        self._btn_on  = QPushButton("●  LASER ON")
-        for btn in (self._btn_off, self._btn_mod, self._btn_on):
-            btn.setFixedHeight(32)
-            btn.setFont(_mono_font(10))
-            mode_row.addWidget(btn)
-        mode_row.addStretch()
-        self._btn_off.clicked.connect(lambda: self._set_output_mode("off"))
-        self._btn_mod.clicked.connect(lambda: self._set_output_mode("modulated"))
-        self._btn_on.clicked.connect(lambda: self._set_output_mode("on"))
-        left_col.addLayout(mode_row)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(f"color: {_BORDER};")
-        left_col.addWidget(sep)
-
-        fields = QGridLayout()
-        fields.setHorizontalSpacing(10)
-        fields.setVerticalSpacing(8)
-
-        # Row 0: freq shift + harmonic N
-        fields.addWidget(_dim_label("Freq shift:"), 0, 0)
-        self._sp_offset = QDoubleSpinBox()
-        self._sp_offset.setRange(-MAX_SHIFT_HZ, MAX_SHIFT_HZ)
-        self._sp_offset.setDecimals(6)
-        self._sp_offset.setSingleStep(1.0)
-        self._sp_offset.setSuffix(" Hz")
-        self._sp_offset.setFixedHeight(46)
-        self._sp_offset.setMinimumWidth(280)
-        self._sp_offset.setFont(_mono_font(15, bold=True))
-        self._sp_offset.setStyleSheet(_spin_style())
-        self._sp_offset.valueChanged.connect(self._param_changed)
-        fields.addWidget(self._sp_offset, 0, 1)
-
+    def _build_secondary_field(self, fields: QGridLayout) -> QWidget:
         fields.addWidget(_dim_label("Harmonic N:"), 0, 2)
         self._sp_n = QSpinBox()
         self._sp_n.setRange(1, 5)
@@ -1062,210 +1055,28 @@ class HarmonicPanel(QWidget):
         self._sp_n.setStyleSheet(_spin_style())
         self._sp_n.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_n, 0, 3)
+        return self._sp_n
 
-        # Row 1: measurement window
-        fields.addWidget(_dim_label("Meas. window:"), 1, 0)
-        self._cb_window = QComboBox()
-        self._cb_window.addItems(WINDOW_NAMES)
-        self._cb_window.setCurrentIndex(2)
-        self._cb_window.setFixedHeight(36)
-        self._cb_window.setFixedWidth(118)
-        self._cb_window.setStyleSheet(_spin_style())
-        self._cb_window.currentIndexChanged.connect(self._on_window_changed)
-        fields.addWidget(self._cb_window, 1, 1)
+    def _be_set_control(self, ctrl: int):
+        self._be.set_control_harmonic(ctrl)
 
-        self._lbl_win_suggest = QLabel()
-        self._lbl_win_suggest.setFont(_mono_font(9))
-        self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
-        fields.addWidget(self._lbl_win_suggest, 1, 2, 1, 2)
+    def _be_upload(self, c_src: str, bit_src: Optional[str]):
+        self._be.upload_harmonic(c_src, bit_src)
 
-        # Row 2: auto-apply
-        auto_row = QHBoxLayout()
-        self._cb_auto = QCheckBox("Auto-Apply")
-        self._cb_auto.setChecked(True)
-        self._cb_auto.setFont(_mono_font(10))
-        self._cb_auto.setStyleSheet(f"color: {_TEXT}; background: transparent;")
-        auto_row.addWidget(self._cb_auto)
-        auto_row.addStretch()
-        fields.addLayout(auto_row, 2, 0, 1, 4)
-
-        # Row 3: shift detail
-        self._lbl_shift = QLabel()
-        self._lbl_shift.setFont(_mono_font(9))
-        self._lbl_shift.setWordWrap(True)
-        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        fields.addWidget(self._lbl_shift, 3, 0, 1, 4)
-        fields.setColumnStretch(1, 1)
-
-        left_col.addLayout(fields)
-        cl.addLayout(left_col, 1)
-
-        # Action column
-        actions = QVBoxLayout()
-        actions.setSpacing(8)
-
-        self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
-        self._btn_apply.setFixedWidth(210)
-        self._btn_apply.setFixedHeight(82)
-        self._btn_apply.setFont(_mono_font(13, bold=True))
-        self._btn_apply.setStyleSheet(_btn_style(_GREEN))
-        self._btn_apply.clicked.connect(self._do_apply)
-        actions.addWidget(self._btn_apply)
-
-        self._btn_reset = QPushButton("Soft Reset")
-        self._btn_reset.setFixedWidth(210)
-        self._btn_reset.setFixedHeight(32)
-        self._btn_reset.setStyleSheet(_btn_style(_AMBER))
-        self._btn_reset.clicked.connect(self._do_soft_reset)
-        actions.addWidget(self._btn_reset)
-
-        self._btn_upload = QPushButton("Upload && Compile\n(Harmonic mode)")
-        self._btn_upload.setFixedWidth(210)
-        self._btn_upload.setFixedHeight(44)
-        self._btn_upload.setStyleSheet(_btn_style(_ACCENT))
-        self._btn_upload.clicked.connect(self._do_upload)
-        actions.addWidget(self._btn_upload)
-        actions.addStretch()
-        cl.addLayout(actions)
-
-        root.addWidget(controls)
-        self._update_mode_styles()
-        self._update_shift_detail()
-        self._update_window_suggestion()
-
-    # ── output mode ────────────────────────────────────────────────────────────
-
-    def _set_output_mode(self, mode: str):
-        self._output_mode = mode
-        self._update_mode_styles()
-        self._update_mode_controls()
-        if self._live:
-            if mode == "off":
-                self._be.set_control_harmonic(0x00)
-                self._log("[Harmonic] Laser OFF  (output = constant 0)")
-            elif mode == "on":
-                self._be.set_control_harmonic(CTRL_FORCE_HIGH)
-                self._log("[Harmonic] Laser ON   (output = constant 1)")
-            else:
-                self._do_apply()
-
-    def _update_mode_styles(self):
-        m = self._output_mode
-        self._btn_off.setStyleSheet(_mode_btn_style(_RED,   m == "off"))
-        self._btn_mod.setStyleSheet(_mode_btn_style(_GREEN, m == "modulated"))
-        self._btn_on.setStyleSheet(_mode_btn_style(_WHITE,  m == "on"))
-
-    def _update_mode_controls(self):
-        enabled = (self._output_mode == "modulated")
-        for w in (self._sp_offset, self._sp_n, self._cb_window,
-                  self._cb_auto, self._btn_apply):
-            w.setEnabled(enabled)
-
-    # ── backend signal handlers ────────────────────────────────────────────────
-
-    @Slot()
-    def _on_connected(self):
-        self._live = True
-        if self._be.mode == "harmonic":
-            self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
-
-    @Slot(str)
-    def _on_disconnected(self, _reason: str):
-        self._live = False
-        self._refresh_pending = False
-        self._period_c = 0
+    def _on_disconnected_extra(self):
         self._d_status.set_data("---", "", _AMBER)
 
-    @Slot(str)
-    def _on_mode_changed(self, mode: str):
-        if mode == "harmonic":
-            self._lbl_warn.setVisible(False)
-            if self._live:
-                self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
-        else:
-            self._lbl_warn.setText(
-                f"  Active helper: '{mode}' mode  —  click 'Upload && Compile (Harmonic mode)' to switch"
-            )
-            self._lbl_warn.setVisible(True)
+    def _update_status_tiles(self, d: dict, step_base: int, stable: bool):
+        mult_n = int(d.get("mult_n") or 1)
+        self._d_n.set_data(str(mult_n), "harmonic order")
+        self._d_status.set_data(
+            "LOCKED" if stable else "ACQUIRING",
+            "freerun active" if d.get("freerun_active") else "measuring",
+            _GREEN if stable else _AMBER,
+        )
 
-    @Slot(dict)
-    def _on_status(self, d: dict):
-        if int(d.get("harmonic_mode", 0)) != 1:
-            return  # JSON from pulse helper; skip
-
-        raw_us = d.get("meas_time_us")
-        if raw_us is not None:
-            us_val = int(raw_us)
-            try:
-                idx = WINDOW_OPTIONS_US.index(us_val)
-            except ValueError:
-                idx = min(range(len(WINDOW_OPTIONS_US)),
-                          key=lambda i: abs(WINDOW_OPTIONS_US[i] - us_val))
-            if idx != self._cb_window.currentIndex():
-                self._cb_window.blockSignals(True)
-                self._cb_window.setCurrentIndex(idx)
-                self._cb_window.blockSignals(False)
-
-        # Sync output mode from FPGA control register
-        ctrl = int(d.get("control") or 0)
-        if (ctrl >> 2) & 1:
-            fpga_mode = "on"
-        elif ctrl & 1:
-            fpga_mode = "modulated"
-        else:
-            fpga_mode = "off"
-        if fpga_mode != self._output_mode:
-            self._output_mode = fpga_mode
-            self._update_mode_styles()
-            self._update_mode_controls()
-
-        stable    = bool(d.get("period_stable"))
-        mult_n    = int(d.get("mult_n") or 1)
-        step_base = int(d.get("phase_step_base") or 0)
-
-        if self._refresh_pending:
-            if step_base > 0:
-                self._period_c = (1 << PHASE_BITS) // step_base
-                in_hz = phase_to_hz(step_base)
-                self._d_in.set_data(
-                    fmt_freq(in_hz),
-                    "stable" if stable else "acquiring …",
-                    _ACCENT if stable else _AMBER,
-                )
-                self._refresh_pending = False
-                self._log(f"[Harmonic] Input: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
-            else:
-                self._d_in.set_data("---", "no input signal", _RED)
-
-        if step_base > 0:
-            step_off  = int(d.get("phase_step_offset") or 0)
-            step_live = int(d.get("phase_step") or 0)
-            out_hz    = phase_to_hz(step_live)
-            delta     = phase_to_hz(step_off)
-
-            self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
-            self._d_n.set_data(str(mult_n), "harmonic order")
-            self._d_status.set_data(
-                "LOCKED" if stable else "ACQUIRING",
-                "freerun active" if d.get("freerun_active") else "measuring",
-                _GREEN if stable else _AMBER,
-            )
-            self._update_shift_detail()
-        else:
-            self._d_status.set_data("NO INPUT", "waiting for signal", _RED)
-
-    # ── parameter controls ─────────────────────────────────────────────────────
-
-    def _param_changed(self, *_):
-        if self._output_mode == "modulated" and self._cb_auto.isChecked():
-            self._debounce.start()
-        self._update_shift_detail()
-        self._update_window_suggestion()
-
-    def _on_window_changed(self, idx: int):
-        if self._live and self._be.mode == "harmonic":
-            self._be.set_window(WINDOW_OPTIONS_US[idx])
-        self._update_window_suggestion()
+    def _update_status_noinput(self):
+        self._d_status.set_data("NO INPUT", "waiting for signal", _RED)
 
     def _update_shift_detail(self):
         n           = self._sp_n.value()
@@ -1282,21 +1093,6 @@ class HarmonicPanel(QWidget):
             f"register {offset_word:+d}, resolution {PHASE_RES_HZ:.9f} Hz/LSB{out_text}"
         )
 
-    def _update_window_suggestion(self):
-        f_shift  = abs(self._sp_offset.value())
-        sug      = suggest_window(f_shift)
-        names    = WINDOW_NAMES
-        current  = self._cb_window.currentIndex()
-        freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
-        if current == sug:
-            self._lbl_win_suggest.setText(f"✓ optimal for {freq_str}")
-            self._lbl_win_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
-        else:
-            self._lbl_win_suggest.setText(f"suggested: {names[sug]} for {freq_str}")
-            self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
-
-    # ── actions ────────────────────────────────────────────────────────────────
-
     def _do_apply(self):
         if not self._live or self._output_mode != "modulated":
             return
@@ -1306,26 +1102,9 @@ class HarmonicPanel(QWidget):
         actual_hz   = phase_to_hz(offset_word)
         self._be.apply_harmonic(n, offset_word)
         self._log(
-            f"[Harmonic] Apply  N={n}  shift={actual_hz:+.6f} Hz  "
+            f"Apply  N={n}  shift={actual_hz:+.6f} Hz  "
             f"offset={offset_word:+d}"
         )
-
-    def _do_soft_reset(self):
-        if not self._live:
-            return
-        self._refresh_pending = True
-        self._be.soft_reset()
-        self._log("[Harmonic] Soft reset sent.")
-
-    def _do_upload(self):
-        here    = Path(__file__).resolve().parent
-        c_src   = os.fspath(here / "rp_ctl.c")
-        bit_src = os.fspath(here / "red_pitaya_top.bit.bin")
-        if not Path(c_src).exists():
-            self._log(f"[Harmonic] ERROR: {c_src} not found")
-            return
-        self._be.upload_harmonic(c_src, bit_src if Path(bit_src).exists() else None)
-        self._log("[Harmonic] Upload queued.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
