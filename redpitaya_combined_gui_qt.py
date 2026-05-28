@@ -48,88 +48,14 @@ try:
 except ImportError:
     _HAS_PARAMIKO = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Hardware constants
-# ─────────────────────────────────────────────────────────────────────────────
-CLK_HZ        = 124_999_999
-PHASE_BITS    = 48
-DEFAULT_BASE  = 0x40600000
-
-# control register bits
-CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
-CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
-# bit 3 (harmonic_mode) is enforced by the respective C helper
-
-_PHASE_MAX    = 2 ** (PHASE_BITS - 1)
-PHASE_RES_HZ  = CLK_HZ / 2**PHASE_BITS
-MAX_SHIFT_HZ  = (_PHASE_MAX - 1) * CLK_HZ / 2**PHASE_BITS
-
-WINDOW_OPTIONS_US = [1_000, 10_000, 100_000, 500_000, 1_000_000]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Math helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def hz_to_phase(delta_hz: float) -> int:
-    v = int(round(delta_hz * 2**PHASE_BITS / CLK_HZ))
-    return max(-_PHASE_MAX, min(_PHASE_MAX - 1, v))
-
-
-def phase_to_hz(word: int) -> float:
-    return word * CLK_HZ / 2**PHASE_BITS
-
-
-def duty_to_cycles(frac: float, period: int) -> int:
-    return max(1, min(period - 1, int(round(frac * period))))
-
-
-def fmt_freq(hz: float) -> str:
-    if hz <= 0:
-        return "---"
-    if hz < 1e3:
-        return f"{hz:.6f} Hz"
-    if hz < 1e6:
-        return f"{hz / 1e3:.6f} kHz"
-    return f"{hz / 1e6:.6f} MHz"
-
-
-def fmt_signed_freq(hz: float) -> str:
-    if abs(hz) < PHASE_RES_HZ / 2:
-        return "+0.000000 Hz"
-    sign = "+" if hz >= 0 else "-"
-    return f"{sign}{fmt_freq(abs(hz))}"
-
-
-def suggest_window(f_shift_hz: float) -> int:
-    if f_shift_hz <= 0:
-        return 2
-    if f_shift_hz < 1:
-        return 4
-    if f_shift_hz < 10:
-        return 3
-    if f_shift_hz < 100:
-        return 2
-    if f_shift_hz < 1000:
-        return 1
-    return 0
-
-
-def trig_hz_to_half_period(f_hz: float) -> int:
-    if f_hz <= 0:
-        return 0
-    return round(CLK_HZ / (2.0 * f_hz))
-
-
-def fmt_dur(s: float) -> str:
-    if s <= 0:
-        return "---"
-    if s < 1e-6:
-        return f"{s * 1e9:.3f} ns"
-    if s < 1e-3:
-        return f"{s * 1e6:.3f} µs"
-    if s < 1.0:
-        return f"{s * 1e3:.3f} ms"
-    return f"{s:.6f} s"
+# Hardware constants and pure conversion math live in a Qt-free module so they
+# can be unit-tested in isolation (see tests/test_rp_math.py).
+from rp_math import (  # noqa: E402
+    CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH,
+    PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
+    hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
+    suggest_window, trig_hz_to_half_period, fmt_dur,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +213,12 @@ class SshBackend(QObject):
                 if job.cb is not None and result is not None:
                     job.cb(result)
             except Exception as exc:
+                # A single failed poll (helper not compiled yet, transient
+                # non-JSON output, momentary hiccup) must not tear down the
+                # whole session — log it and keep the connection alive.
+                if job.pri == self.P_POLL and self._live:
+                    self.sig_log.emit(f"[poll skipped] {exc}")
+                    continue
                 self._live = False
                 self.sig_error.emit(str(exc))
                 self.sig_disconnected.emit(str(exc))
@@ -295,8 +227,11 @@ class SshBackend(QObject):
         _, stdout, stderr = self._ssh.exec_command(cmd, timeout=timeout)
         out = stdout.read().decode()
         err = stderr.read().decode().strip()
+        status = stdout.channel.recv_exit_status()
         if err:
             self.sig_log.emit(f"[stderr] {err}")
+        if status != 0:
+            self.sig_log.emit(f"[exit {status}] {cmd}")
         return out
 
     def _active_cmd(self) -> str:
@@ -726,7 +661,7 @@ class PulsePanel(QWidget):
         # Row 1: measurement window
         fields.addWidget(_dim_label("Meas. window:"), 1, 0)
         self._cb_window = QComboBox()
-        self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"])
+        self._cb_window.addItems(WINDOW_NAMES)
         self._cb_window.setCurrentIndex(2)
         self._cb_window.setFixedHeight(36)
         self._cb_window.setFixedWidth(118)
@@ -949,7 +884,7 @@ class PulsePanel(QWidget):
     def _update_window_suggestion(self):
         f_shift  = abs(self._sp_offset.value())
         sug      = suggest_window(f_shift)
-        names    = ["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"]
+        names    = WINDOW_NAMES
         current  = self._cb_window.currentIndex()
         freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
         if current == sug:
@@ -1131,7 +1066,7 @@ class HarmonicPanel(QWidget):
         # Row 1: measurement window
         fields.addWidget(_dim_label("Meas. window:"), 1, 0)
         self._cb_window = QComboBox()
-        self._cb_window.addItems(["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"])
+        self._cb_window.addItems(WINDOW_NAMES)
         self._cb_window.setCurrentIndex(2)
         self._cb_window.setFixedHeight(36)
         self._cb_window.setFixedWidth(118)
@@ -1350,7 +1285,7 @@ class HarmonicPanel(QWidget):
     def _update_window_suggestion(self):
         f_shift  = abs(self._sp_offset.value())
         sug      = suggest_window(f_shift)
-        names    = ["1 ms", "10 ms", "100 ms", "500 ms", "1000 ms"]
+        names    = WINDOW_NAMES
         current  = self._cb_window.currentIndex()
         freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
         if current == sug:

@@ -6,24 +6,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Desktop tools for controlling a custom Red Pitaya FPGA TTL signal generator over SSH.
 
-Two FPGA modes are supported, each in its own self-contained subfolder:
+Two operating modes are supported by a **single unified FPGA bitfile** and a
+**single board-side C helper** (`rp_ctl.c`). The helper selects its mode from the
+binary name it is invoked as — switching modes is instant, no re-flashing.
 
-| Subfolder | Mode | Formula | Duty cycle |
-|-----------|------|---------|------------|
-| `pulse_generator/` | Pulse / Freq-Shift | f_out = f_in + f_shift | User-adjustable |
-| `harmonic_generator/` | Harmonic Generator | f_out = N × f_in + f_shift | Fixed 50 % |
+| Mode | Formula | Duty cycle |
+|------|---------|------------|
+| Pulse / Freq-Shift | f_out = f_in + f_shift | User-adjustable |
+| Harmonic Generator | f_out = N × f_in + f_shift | Fixed 50 % |
 
 Signal path (both modes): `DIO0_P` → FPGA period measurement + NCO → `DIO1_P`.
+An independent free-running square wave is available on `DIO2_P`.
 
-### Top-level files
+### Repository layout
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `redpitaya_combined_gui_qt.py` | Combined two-tab PySide6 GUI; drives both modes through one SSH session. Reads helper-C and bitstreams from the two subfolders. |
-| `requirements.txt` | Shared Python dependencies (`PySide6`, `paramiko`). |
-| `PHASE1_RECIPROCAL_COUNTING.md` | Reciprocal-counting measurement design notes. |
-
-Each subfolder contains its own `README.md` and `CLAUDE.md` with mode-specific detail.
+| `redpitaya_combined_gui_qt.py` | Two-tab PySide6 GUI; drives both modes through one SSH session. |
+| `rp_math.py` | Qt-free hardware constants + frequency/duty conversion math (imported by the GUI; unit-tested). |
+| `rp_ctl.c` | Unified board-side C helper (pulse + harmonic), compiled once and symlinked to two names. |
+| `red_pitaya_top.bit.bin` | Unified FPGA bitstream uploaded by the GUI. |
+| `requirements.txt` | Python dependencies (`PySide6-Essentials`, `paramiko`). |
+| `tests/` | `unittest`/`pytest` suite for `rp_math`. |
+| `Vivado files/` | RTL source: `red_pitaya_top.sv`, `pulse_gen.sv`, `axi4lite_pulse_regs.sv`. |
+| `memory/` | Project notes (measured clock, fixed measurement bug). |
 
 ## Commands
 
@@ -33,28 +39,28 @@ python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 
-# Run combined GUI (both modes, one window)
+# Run the GUI (both modes, one window)
 .venv/bin/python redpitaya_combined_gui_qt.py
 
-# Run standalone GUIs
-.venv/bin/python pulse_generator/redpitaya_pulse_gui_qt.py
-.venv/bin/python harmonic_generator/redpitaya_harmonic_gui_qt.py
+# Run the math unit tests (no Qt/paramiko needed)
+python3 -m unittest discover -s tests
+# or, if pytest is installed:
+pytest tests/
 
-# Run CLI register monitors
-python3 pulse_generator/redpitaya_register_monitor.py --host rp-xxxxxx.local --interval 0.5 --count 20
-python3 harmonic_generator/redpitaya_register_monitor.py --host rp-xxxxxx.local --interval 0.5 --count 20
+# Compile the board-side helper manually on the Red Pitaya
+scp rp_ctl.c root@rp-xxxxxx.local:/root/rp_ctl.c
+ssh root@rp-xxxxxx.local 'gcc -O2 -o /root/rp_ctl /root/rp_ctl.c && \
+    ln -sf /root/rp_ctl /root/rp_pulse_ctl && \
+    ln -sf /root/rp_ctl /root/rp_harmonic_ctl'
 
-# Compile board-side helpers manually on the Red Pitaya
-scp pulse_generator/rp_pulse_ctl.c root@rp-xxxxxx.local:/root/rp_pulse_ctl.c
-ssh root@rp-xxxxxx.local 'gcc -O2 -o /root/rp_pulse_ctl /root/rp_pulse_ctl.c'
-
-scp harmonic_generator/rp_harmonic_ctl.c root@rp-xxxxxx.local:/root/rp_harmonic_ctl.c
-ssh root@rp-xxxxxx.local 'gcc -O2 -o /root/rp_harmonic_ctl /root/rp_harmonic_ctl.c'
+# Flash the bitstream (once per board boot)
+scp red_pitaya_top.bit.bin root@rp-xxxxxx.local:/root/
+ssh root@rp-xxxxxx.local '/opt/redpitaya/bin/fpgautil -b /root/red_pitaya_top.bit.bin'
 ```
 
 ## Architecture
 
-### Combined GUI (`redpitaya_combined_gui_qt.py`)
+### GUI (`redpitaya_combined_gui_qt.py`)
 
 Two-layer design: Qt main thread for UI only; `SshBackend` for all SSH/SFTP work.
 
@@ -66,78 +72,88 @@ is queued through a single background thread with these priorities:
 - `P_INIT = 2` — connect / disconnect.
 - `P_POLL = 9` — periodic register reads.
 
-`self._mode` ("pulse" | "harmonic") tracks which binary is active on the FPGA.
+A failed `P_POLL` job is logged and skipped without dropping the session; failures
+of any other priority tear the session down and emit `sig_disconnected`.
+
+`self._mode` ("pulse" | "harmonic") tracks which helper symlink is called for polls.
 Results flow back via signals: `sig_connected`, `sig_disconnected`, `sig_status`,
 `sig_log`, `sig_error`, `sig_mode_changed`.
 
-Asset paths resolved by the combined GUI:
+`PulsePanel` and `HarmonicPanel` are the two tabs; both consume the same polled
+status dict and ignore JSON whose `harmonic_mode` flag does not match their mode.
 
-| Asset | Path |
-|-------|------|
-| Pulse C helper | `pulse_generator/rp_pulse_ctl.c` |
-| Pulse bitstream | `pulse_generator/red_pitaya_top.bit.bin` |
-| Harmonic C helper | `harmonic_generator/rp_harmonic_ctl.c` |
-| Harmonic bitstream | `harmonic_generator/red_pitaya_top.bit.bin` |
+Assets are resolved relative to the script directory (`Path(__file__).resolve().parent`):
+`rp_ctl.c` and `red_pitaya_top.bit.bin`.
 
-### Standalone GUIs
+### Math helpers (`rp_math.py`)
 
-Both standalone GUIs use the same two-layer design as the combined GUI. Each resolves
-its C helper and bitstream via `Path(__file__).resolve().parent` — they must stay in
-the same folder as their respective assets.
-
-### Math helpers (shared across all GUIs)
+Pure, Qt-free functions shared by the GUI and covered by `tests/test_rp_math.py`:
 
 - `hz_to_phase(delta_hz)` / `phase_to_hz(word)` — convert between Hz and the signed
   48-bit NCO offset word.
-- `duty_to_cycles(frac, period)` — convert width fraction to clock cycles (pulse mode).
+- `duty_to_cycles(frac, period)` — width fraction → clock cycles (pulse mode).
 - `suggest_window(f_shift_hz)` — recommend one of the five reciprocal-counting windows.
+- `trig_hz_to_half_period(f_hz)` — DIO2 square-wave half-period in clock cycles.
+- formatting helpers (`fmt_freq`, `fmt_signed_freq`, `fmt_dur`).
 
-### FPGA register map (both modes share the same base)
+Hardware constants also live here: `CLK_HZ = 124_999_999` (measured, not nominal),
+`PHASE_BITS = 48`, `DEFAULT_BASE = 0x40600000`, `WINDOW_OPTIONS_US`/`WINDOW_NAMES`.
 
-Base address: `0x40600000`
+### FPGA register map
 
-| Offset | Pulse mode | Harmonic mode |
-|--------|-----------|---------------|
-| `0x00` | `control` (bit 0=enable, bit 1=soft reset) | same |
-| `0x08` | `width` (pulse cycles) | `mult_n` (harmonic order 1..5) |
-| `0x10` | `status` (busy/valid/stable/timeout/freerun) | same |
-| `0x14` | `raw_period` | same |
-| `0x18` | `period_avg` | same |
-| `0x1C/0x20` | `phase_step_offset` (signed 48-bit) | same |
-| `0x24/0x28` | `phase_step_base` (read-only) | same |
-| `0x2C/0x30` | `phase_step` (live, read-only) | same |
-| `0x34` | `meas_time_us` | same |
+Base address: `0x40600000`. Register `0x08` is shared: `width_n` in pulse mode,
+`mult_n` (1..5) in harmonic mode. Mode is selected by `control` bit 3 (`harmonic_mode`),
+which the C helper sets/clears based on its invocation name.
 
-The key difference: register `0x08` is `width` in pulse mode and `mult_n` in harmonic
-mode — this is how the GUIs detect which bitfile is loaded (JSON payload key).
+| Offset | Register | Notes |
+|--------|----------|-------|
+| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode |
+| `0x04` | `trig_half_period` | DIO2 square-wave half-period in clock cycles (0=off) |
+| `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
+| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
+| `0x14` | `raw_period` | last raw measured input period (cycles) |
+| `0x18` | `edge_cnt` | edge count from last measurement window |
+| `0x1C/0x20` | `phase_step_offset` | signed 48-bit NCO frequency offset |
+| `0x24/0x28` | `phase_step_base` | computed base step (read-only) |
+| `0x2C/0x30` | `phase_step` | live `[N·]base + offset` (read-only) |
+| `0x34` | `meas_time_us` | measurement window in µs (min 1000) |
 
-### Board-side helpers
+The authoritative `status` bit order is the rdata concatenation in
+`axi4lite_pulse_regs.sv` (the `4'd4` read case), **not** any prose comment.
 
-| Binary | Mode | Write signature |
-|--------|------|----------------|
+### Board-side helper (`rp_ctl.c`)
+
+One binary, two symlink names; mode detected from `argv[0]`:
+
+| Symlink | Mode | Write signature |
+|---------|------|----------------|
 | `/root/rp_pulse_ctl` | Pulse | `write <width_cycles> <phase_step_offset> <control>` |
 | `/root/rp_harmonic_ctl` | Harmonic | `write <mult_n> <phase_step_offset> <control>` |
 
-Both helpers print a single JSON object on stdout. The GUIs treat that payload as
-the source of truth. 48-bit NCO values are split across two AXI words; helpers write
-the high word first for atomic latching.
+Subcommands (both modes): `read`, `write`, `control <value>`, `window <us>`,
+`trig <half_period>`, `soft_reset`. Every subcommand prints one JSON object on stdout
+that the GUI treats as the source of truth. 48-bit NCO values are split across two AXI
+words; the helper writes the high word first for atomic latching.
 
 ## Development Guidance
 
 - Keep all SSH, SCP, and polling work off the Qt main thread.
 - Preserve the single-session, priority-queued backend model.
-- When updating the FPGA register map, reflect the change in all three places for the
-  relevant mode: the `.sv` file, the C helper, and the GUI parser/UI.
+- Keep pure conversion math in `rp_math.py` (Qt-free) so it stays unit-testable; add
+  a test in `tests/` when you touch the frequency/duty math.
+- When updating the FPGA register map, reflect the change in all three places: the
+  `.sv` file, `rp_ctl.c`, and the GUI parser/UI.
+- Treat the RTL rdata concatenation (not comments) as the authoritative bit order.
 - Keep helper JSON field names aligned with what the GUI parses.
 - Use non-interactive remote commands with explicit paths.
-- `red_pitaya_top.bit.bin` files exist in each subfolder and are uploaded by the GUIs,
-  but should not be treated as guaranteed source-controlled design provenance.
+- `red_pitaya_top.bit.bin` is uploaded by the GUI but is not guaranteed source-controlled
+  design provenance.
 
 ## What Not To Do
 
 - Do not move SSH/network work onto the Qt UI thread.
-- Do not merge pulse and harmonic register layouts — the `0x08` difference is intentional.
-- Do not add `width` logic to the harmonic mode or `mult_n` to the pulse mode.
-- Do not commit `__pycache__/`, `.DS_Store`, logs, or generated artifacts.
-- Do not document register semantics from stale code without checking the C helper
-  source and the RTL.
+- Do not let a single failed poll tear down the SSH session.
+- Do not duplicate the conversion math back into the GUI module.
+- Do not document register semantics from stale prose comments without checking the
+  RTL rdata concatenation and the C helper source.
+- Do not commit `__pycache__/`, `.DS_Store`, logs, compiled helpers, or generated artifacts.
