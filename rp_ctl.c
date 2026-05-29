@@ -134,7 +134,7 @@ static void print_json(volatile uint8_t *base) {
     const uint32_t mult_n            = (reg08 < 1u) ? 1u : (reg08 > 5u) ? 5u : reg08;
     const uint32_t trig_half_period  = rd32(base, REG_TRIG_HALF_PERIOD);
     const uint32_t status            = rd32(base, REG_STATUS);
-    const uint32_t period_stable     = (status >> 3) & 0x1u;
+    const uint32_t period_stable     = (status >> 2) & 0x1u;
     const uint32_t freerun_active    = (status >> 4) & 0x1u;
     const uint32_t meas_time_us      = rd32(base, REG_MEAS_TIME_US);
     const int64_t  step_offset       = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);

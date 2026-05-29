@@ -11,8 +11,9 @@
 //   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
 //                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
 //   0x0C RW  pulse_delay    (kept for address stability; unused)
-//   0x10 RO  status:   [0] busy, [1] period_valid, [2] timeout, [3] period_stable,
+//   0x10 RO  status:   [0] busy, [1] period_valid, [2] period_stable, [3] timeout,
 //                      [4] freerun_active
+//                      (bit order matches the rdata concat below: see 4'd4 read)
 //   0x14 RO  period_cycles   (edge count from last window, same as edge_cnt_out)
 //   0x18 RO  edge_cnt_out    (edge count from last window; f_in = CLK_HZ * (val/2) / window_cycles)
 //   0x1C RW  phase_step_offset_lo   bits [31:0]  of signed 48-bit NCO offset
