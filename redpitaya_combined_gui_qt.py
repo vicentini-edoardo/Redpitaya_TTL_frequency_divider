@@ -368,16 +368,20 @@ class SshBackend(QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour palette & style helpers
 # ─────────────────────────────────────────────────────────────────────────────
-_BG      = "#0d1117"
-_SURFACE = "#101722"
-_ACCENT  = "#00d4ff"
-_GREEN   = "#3fb950"
-_AMBER   = "#d29922"
-_RED     = "#f85149"
-_WHITE   = "#e6edf3"
-_TEXT    = "#e6edf3"
-_DIM     = "#8b949e"
-_BORDER  = "#263241"
+_BG       = "#0a0f16"
+_PANEL    = "#0f1722"
+_SURFACE  = "#131d2b"
+_SURFACE2 = "#182334"
+_FIELD    = "#09111c"
+_ACCENT   = "#62a8ff"
+_GREEN    = "#4fc17b"
+_AMBER    = "#e2aa4f"
+_RED      = "#f26d6d"
+_WHITE    = "#f2f6fb"
+_TEXT     = "#e7edf6"
+_DIM      = "#93a4ba"
+_MUTED    = "#6f8198"
+_BORDER   = "#2b3a4d"
 
 # Spacing scale (px) — used for consistent rhythm throughout
 _SP_XS  = 4
@@ -403,26 +407,45 @@ def _mono_font(size: int = 10, bold: bool = False) -> QFont:
 def _group_style() -> str:
     return f"""
         QGroupBox {{
-            color: {_ACCENT}; border: 1px solid {_BORDER};
-            border-radius: 10px; margin-top: 14px;
-            padding: 10px 12px 10px 12px;
-            font-family: {_MONO}; font-size: 10px; font-weight: bold;
+            background: {_PANEL};
+            color: {_DIM};
+            border: 1px solid {_BORDER};
+            border-radius: 10px;
+            margin-top: 15px;
+            padding: 12px 14px 12px 14px;
+            font-family: {_MONO};
+            font-size: 10px;
+            font-weight: bold;
         }}
-        QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 6px; }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 14px;
+            padding: 0 8px;
+            color: {_ACCENT};
+            background: {_BG};
+        }}
     """
 
 
 def _btn_style(color: str = _ACCENT) -> str:
     return f"""
         QPushButton {{
-            background: #111923; color: {color};
-            border: 1px solid {color}; border-radius: 7px;
+            background: {_SURFACE2};
+            color: {color};
+            border: 1px solid {color};
+            border-radius: 7px;
             padding: 7px 14px;
-            font-family: {_MONO}; font-size: 10px;
+            font-family: {_MONO};
+            font-size: 10px;
+            font-weight: 600;
         }}
-        QPushButton:hover   {{ background: #182536; }}
-        QPushButton:pressed {{ background: #0b1622; }}
-        QPushButton:disabled {{ color: {_DIM}; border-color: {_BORDER}; }}
+        QPushButton:hover   {{ background: {_PANEL}; }}
+        QPushButton:pressed {{ background: {_FIELD}; }}
+        QPushButton:disabled {{
+            background: {_FIELD};
+            color: {_MUTED};
+            border-color: {_BORDER};
+        }}
     """
 
 
@@ -431,50 +454,95 @@ def _mode_btn_style(color: str, active: bool) -> str:
     if active:
         return f"""
             QPushButton {{
-                background: {color}28; color: {color};
-                border: 2px solid {color}; border-radius: 6px;
-                padding: 4px 14px;
-                font-family: {_MONO}; font-size: 10px; font-weight: bold;
+                background: {color}24;
+                color: {color};
+                border: 1px solid {color};
+                border-radius: 7px;
+                padding: 6px 14px;
+                font-family: {_MONO};
+                font-size: 10px;
+                font-weight: bold;
             }}
-            QPushButton:hover {{ background: {color}40; }}
+            QPushButton:hover {{ background: {color}32; }}
         """
     return f"""
         QPushButton {{
-            background: #111923; color: {_DIM};
-            border: 1px solid {_BORDER}; border-radius: 6px;
-            padding: 4px 14px;
-            font-family: {_MONO}; font-size: 10px;
+            background: {_FIELD};
+            color: {_DIM};
+            border: 1px solid {_BORDER};
+            border-radius: 7px;
+            padding: 6px 14px;
+            font-family: {_MONO};
+            font-size: 10px;
         }}
-        QPushButton:hover {{ background: #182536; color: {color}; border-color: {color}; }}
+        QPushButton:hover {{ background: {_SURFACE}; color: {color}; border-color: {color}; }}
     """
 
 
 def _le_style() -> str:
     return f"""
         QLineEdit {{
-            background: {_BG}; color: {_TEXT};
-            border: 1px solid {_BORDER}; border-radius: 4px;
-            padding: 3px 6px; font-family: {_MONO}; font-size: 10px;
+            background: {_FIELD};
+            color: {_TEXT};
+            border: 1px solid {_BORDER};
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-family: {_MONO};
+            font-size: 10px;
         }}
         QLineEdit:focus {{ border-color: {_ACCENT}; }}
+        QLineEdit:disabled {{ color: {_MUTED}; }}
     """
 
 
 def _spin_style() -> str:
     return f"""
         QDoubleSpinBox, QSpinBox, QComboBox {{
-            background: #0b111a; color: {_TEXT};
-            border: 1px solid {_BORDER}; border-radius: 7px;
-            padding: 5px 8px; font-family: {_MONO}; font-size: 10px;
+            background: {_FIELD};
+            color: {_TEXT};
+            border: 1px solid {_BORDER};
+            border-radius: 7px;
+            padding: 5px 8px;
+            font-family: {_MONO};
+            font-size: 10px;
         }}
         QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{ border-color: {_ACCENT}; }}
+        QDoubleSpinBox:disabled, QSpinBox:disabled, QComboBox:disabled {{
+            color: {_MUTED};
+            background: #07101a;
+        }}
         QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,
         QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; }}
         QComboBox::drop-down {{ width: 22px; border: none; }}
         QComboBox QAbstractItemView {{
-            background: #0b111a; color: {_TEXT};
-            selection-background-color: #182536;
+            background: {_FIELD};
+            color: {_TEXT};
+            selection-background-color: {_SURFACE2};
             border: 1px solid {_BORDER};
+        }}
+    """
+
+
+def _checkbox_style() -> str:
+    return f"""
+        QCheckBox {{
+            color: {_TEXT};
+            background: transparent;
+            spacing: 8px;
+            font-family: {_MONO};
+            font-size: 10px;
+        }}
+        QCheckBox:disabled {{ color: {_MUTED}; }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+            border: 1px solid {_BORDER};
+            border-radius: 3px;
+            background: {_FIELD};
+        }}
+        QCheckBox::indicator:checked {{
+            background: {_ACCENT};
+            border-color: {_ACCENT};
         }}
     """
 
@@ -502,38 +570,40 @@ class BigDisplay(QFrame):
                  accent: str = _ACCENT, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._accent = accent
+        self.setObjectName(f"readout{title.replace(' ', '')}")
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(f"""
             QFrame {{
-                background: {_SURFACE}; border: 1px solid {_BORDER}; border-radius: 14px;
+                background: {_SURFACE};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
             }}
         """)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 12, 20, 14)
-        lay.setSpacing(4)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(6)
 
-        title_lbl = QLabel(title.upper())
-        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl = QLabel(title)
+        title_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         title_lbl.setFont(_mono_font(9, bold=True))
-        title_lbl.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
+        title_lbl.setStyleSheet(
+            f"color: {_DIM}; background: transparent; border: none;"
+        )
         lay.addWidget(title_lbl)
 
-        rule = QLabel()
-        rule.setFixedHeight(1)
-        rule.setStyleSheet(f"background: {accent}50; border: none; border-radius: 0;")
-        lay.addWidget(rule)
-
         self._val = QLabel("---")
-        self._val.setAlignment(Qt.AlignCenter)
-        self._val.setFont(_mono_font(26, bold=True))
+        self._val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._val.setFont(_mono_font(25, bold=True))
         self._val.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay.addWidget(self._val, 1)
 
         self._sub = QLabel(sub_hint)
-        self._sub.setAlignment(Qt.AlignCenter)
-        self._sub.setFont(_mono_font(10))
-        self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
+        self._sub.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._sub.setFont(_mono_font(9))
+        self._sub.setStyleSheet(
+            f"color: {_MUTED}; background: transparent; border: none;"
+        )
         lay.addWidget(self._sub)
 
     def set_data(self, value: str, sub: str = "", color: Optional[str] = None):
@@ -640,8 +710,8 @@ class _NcoPanel(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, _SP_SM, 0, 0)
-        root.setSpacing(_SP_MD)
+        root.setContentsMargins(_SP_SM, _SP_MD, _SP_SM, _SP_SM)
+        root.setSpacing(_SP_LG)
 
         # Monitors 2×2 — left column shared, right column mode-specific
         self._d_in  = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
@@ -652,7 +722,11 @@ class _NcoPanel(QWidget):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             d.setMinimumHeight(80)
 
-        grid = QGridLayout()
+        readouts = QFrame()
+        readouts.setObjectName("rpReadoutGrid")
+        readouts.setStyleSheet("QFrame#rpReadoutGrid { background: transparent; border: none; }")
+        grid = QGridLayout(readouts)
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(_SP_MD)
         grid.addWidget(self._d_in,  0, 0)
         grid.addWidget(self._d_tr,  0, 1)
@@ -661,16 +735,18 @@ class _NcoPanel(QWidget):
         for i in range(2):
             grid.setRowStretch(i, 1)
             grid.setColumnStretch(i, 1)
-        root.addLayout(grid, 1)
+        root.addWidget(readouts, 1)
 
         # Controls group
         controls = _make_group("Controls")
+        controls.setObjectName("rpControlDeck")
+        controls.setMinimumHeight(235)
         cl = QHBoxLayout(controls)
-        cl.setContentsMargins(_SP_LG, 10, _SP_LG, _SP_MD)
+        cl.setContentsMargins(_SP_LG, 12, _SP_LG, _SP_LG)
         cl.setSpacing(_SP_LG)
 
         left_col = QVBoxLayout()
-        left_col.setSpacing(8)
+        left_col.setSpacing(_SP_MD)
 
         # ── Output mode bar ───────────────────────────────────────────────────
         mode_row = QHBoxLayout()
@@ -679,11 +755,11 @@ class _NcoPanel(QWidget):
         mode_lbl.setFont(_mono_font(10, bold=True))
         mode_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
         mode_row.addWidget(mode_lbl)
-        self._btn_off = QPushButton("■  LASER OFF")
-        self._btn_mod = QPushButton("~  MODULATED")
-        self._btn_on  = QPushButton("●  LASER ON")
+        self._btn_off = QPushButton("Laser off")
+        self._btn_mod = QPushButton("Modulated")
+        self._btn_on  = QPushButton("Laser on")
         for btn in (self._btn_off, self._btn_mod, self._btn_on):
-            btn.setFixedHeight(30)
+            btn.setFixedHeight(34)
             btn.setFont(_mono_font(10))
             mode_row.addWidget(btn)
         mode_row.addStretch()
@@ -699,7 +775,11 @@ class _NcoPanel(QWidget):
 
         fields = QGridLayout()
         fields.setHorizontalSpacing(12)
-        fields.setVerticalSpacing(8)
+        fields.setVerticalSpacing(14)
+        fields.setRowMinimumHeight(0, 44)
+        fields.setRowMinimumHeight(1, 44)
+        fields.setRowMinimumHeight(2, 30)
+        fields.setRowMinimumHeight(3, 42)
 
         # Row 0: freq shift (shared) + mode-specific secondary field
         fields.addWidget(_dim_label("Freq shift:"), 0, 0)
@@ -709,7 +789,7 @@ class _NcoPanel(QWidget):
         self._sp_offset.setSingleStep(1.0)
         self._sp_offset.setSuffix(" Hz")
         self._sp_offset.setFixedHeight(34)
-        self._sp_offset.setMinimumWidth(200)
+        self._sp_offset.setMinimumWidth(210)
         self._sp_offset.setFont(_mono_font(12, bold=True))
         self._sp_offset.setStyleSheet(_spin_style())
         self._sp_offset.valueChanged.connect(self._param_changed)
@@ -738,7 +818,7 @@ class _NcoPanel(QWidget):
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
         self._cb_auto.setFont(_mono_font(10))
-        self._cb_auto.setStyleSheet(f"color: {_TEXT}; background: transparent;")
+        self._cb_auto.setStyleSheet(_checkbox_style())
         auto_row.addWidget(self._cb_auto)
         auto_row.addStretch()
         fields.addLayout(auto_row, 2, 0, 1, 4)
@@ -747,7 +827,7 @@ class _NcoPanel(QWidget):
         self._lbl_shift = QLabel()
         self._lbl_shift.setFont(_mono_font(9))
         self._lbl_shift.setWordWrap(True)
-        self._lbl_shift.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        self._lbl_shift.setStyleSheet(f"color: {_MUTED}; background: transparent;")
         fields.addWidget(self._lbl_shift, 3, 0, 1, 4)
         fields.setColumnStretch(1, 1)
 
@@ -758,8 +838,8 @@ class _NcoPanel(QWidget):
         actions = QVBoxLayout()
         actions.setSpacing(8)
 
-        self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
-        self._btn_apply.setFixedWidth(200)
+        self._btn_apply = QPushButton("Apply now\nCtrl+Return")
+        self._btn_apply.setFixedWidth(190)
         self._btn_apply.setMinimumHeight(60)
         self._btn_apply.setFont(_mono_font(12, bold=True))
         self._btn_apply.setStyleSheet(_btn_style(_GREEN))
@@ -767,16 +847,16 @@ class _NcoPanel(QWidget):
         self._btn_apply.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         actions.addWidget(self._btn_apply)
 
-        self._btn_reset = QPushButton("Soft Reset")
-        self._btn_reset.setFixedWidth(200)
-        self._btn_reset.setFixedHeight(30)
+        self._btn_reset = QPushButton("Soft reset")
+        self._btn_reset.setFixedWidth(190)
+        self._btn_reset.setFixedHeight(34)
         self._btn_reset.setStyleSheet(_btn_style(_AMBER))
         self._btn_reset.clicked.connect(self._do_soft_reset)
         actions.addWidget(self._btn_reset)
 
-        self._btn_upload = QPushButton(f"Upload && Compile\n({self._tag} mode)")
-        self._btn_upload.setFixedWidth(200)
-        self._btn_upload.setFixedHeight(40)
+        self._btn_upload = QPushButton(f"Upload && compile\n{self._tag} mode")
+        self._btn_upload.setFixedWidth(190)
+        self._btn_upload.setFixedHeight(44)
         self._btn_upload.setStyleSheet(_btn_style(_ACCENT))
         self._btn_upload.clicked.connect(self._do_upload)
         actions.addWidget(self._btn_upload)
@@ -1119,8 +1199,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Red Pitaya — Combined Control")
-        self.setMinimumSize(1000, 800)
+        self.setObjectName("rpDarkWorkbench")
+        self.setWindowTitle("Red Pitaya TTL Frequency Control")
+        self.setMinimumSize(1040, 900)
 
         self._be = SshBackend(self)
         self._be.sig_connected.connect(self._on_connected)
@@ -1137,7 +1218,18 @@ class MainWindow(QMainWindow):
         self._be.sig_status.connect(self._adapt_poll_interval)
 
         self._build_ui()
-        self.setStyleSheet(f"QMainWindow, QWidget {{ background: {_BG}; color: {_TEXT}; }}")
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background: {_BG};
+                color: {_TEXT};
+            }}
+            QToolTip {{
+                background: {_SURFACE};
+                color: {_TEXT};
+                border: 1px solid {_BORDER};
+                padding: 4px 6px;
+            }}
+        """)
 
         act = QAction(self)
         act.setShortcut(QKeySequence("Ctrl+Return"))
@@ -1150,27 +1242,37 @@ class MainWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
-        root.setContentsMargins(_SP_XL, 10, _SP_XL, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(_SP_XL, _SP_LG, _SP_XL, _SP_LG)
+        root.setSpacing(_SP_MD)
 
         root.addWidget(self._build_connection())
 
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(f"""
             QTabWidget::pane {{
-                border: 1px solid {_BORDER}; border-radius: 8px;
-                background: {_BG};
-                padding: 4px;
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+                background: {_PANEL};
+                padding: 6px;
             }}
             QTabBar::tab {{
-                background: #111923; color: {_DIM};
-                border: 1px solid {_BORDER}; border-bottom: none;
-                border-radius: 6px 6px 0 0;
-                padding: 8px 24px;
-                font-family: {_MONO}; font-size: 11px;
+                background: {_FIELD};
+                color: {_DIM};
+                border: 1px solid {_BORDER};
+                border-bottom: none;
+                border-radius: 8px 8px 0 0;
+                padding: 9px 24px;
+                font-family: {_MONO};
+                font-size: 11px;
+                font-weight: 600;
             }}
-            QTabBar::tab:selected {{ background: #182536; color: {_TEXT}; border-bottom: 1px solid {_BG}; }}
-            QTabBar::tab:hover    {{ background: #14202e; color: {_TEXT}; }}
+            QTabBar::tab:selected {{
+                background: {_SURFACE};
+                color: {_TEXT};
+                border-color: {_ACCENT};
+                border-bottom: 1px solid {_SURFACE};
+            }}
+            QTabBar::tab:hover {{ background: {_SURFACE2}; color: {_TEXT}; }}
         """)
 
         self._pulse_panel    = PulsePanel(self._be, self._log)
@@ -1181,8 +1283,15 @@ class MainWindow(QMainWindow):
         self._tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self._tabs, 1)
 
-        root.addWidget(self._build_trigger())
-        root.addWidget(self._build_log())
+        shared = QWidget()
+        shared.setObjectName("rpSharedTools")
+        shared.setStyleSheet("QWidget#rpSharedTools { background: transparent; }")
+        shared_lay = QVBoxLayout(shared)
+        shared_lay.setContentsMargins(0, 0, 0, 0)
+        shared_lay.setSpacing(_SP_MD)
+        shared_lay.addWidget(self._build_trigger())
+        shared_lay.addWidget(self._build_log())
+        root.addWidget(shared)
 
     def _do_git_update(self):
         self._btn_update.setEnabled(False)
@@ -1215,29 +1324,91 @@ class MainWindow(QMainWindow):
         self._log(f"[Update] {msg}")
 
     def _build_connection(self) -> QGroupBox:
-        g = _make_group("Connection")
-        row = QHBoxLayout(g)
-        row.setSpacing(10)
+        g = QFrame()
+        g.setObjectName("rpWorkbenchHeader")
+        g.setStyleSheet(f"""
+            QFrame#rpWorkbenchHeader {{
+                background: {_PANEL};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+            }}
+        """)
+        outer = QVBoxLayout(g)
+        outer.setContentsMargins(_SP_LG, _SP_MD, _SP_LG, _SP_MD)
+        outer.setSpacing(_SP_SM)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(_SP_MD)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+
+        title = QLabel("Red Pitaya TTL")
+        title.setObjectName("rpWorkbenchTitle")
+        title.setFont(QFont("Arial", 15, QFont.Bold))
+        title.setStyleSheet(f"color: {_WHITE}; background: transparent;")
+        title_col.addWidget(title)
+
+        subtitle = QLabel("FPGA pulse and harmonic generator")
+        subtitle.setFont(_mono_font(9))
+        subtitle.setStyleSheet(f"color: {_MUTED}; background: transparent;")
+        title_col.addWidget(subtitle)
+        top_row.addLayout(title_col)
+        top_row.addStretch()
+
+        self._lbl_status = QLabel("Disconnected")
+        self._lbl_status.setFont(_mono_font(10))
+        self._lbl_status.setStyleSheet(
+            f"color: {_RED}; background: {_RED}18; border: 1px solid {_RED}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
+        top_row.addWidget(self._lbl_status)
+
+        self._lbl_mode = QLabel("mode: -")
+        self._lbl_mode.setFont(_mono_font(9))
+        self._lbl_mode.setStyleSheet(
+            f"color: {_DIM}; background: {_FIELD}; border: 1px solid {_BORDER}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
+        top_row.addWidget(self._lbl_mode)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.VLine)
+        sep2.setStyleSheet(f"color: {_BORDER};")
+        top_row.addWidget(sep2)
+
+        self._btn_update = QPushButton("Update")
+        self._btn_update.setFixedHeight(30)
+        self._btn_update.setStyleSheet(_btn_style(_DIM))
+        self._btn_update.clicked.connect(self._do_git_update)
+        top_row.addWidget(self._btn_update)
+
+        self._lbl_update_status = QLabel()
+        self._lbl_update_status.setFont(_mono_font(9))
+        self._lbl_update_status.setStyleSheet(f"color: {_DIM}; background: transparent;")
+        top_row.addWidget(self._lbl_update_status)
+        outer.addLayout(top_row)
+
+        row = QHBoxLayout()
+        row.setSpacing(_SP_MD)
+
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.HLine)
+        sep1.setStyleSheet(f"color: {_BORDER};")
+        outer.addWidget(sep1)
 
         self._w_host = QLineEdit("rp-f06a51.local")
+        self._w_host.setFixedWidth(170)
         self._w_port = QLineEdit("22");    self._w_port.setFixedWidth(55)
         self._w_user = QLineEdit("root");  self._w_user.setFixedWidth(70)
         self._w_key  = QLineEdit();        self._w_key.setPlaceholderText("SSH key (optional)")
+        self._w_key.setMinimumWidth(190)
 
         btn_key = QPushButton("…"); btn_key.setFixedWidth(28)
         btn_key.clicked.connect(self._pick_key)
 
         self._btn_conn = QPushButton("Connect")
-        self._btn_conn.setFixedWidth(95)
+        self._btn_conn.setFixedWidth(104)
         self._btn_conn.clicked.connect(self._toggle_connect)
-
-        self._lbl_status = QLabel("●  Disconnected")
-        self._lbl_status.setFont(_mono_font(10))
-        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
-
-        self._lbl_mode = QLabel("mode: —")
-        self._lbl_mode.setFont(_mono_font(9))
-        self._lbl_mode.setStyleSheet(f"color: {_DIM}; background: transparent;")
 
         for w, lbl in ((self._w_host, "Host:"), (self._w_port, "Port:"),
                        (self._w_user, "User:"), (self._w_key, "Key:")):
@@ -1249,25 +1420,8 @@ class MainWindow(QMainWindow):
 
         row.addWidget(btn_key)
         row.addWidget(self._btn_conn)
-        row.addWidget(self._lbl_status)
-        row.addWidget(self._lbl_mode)
         row.addStretch()
-
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.VLine)
-        sep2.setStyleSheet(f"color: {_BORDER};")
-        row.addWidget(sep2)
-
-        self._btn_update = QPushButton("git pull")
-        self._btn_update.setFixedHeight(26)
-        self._btn_update.setStyleSheet(_btn_style(_DIM))
-        self._btn_update.clicked.connect(self._do_git_update)
-        row.addWidget(self._btn_update)
-
-        self._lbl_update_status = QLabel()
-        self._lbl_update_status.setFont(_mono_font(9))
-        self._lbl_update_status.setStyleSheet(f"color: {_DIM}; background: transparent;")
-        row.addWidget(self._lbl_update_status)
+        outer.addLayout(row)
 
         self.sig_update_done.connect(self._on_update_done)
 
@@ -1281,7 +1435,7 @@ class MainWindow(QMainWindow):
         """DIO2 free-running square wave — independent of NCO mode."""
         g = _make_group("DIO2 Trigger Output  (independent free-running square wave)")
         row = QHBoxLayout(g)
-        row.setContentsMargins(_SP_MD, 6, _SP_MD, 6)
+        row.setContentsMargins(_SP_LG, _SP_SM, _SP_LG, _SP_MD)
         row.setSpacing(_SP_MD)
 
         lbl = QLabel("Frequency:")
@@ -1303,7 +1457,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self._sp_trig)
 
         self._btn_trig_apply = QPushButton("Set")
-        self._btn_trig_apply.setFixedWidth(60)
+        self._btn_trig_apply.setFixedWidth(68)
         self._btn_trig_apply.setFixedHeight(30)
         self._btn_trig_apply.setStyleSheet(_btn_style(_GREEN))
         self._btn_trig_apply.setEnabled(False)
@@ -1360,7 +1514,7 @@ class MainWindow(QMainWindow):
         self._log_box.setMaximumHeight(88)
         self._log_box.setFont(_mono_font(9))
         self._log_box.setStyleSheet(
-            f"background: #090e15; color: {_DIM}; border: none; border-radius: 6px;"
+            f"background: {_FIELD}; color: {_DIM}; border: 1px solid {_BORDER}; border-radius: 7px;"
         )
         lay.addWidget(self._log_box)
         return g
@@ -1386,16 +1540,22 @@ class MainWindow(QMainWindow):
             user = self._w_user.text().strip() or "root"
             key  = self._w_key.text().strip() or None
             self._btn_conn.setEnabled(False)
-            self._lbl_status.setText("●  Connecting …")
-            self._lbl_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
+            self._lbl_status.setText("Connecting")
+            self._lbl_status.setStyleSheet(
+                f"color: {_ACCENT}; background: {_ACCENT}18; border: 1px solid {_ACCENT}; "
+                "border-radius: 999px; padding: 4px 10px;"
+            )
             self._be.start_connect(host, port, user, key, DEFAULT_BASE)
 
     @Slot()
     def _on_connected(self):
         self._btn_conn.setText("Disconnect")
         self._btn_conn.setEnabled(True)
-        self._lbl_status.setText("●  Connected")
-        self._lbl_status.setStyleSheet(f"color: {_GREEN}; background: transparent;")
+        self._lbl_status.setText("Connected")
+        self._lbl_status.setStyleSheet(
+            f"color: {_GREEN}; background: {_GREEN}18; border: 1px solid {_GREEN}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
         self._poll.start()
         self._be.poll()
         self._log("Connected.")
@@ -1405,16 +1565,22 @@ class MainWindow(QMainWindow):
         self._poll.stop()
         self._btn_conn.setText("Connect")
         self._btn_conn.setEnabled(True)
-        self._lbl_status.setText("●  Disconnected")
-        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
-        self._lbl_mode.setText("mode: —")
+        self._lbl_status.setText("Disconnected")
+        self._lbl_status.setStyleSheet(
+            f"color: {_RED}; background: {_RED}18; border: 1px solid {_RED}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
+        self._lbl_mode.setText("mode: -")
         self._log(f"Disconnected: {reason}")
 
     @Slot(str)
     def _on_mode_changed(self, mode: str):
         self._lbl_mode.setText(f"mode: {mode}")
         color = _ACCENT if mode == "pulse" else _GREEN
-        self._lbl_mode.setStyleSheet(f"color: {color}; background: transparent;")
+        self._lbl_mode.setStyleSheet(
+            f"color: {color}; background: {color}18; border: 1px solid {color}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
 
     @Slot(int)
     def _on_tab_changed(self, idx: int):
@@ -1448,8 +1614,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_error(self, msg: str):
-        self._lbl_status.setText("●  Error")
-        self._lbl_status.setStyleSheet(f"color: {_RED}; background: transparent;")
+        self._lbl_status.setText("Error")
+        self._lbl_status.setStyleSheet(
+            f"color: {_RED}; background: {_RED}18; border: 1px solid {_RED}; "
+            "border-radius: 999px; padding: 4px 10px;"
+        )
         self._log(f"ERROR  {msg}")
 
     @Slot(str)
