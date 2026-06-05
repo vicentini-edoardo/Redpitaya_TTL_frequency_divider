@@ -367,15 +367,24 @@ class SshBackend(QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour palette & style helpers
 # ─────────────────────────────────────────────────────────────────────────────
-_BG     = "#0d1117"
-_ACCENT = "#00d4ff"
-_GREEN  = "#3fb950"
-_AMBER  = "#d29922"
-_RED    = "#f85149"
-_WHITE  = "#e6edf3"
-_TEXT   = "#e6edf3"
-_DIM    = "#8b949e"
-_BORDER = "#263241"
+_BG      = "#0d1117"
+_SURFACE = "#101722"
+_ACCENT  = "#00d4ff"
+_GREEN   = "#3fb950"
+_AMBER   = "#d29922"
+_RED     = "#f85149"
+_WHITE   = "#e6edf3"
+_TEXT    = "#e6edf3"
+_DIM     = "#8b949e"
+_BORDER  = "#263241"
+
+# Spacing scale (px) — used for consistent rhythm throughout
+_SP_XS  = 4
+_SP_SM  = 8
+_SP_MD  = 12
+_SP_LG  = 16
+_SP_XL  = 20
+_SP_2XL = 28
 _MONO   = "Menlo, Consolas, 'Courier New', monospace"
 
 
@@ -394,11 +403,11 @@ def _group_style() -> str:
     return f"""
         QGroupBox {{
             color: {_ACCENT}; border: 1px solid {_BORDER};
-            border-radius: 10px; margin-top: 16px;
-            padding: 14px 12px 12px 12px;
+            border-radius: 10px; margin-top: 18px;
+            padding: 16px 14px 14px 14px;
             font-family: {_MONO}; font-size: 10px; font-weight: bold;
         }}
-        QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 6px; }}
+        QGroupBox::title {{ subcontrol-origin: margin; left: 16px; padding: 0 6px; }}
     """
 
 
@@ -407,7 +416,7 @@ def _btn_style(color: str = _ACCENT) -> str:
         QPushButton {{
             background: #111923; color: {color};
             border: 1px solid {color}; border-radius: 7px;
-            padding: 6px 12px;
+            padding: 7px 14px;
             font-family: {_MONO}; font-size: 10px;
         }}
         QPushButton:hover   {{ background: #182536; }}
@@ -423,17 +432,17 @@ def _mode_btn_style(color: str, active: bool) -> str:
             QPushButton {{
                 background: {color}28; color: {color};
                 border: 2px solid {color}; border-radius: 7px;
-                padding: 5px 14px;
-                font-family: {_MONO}; font-size: 10px; font-weight: bold;
+                padding: 7px 18px;
+                font-family: {_MONO}; font-size: 11px; font-weight: bold;
             }}
-            QPushButton:hover {{ background: {color}38; }}
+            QPushButton:hover {{ background: {color}40; }}
         """
     return f"""
         QPushButton {{
             background: #111923; color: {_DIM};
             border: 1px solid {_BORDER}; border-radius: 7px;
-            padding: 5px 14px;
-            font-family: {_MONO}; font-size: 10px;
+            padding: 7px 18px;
+            font-family: {_MONO}; font-size: 11px;
         }}
         QPushButton:hover {{ background: #182536; color: {color}; border-color: {color}; }}
     """
@@ -477,7 +486,7 @@ def _make_group(title: str) -> QGroupBox:
     return g
 
 
-def _dim_label(text: str, width: int = 90) -> QLabel:
+def _dim_label(text: str, width: int = 104) -> QLabel:
     lbl = QLabel(text)
     lbl.setFixedWidth(width)
     lbl.setFont(_mono_font(10))
@@ -495,12 +504,12 @@ class BigDisplay(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(f"""
             QFrame {{
-                background: #101722; border: 1px solid {_BORDER}; border-radius: 14px;
+                background: {_SURFACE}; border: 1px solid {_BORDER}; border-radius: 14px;
             }}
         """)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 18, 20, 18)
-        lay.setSpacing(8)
+        lay.setContentsMargins(24, 16, 24, 20)
+        lay.setSpacing(4)
 
         title_lbl = QLabel(title.upper())
         title_lbl.setAlignment(Qt.AlignCenter)
@@ -508,23 +517,33 @@ class BigDisplay(QFrame):
         title_lbl.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(title_lbl)
 
+        rule = QLabel()
+        rule.setFixedHeight(1)
+        rule.setStyleSheet(f"background: {accent}50; border: none; border-radius: 0;")
+        lay.addWidget(rule)
+
+        lay.addSpacing(_SP_XS)
+
         self._val = QLabel("---")
         self._val.setAlignment(Qt.AlignCenter)
         self._val.setFont(_mono_font(32, bold=True))
-        self._val.setStyleSheet(f"color: {accent}; background: transparent; border: none;")
+        self._val.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         lay.addWidget(self._val, 1)
 
+        lay.addSpacing(_SP_XS)
+
         self._sub = QLabel(sub_hint)
         self._sub.setAlignment(Qt.AlignCenter)
-        self._sub.setFont(_mono_font(10))
+        self._sub.setFont(_mono_font(11))
         self._sub.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         lay.addWidget(self._sub)
 
     def set_data(self, value: str, sub: str = "", color: Optional[str] = None):
         self._val.setText(value)
+        resolved = color or (self._accent if value != "---" else _DIM)
         self._val.setStyleSheet(
-            f"color: {color or self._accent}; background: transparent; border: none;"
+            f"color: {resolved}; background: transparent; border: none;"
         )
         if sub is not None:
             self._sub.setText(sub)
@@ -628,8 +647,8 @@ class _NcoPanel(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 4, 0, 0)
-        root.setSpacing(10)
+        root.setContentsMargins(0, _SP_SM, 0, 0)
+        root.setSpacing(_SP_MD)
 
         # Mode mismatch warning (shown when the active helper != this panel's mode)
         self._lbl_warn = QLabel()
@@ -637,7 +656,7 @@ class _NcoPanel(QWidget):
         self._lbl_warn.setAlignment(Qt.AlignCenter)
         self._lbl_warn.setStyleSheet(
             f"background: #2a1500; color: {_AMBER}; "
-            f"border: 1px solid {_AMBER}; border-radius: 6px; padding: 4px;"
+            f"border: 1px solid {_AMBER}; border-radius: 6px; padding: 6px 8px;"
         )
         if self._be.mode != self.MODE:
             self._lbl_warn.setText(self._warn_text(self._be.mode))
@@ -653,10 +672,10 @@ class _NcoPanel(QWidget):
 
         for d in (self._d_in, self._d_tr, self._d_out, self._d_br):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            d.setMinimumHeight(140)
+            d.setMinimumHeight(155)
 
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(_SP_MD)
         grid.addWidget(self._d_in,  0, 0)
         grid.addWidget(self._d_tr,  0, 1)
         grid.addWidget(self._d_out, 1, 0)
@@ -669,15 +688,15 @@ class _NcoPanel(QWidget):
         # Controls group
         controls = _make_group("Controls")
         cl = QHBoxLayout(controls)
-        cl.setContentsMargins(12, 12, 12, 12)
-        cl.setSpacing(18)
+        cl.setContentsMargins(_SP_LG, 14, _SP_LG, _SP_LG)
+        cl.setSpacing(_SP_XL)
 
         left_col = QVBoxLayout()
-        left_col.setSpacing(10)
+        left_col.setSpacing(14)
 
         # ── Output mode bar ───────────────────────────────────────────────────
         mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
+        mode_row.setSpacing(_SP_MD)
         mode_lbl = QLabel("Output mode:")
         mode_lbl.setFont(_mono_font(10, bold=True))
         mode_lbl.setStyleSheet(f"color: {_DIM}; background: transparent;")
@@ -686,8 +705,8 @@ class _NcoPanel(QWidget):
         self._btn_mod = QPushButton("~  MODULATED")
         self._btn_on  = QPushButton("●  LASER ON")
         for btn in (self._btn_off, self._btn_mod, self._btn_on):
-            btn.setFixedHeight(32)
-            btn.setFont(_mono_font(10))
+            btn.setFixedHeight(38)
+            btn.setFont(_mono_font(11))
             mode_row.addWidget(btn)
         mode_row.addStretch()
         self._btn_off.clicked.connect(lambda: self._set_output_mode("off"))
@@ -701,8 +720,8 @@ class _NcoPanel(QWidget):
         left_col.addWidget(sep)
 
         fields = QGridLayout()
-        fields.setHorizontalSpacing(10)
-        fields.setVerticalSpacing(8)
+        fields.setHorizontalSpacing(14)
+        fields.setVerticalSpacing(14)
 
         # Row 0: freq shift (shared) + mode-specific secondary field
         fields.addWidget(_dim_label("Freq shift:"), 0, 0)
@@ -759,26 +778,26 @@ class _NcoPanel(QWidget):
 
         # Action column
         actions = QVBoxLayout()
-        actions.setSpacing(8)
+        actions.setSpacing(10)
 
         self._btn_apply = QPushButton("Apply Now\nCtrl+↵")
-        self._btn_apply.setFixedWidth(210)
-        self._btn_apply.setFixedHeight(82)
+        self._btn_apply.setFixedWidth(220)
+        self._btn_apply.setFixedHeight(86)
         self._btn_apply.setFont(_mono_font(13, bold=True))
         self._btn_apply.setStyleSheet(_btn_style(_GREEN))
         self._btn_apply.clicked.connect(self._do_apply)
         actions.addWidget(self._btn_apply)
 
         self._btn_reset = QPushButton("Soft Reset")
-        self._btn_reset.setFixedWidth(210)
-        self._btn_reset.setFixedHeight(32)
+        self._btn_reset.setFixedWidth(220)
+        self._btn_reset.setFixedHeight(38)
         self._btn_reset.setStyleSheet(_btn_style(_AMBER))
         self._btn_reset.clicked.connect(self._do_soft_reset)
         actions.addWidget(self._btn_reset)
 
         self._btn_upload = QPushButton(f"Upload && Compile\n({self._tag} mode)")
-        self._btn_upload.setFixedWidth(210)
-        self._btn_upload.setFixedHeight(44)
+        self._btn_upload.setFixedWidth(220)
+        self._btn_upload.setFixedHeight(50)
         self._btn_upload.setStyleSheet(_btn_style(_ACCENT))
         self._btn_upload.clicked.connect(self._do_upload)
         actions.addWidget(self._btn_upload)
@@ -1155,7 +1174,7 @@ class MainWindow(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
-        root.setContentsMargins(16, 16, 16, 12)
+        root.setContentsMargins(_SP_XL, 14, _SP_XL, 14)
         root.setSpacing(10)
 
         root.addWidget(self._build_connection())
@@ -1165,16 +1184,17 @@ class MainWindow(QMainWindow):
             QTabWidget::pane {{
                 border: 1px solid {_BORDER}; border-radius: 8px;
                 background: {_BG};
+                padding: 8px;
             }}
             QTabBar::tab {{
                 background: #111923; color: {_DIM};
                 border: 1px solid {_BORDER}; border-bottom: none;
                 border-radius: 6px 6px 0 0;
-                padding: 6px 20px;
-                font-family: {_MONO}; font-size: 10px;
+                padding: 8px 24px;
+                font-family: {_MONO}; font-size: 11px;
             }}
-            QTabBar::tab:selected {{ background: #182536; color: {_TEXT}; }}
-            QTabBar::tab:hover    {{ background: #14202e; }}
+            QTabBar::tab:selected {{ background: #182536; color: {_TEXT}; border-bottom: 1px solid {_BG}; }}
+            QTabBar::tab:hover    {{ background: #14202e; color: {_TEXT}; }}
         """)
 
         self._pulse_panel    = PulsePanel(self._be, self._log)
@@ -1191,7 +1211,7 @@ class MainWindow(QMainWindow):
     def _build_connection(self) -> QGroupBox:
         g = _make_group("Connection")
         row = QHBoxLayout(g)
-        row.setSpacing(6)
+        row.setSpacing(10)
 
         self._w_host = QLineEdit("rp-f06a51.local")
         self._w_port = QLineEdit("22");    self._w_port.setFixedWidth(55)
@@ -1237,8 +1257,8 @@ class MainWindow(QMainWindow):
         """DIO2 free-running square wave — independent of NCO mode."""
         g = _make_group("DIO2 Trigger Output  (independent free-running square wave)")
         row = QHBoxLayout(g)
-        row.setContentsMargins(12, 8, 12, 8)
-        row.setSpacing(14)
+        row.setContentsMargins(_SP_LG, 10, _SP_LG, 10)
+        row.setSpacing(_SP_LG)
 
         lbl = QLabel("Frequency:")
         lbl.setFont(_mono_font(10, bold=True))
@@ -1310,10 +1330,11 @@ class MainWindow(QMainWindow):
     def _build_log(self) -> QGroupBox:
         g = _make_group("Log")
         lay = QVBoxLayout(g)
-        lay.setContentsMargins(10, 10, 10, 8)
+        lay.setContentsMargins(_SP_MD, _SP_MD, _SP_MD, 10)
         self._log_box = QTextEdit()
         self._log_box.setReadOnly(True)
-        self._log_box.setMaximumHeight(80)
+        self._log_box.setMinimumHeight(72)
+        self._log_box.setMaximumHeight(110)
         self._log_box.setFont(_mono_font(9))
         self._log_box.setStyleSheet(
             f"background: #090e15; color: {_DIM}; border: none; border-radius: 6px;"
