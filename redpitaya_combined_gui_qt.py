@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 try:
     from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QFont, QKeySequence
+    from PySide6.QtGui import QAction, QFont, QFontMetrics, QKeySequence
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -566,10 +566,14 @@ def _dim_label(text: str, width: int = 104) -> QLabel:
 class BigDisplay(QFrame):
     """Large labelled readout tile."""
 
+    VALUE_FONT_MAX = 22
+    VALUE_FONT_MIN = 12
+
     def __init__(self, title: str, sub_hint: str = "",
                  accent: str = _ACCENT, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._accent = accent
+        self._value_color = _DIM
         self.setObjectName(f"readout{title.replace(' ', '')}")
         self.setFrameShape(QFrame.NoFrame)
         self.setStyleSheet(f"""
@@ -580,12 +584,13 @@ class BigDisplay(QFrame):
             }}
         """)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 14, 18, 14)
-        lay.setSpacing(6)
+        lay.setContentsMargins(18, 10, 18, 10)
+        lay.setSpacing(2)
 
         title_lbl = QLabel(title)
         title_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         title_lbl.setFont(_mono_font(9, bold=True))
+        title_lbl.setFixedHeight(16)
         title_lbl.setStyleSheet(
             f"color: {_DIM}; background: transparent; border: none;"
         )
@@ -593,14 +598,16 @@ class BigDisplay(QFrame):
 
         self._val = QLabel("---")
         self._val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self._val.setFont(_mono_font(25, bold=True))
+        self._val.setFont(_mono_font(self.VALUE_FONT_MAX, bold=True))
         self._val.setStyleSheet(f"color: {_DIM}; background: transparent; border: none;")
         self._val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._val.setMinimumHeight(24)
         lay.addWidget(self._val, 1)
 
         self._sub = QLabel(sub_hint)
         self._sub.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._sub.setFont(_mono_font(9))
+        self._sub.setFixedHeight(16)
         self._sub.setStyleSheet(
             f"color: {_MUTED}; background: transparent; border: none;"
         )
@@ -608,12 +615,37 @@ class BigDisplay(QFrame):
 
     def set_data(self, value: str, sub: str = "", color: Optional[str] = None):
         self._val.setText(value)
-        resolved = color or (self._accent if value != "---" else _DIM)
-        self._val.setStyleSheet(
-            f"color: {resolved}; background: transparent; border: none;"
-        )
+        self._value_color = color or (self._accent if value != "---" else _DIM)
+        self._fit_value_font()
         if sub is not None:
             self._sub.setText(sub)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_value_font()
+
+    def _fit_value_font(self):
+        text = self._val.text()
+        if not text:
+            return
+
+        rect = self._val.contentsRect()
+        available_w = max(1, rect.width())
+        available_h = max(1, rect.height())
+        chosen = self.VALUE_FONT_MIN
+
+        for size in range(self.VALUE_FONT_MAX, self.VALUE_FONT_MIN - 1, -1):
+            font = _mono_font(size, bold=True)
+            metrics = QFontMetrics(font)
+            if (metrics.horizontalAdvance(text) <= available_w and
+                    metrics.height() <= available_h):
+                chosen = size
+                break
+
+        self._val.setFont(_mono_font(chosen, bold=True))
+        self._val.setStyleSheet(
+            f"color: {self._value_color}; background: transparent; border: none;"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

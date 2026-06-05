@@ -32,6 +32,23 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
         self.assertIn("Red Pitaya", title.text())
         self.assertIn("TTL", title.text())
 
+    def test_readout_value_font_shrinks_to_fit_long_values(self):
+        tile = gui.BigDisplay("Output Frequency", "shift +0.000000 Hz", gui._GREEN)
+        self.addCleanup(tile.close)
+        tile.setFixedSize(360, 84)
+        tile.show()
+
+        tile.set_data("125000000.000000 MHz", "shift +0.000000 Hz")
+        self.app.processEvents()
+
+        value_label = tile.findChildren(QLabel)[1]
+        value_width = value_label.fontMetrics().horizontalAdvance(value_label.text())
+        self.assertLessEqual(value_width, value_label.contentsRect().width())
+        self.assertLessEqual(
+            value_label.fontMetrics().height(),
+            value_label.contentsRect().height(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
