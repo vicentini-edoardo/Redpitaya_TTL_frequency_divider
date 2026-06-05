@@ -11,8 +11,12 @@ base    = sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.conda\envs\" & CONDA
 
 If fso.FileExists(base & "pythonw.exe") Then
     python = base & "pythonw.exe"
-Else
+ElseIf fso.FileExists(base & "python.exe") Then
     python = base & "python.exe"
+Else
+    MsgBox "Python not found in conda env """ & CONDA_ENV & """." & vbCrLf & _
+           vbCrLf & "Looked in: " & base, vbCritical, "Launcher Error"
+    WScript.Quit 1
 End If
 
 ' ShellExecute handles the window station correctly for GUI apps.
