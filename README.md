@@ -25,18 +25,28 @@ External TTL signal → DIO0_P → FPGA (period measurement + NCO) → DIO1_P �
 
 ---
 
+## GUI
+
+![GUI screenshot](GUI.png)
+
+---
+
 ## Project layout
 
 ```
-Redpitaya_TTL_shifter/
+Redpitaya_TTL_frequency_divider/
 ├── redpitaya_combined_gui_qt.py   # Two-tab PySide6 GUI (both modes, one SSH session)
+├── rp_math.py                     # Qt-free math helpers (frequency/duty conversion)
 ├── rp_ctl.c                       # Unified board-side C helper (pulse + harmonic)
 ├── red_pitaya_top.bit.bin         # Unified FPGA bitstream
 ├── requirements.txt               # Python dependencies (PySide6, paramiko)
+├── launch_gui.vbs                 # Windows double-click launcher
+├── tests/
+│   └── test_rp_math.py            # Unit tests for rp_math
 └── Vivado files/                  # RTL source files
+    ├── red_pitaya_top.sv
     ├── pulse_gen.sv
-    ├── axi4lite_pulse_regs.sv
-    └── red_pitaya_top.sv
+    └── axi4lite_pulse_regs.sv
 ```
 
 ---
@@ -49,6 +59,8 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+On Windows, double-click `launch_gui.vbs` after installing Python 3.11.
+
 ---
 
 ## Running the GUI
@@ -58,9 +70,19 @@ python3 -m venv .venv
 ```
 
 Select the **Pulse / Freq-Shift** or **Harmonic Generator** tab.
-Click **Upload && Compile** on either tab to upload `rp_ctl.c`, compile it on the
+Click **Upload & Compile** on either tab to upload `rp_ctl.c`, compile it on the
 board, and flash the bitfile — this is needed once per board or after a firmware update.
 Switching between tabs changes the active mode instantly with no re-flashing.
+
+---
+
+## Running the tests
+
+```bash
+python3 -m unittest discover -s tests
+# or with pytest:
+pytest tests/
+```
 
 ---
 
@@ -123,13 +145,14 @@ Base address: `0x40600000`
 
 | Offset | Register | Notes |
 |--------|----------|-------|
-| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode |
+| `0x00` | `control` | See bits below |
+| `0x04` | `trig_half_period` | DIO2 square-wave half-period in clock cycles (0 = off) |
 | `0x08` | `width_n` / `mult_n` | Pulse width in clock cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
 | `0x14` | `raw_period` | Last measured input period (cycles) |
-| `0x18` | `period_avg` | Reciprocal-counted period (cycles) |
+| `0x18` | `edge_cnt` | Edge count from last measurement window |
 | `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset |
-| `0x24/0x28` | `phase_step_base` | `2^48 / period_avg` (read-only) |
+| `0x24/0x28` | `phase_step_base` | Computed base step (read-only) |
 | `0x2C/0x30` | `phase_step` | Live `[N·]base + offset` (read-only) |
 | `0x34` | `meas_time_us` | Measurement window in µs (min 1000) |
 
@@ -147,9 +170,10 @@ Base address: `0x40600000`
 ## Hardware assumptions
 
 - Board: Red Pitaya STEMlab 125-14 or compatible 125 MHz target.
-- FPGA clock: 125 MHz.
+- FPGA clock: ~125 MHz (measured: 124,999,999 Hz).
 - Input TTL signal: `DIO0_P` / `GND`.
 - Output TTL signal: `DIO1_P` / `GND`.
+- Free-running square wave (optional): `DIO2_P` / `GND`.
 - SSH access as `root`; `gcc` available on the board.
 - `/opt/redpitaya/bin/fpgautil` available for bitstream loading.
 
@@ -160,7 +184,7 @@ Base address: `0x40600000`
 1. Enter the Red Pitaya hostname (e.g. `rp-xxxxxx.local`), port `22`, user `root`.
 2. Optionally select an SSH private-key file.
 3. Click **Connect**.
-4. Click **Upload && Compile** on the desired tab if the board helpers are not yet installed.
+4. Click **Upload & Compile** on the desired tab if the board helpers are not yet installed.
 
 ---
 
@@ -170,7 +194,7 @@ Base address: `0x40600000`
 |---------|-----|
 | PySide6 import error | `pip install -r requirements.txt` |
 | Connect fails | Check hostname/IP, SSH credentials, and board reachability. |
-| Register reads fail | Re-run **Upload && Compile** to reinstall the C helper. |
+| Register reads fail | Re-run **Upload & Compile** to reinstall the C helper. |
 | FPGA image does not load | Confirm `fpgautil` exists on the board and the `.bit.bin` matches the board OS. |
 | Input frequency shows `---` | Verify TTL input on `DIO0_P` and shared ground. |
 | Output stuck LOW after mode switch | Click **~ MODULATED** to re-enable the NCO. |

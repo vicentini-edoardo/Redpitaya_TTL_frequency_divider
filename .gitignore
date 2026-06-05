@@ -64,3 +64,8 @@ rp_ctl
 
 # Windows
 Thumbs.db
+
+# Claude Code
+memory/
+.claude/
+PRODUCT.md
