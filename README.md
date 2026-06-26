@@ -129,6 +129,7 @@ ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 read'
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 write <width_cycles> <phase_step_offset> <control>'
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 control 0'   # Laser OFF
 ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 control 4'   # Laser ON
+ssh root@rp-xxxxxx.local '/root/rp_pulse_ctl 0x40600000 trig <trig_phase_step>'
 
 # Harmonic mode
 ssh root@rp-xxxxxx.local '/root/rp_harmonic_ctl 0x40600000 read'
@@ -146,10 +147,10 @@ Base address: `0x40600000`
 | Offset | Register | Notes |
 |--------|----------|-------|
 | `0x00` | `control` | See bits below |
-| `0x04` | `trig_half_period` | DIO2 square-wave half-period in clock cycles (0 = off) |
+| `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0 = off) |
 | `0x08` | `width_n` / `mult_n` | Pulse width in clock cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
-| `0x14` | `raw_period` | Last measured input period (cycles) |
+| `0x14` | `raw_period` | Edge count from last measurement window (legacy name) |
 | `0x18` | `edge_cnt` | Edge count from last measurement window |
 | `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset |
 | `0x24/0x28` | `phase_step_base` | Computed base step (read-only) |

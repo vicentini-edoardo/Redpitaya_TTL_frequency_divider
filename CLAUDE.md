@@ -93,7 +93,8 @@ Pure, Qt-free functions shared by the GUI and covered by `tests/test_rp_math.py`
   48-bit NCO offset word.
 - `duty_to_cycles(frac, period)` — width fraction → clock cycles (pulse mode).
 - `suggest_window(f_shift_hz)` — recommend one of the five reciprocal-counting windows.
-- `trig_hz_to_half_period(f_hz)` — DIO2 square-wave half-period in clock cycles.
+- `trig_hz_to_phase_step(f_hz)` / `trig_phase_step_to_hz(step)` — DIO2
+  frequency on the same 48-bit NCO grid used by frequency shift.
 - formatting helpers (`fmt_freq`, `fmt_signed_freq`, `fmt_dur`).
 
 Hardware constants also live here: `CLK_HZ = 124_999_999` (measured, not nominal),
@@ -108,10 +109,10 @@ which the C helper sets/clears based on its invocation name.
 | Offset | Register | Notes |
 |--------|----------|-------|
 | `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode |
-| `0x04` | `trig_half_period` | DIO2 square-wave half-period in clock cycles (0=off) |
+| `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0=off) |
 | `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
-| `0x14` | `raw_period` | last raw measured input period (cycles) |
+| `0x14` | `raw_period` | edge count from last measurement window (legacy name) |
 | `0x18` | `edge_cnt` | edge count from last measurement window |
 | `0x1C/0x20` | `phase_step_offset` | signed 48-bit NCO frequency offset |
 | `0x24/0x28` | `phase_step_base` | computed base step (read-only) |
@@ -131,7 +132,7 @@ One binary, two symlink names; mode detected from `argv[0]`:
 | `/root/rp_harmonic_ctl` | Harmonic | `write <mult_n> <phase_step_offset> <control>` |
 
 Subcommands (both modes): `read`, `write`, `control <value>`, `window <us>`,
-`trig <half_period>`, `soft_reset`. Every subcommand prints one JSON object on stdout
+`trig <phase_step>`, `soft_reset`. Every subcommand prints one JSON object on stdout
 that the GUI treats as the source of truth. 48-bit NCO values are split across two AXI
 words; the helper writes the high word first for atomic latching.
 

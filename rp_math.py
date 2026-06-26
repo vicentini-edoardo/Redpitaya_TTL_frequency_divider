@@ -45,6 +45,12 @@ def duty_to_cycles(frac: float, period: int) -> int:
     return max(1, min(period - 1, int(round(frac * period))))
 
 
+def measured_edges_to_phase_step(edge_count: int, window_cycles: int) -> int:
+    if edge_count < 4 or window_cycles <= 0:
+        return 0
+    return ((edge_count - 1) << PHASE_BITS) // (2 * window_cycles)
+
+
 def fmt_freq(hz: float) -> str:
     if hz <= 0:
         return "---"
@@ -76,10 +82,16 @@ def suggest_window(f_shift_hz: float) -> int:
     return 0
 
 
-def trig_hz_to_half_period(f_hz: float) -> int:
+def trig_hz_to_phase_step(f_hz: float) -> int:
     if f_hz <= 0:
         return 0
-    return round(CLK_HZ / (2.0 * f_hz))
+    return hz_to_phase(f_hz)
+
+
+def trig_phase_step_to_hz(step: int) -> float:
+    if step <= 0:
+        return 0.0
+    return phase_to_hz(step)
 
 
 def fmt_dur(s: float) -> str:

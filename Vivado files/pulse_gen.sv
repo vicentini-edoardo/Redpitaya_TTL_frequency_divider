@@ -10,9 +10,10 @@
 //   MEASURE phase (!freerun_active):
 //     Incoming trigger edges (both rising and falling) are counted over a fixed
 //     time window selected via meas_time_us.
-//     After first complete window, period_stable asserts.
+//     After a complete valid window, period_stable asserts.
 //     An iterative divider (48 cycles) computes:
-//       phase_step_base = 2^48 * (edge_count/2) / window_cycles
+//       phase_step_base = 2^48 * (edge_count - 1) / (2 * window_cycles)
+//     The first edge opens the window, so it is not a completed interval.
 //     This avoids the intermediate integer period_avg truncation that was the
 //     source of systematic frequency error for non-integer-period signals (e.g. 300 kHz).
 //     Once period_stable and division complete, transitions to FREERUN.
@@ -50,7 +51,7 @@ module pulse_gen
 
   input  logic signed [47:0] phase_step_offset,
 
-  input  logic [31:0] trig_half_period,  // DIO2 free-running square wave: half-period in clk cycles (0=off)
+  input  logic [47:0] trig_phase_step,   // DIO2 free-running square wave: 48-bit NCO step (0=off)
 
   output logic        trig_rise_dbg,
 
@@ -72,8 +73,9 @@ module pulse_gen
   // Actual measured clock: 124,999,999 Hz.
   // floor(124,999,999 / 1,000,000) = 124 cycles/us — but to keep window timing accurate
   // we use 125 cycles/us (same as before) since the 1 Hz difference is negligible per us.
-  // The NCO frequency is correct because phase_step_base = 2^48 * edge_half / window_cycles
-  // uses edge and window counts directly — no hardcoded clock assumption in the NCO path.
+  // The NCO frequency is correct because phase_step_base derives directly from
+  // completed edge intervals and the measurement window in clock cycles. There is
+  // no hardcoded clock assumption in the NCO path.
   localparam logic [31:0] CLK_HZ                = 32'd124_999_999;
   localparam logic [31:0] CLK_PER_US            = 32'd125;
   localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = CLK_HZ;
@@ -114,6 +116,7 @@ module pulse_gen
   logic [31:0] clk_cnt;
   logic [31:0] edge_cnt;
   logic        window_active;
+  logic        period_sample_strobe;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -125,7 +128,10 @@ module pulse_gen
       period_stable <= 1'b0;
       timeout_flag  <= 1'b0;
       window_active <= 1'b0;
+      period_sample_strobe <= 1'b0;
     end else begin
+      period_sample_strobe <= 1'b0;
+
       if (soft_reset || !enable) begin
         clk_cnt       <= 32'd0;
         edge_cnt      <= 32'd0;
@@ -135,6 +141,7 @@ module pulse_gen
         period_stable <= 1'b0;
         timeout_flag  <= 1'b0;
         window_active <= 1'b0;
+        period_sample_strobe <= 1'b0;
       end else begin
         if (!window_active) begin
           if (trig_edge) begin
@@ -155,6 +162,7 @@ module pulse_gen
               period_valid  <= 1'b1;
               period_stable <= 1'b1;
               timeout_flag  <= 1'b0;
+              period_sample_strobe <= 1'b1;
             end else begin
               period_valid  <= 1'b0;
               period_stable <= 1'b0;
@@ -172,25 +180,25 @@ module pulse_gen
   end
 
   // ----------------------------------------------------------------
-  // Iterative divider: phase_step_base = 2^48 * (edge_cnt/2) / window_cycles
+  // Iterative divider:
+  //   phase_step_base = 2^48 * (edge_cnt - 1) / (2 * window_cycles)
   //
-  // Avoids the integer truncation in the old formula (2^48 / (window/edge_half))
-  // by computing the fraction directly. Since edge_half/window < 1 (f_in << f_clk),
-  // we initialise rem = edge_half and shift in 48 zero-bits from the dividend,
-  // using window_cycles as divisor. This is equivalent to standard long-division of
-  // (edge_half << 48) / window_cycles but without needing an 80-bit shift register.
-  // 48 steps, one quotient bit per clock.
+  // Avoids the integer truncation in the old reciprocal-period formula
+  // by computing the fraction directly. Since edge_interval_count/(2*window) < 1
+  // (f_in << f_clk), we initialise rem = edge_cnt - 1 and shift in 48 zero-bits
+  // from the dividend, using 2*window_cycles as divisor. This is equivalent to
+  // standard long-division of ((edge_cnt - 1) << 48) / (2*window_cycles) but
+  // without needing an 80-bit shift register. 48 steps, one quotient bit per clock.
   // ----------------------------------------------------------------
   logic [5:0]  div_step;
-  logic [31:0] div_rem;
+  logic [32:0] div_rem;
   logic [47:0] div_quot;
   logic        div_active;
-  logic [31:0] div_divisor;
+  logic [32:0] div_divisor;
   logic        div_base_valid;
-  logic        period_valid_d;
 
-  logic [32:0] div_new_rem;   // {div_rem, 0} shifted left by 1
-  logic [32:0] div_sub;
+  logic [33:0] div_new_rem;   // {div_rem, 0} shifted left by 1
+  logic [33:0] div_sub;
 
   assign div_new_rem = {div_rem, 1'b0};   // shift in 0 (dividend bits are all zero)
   assign div_sub     = div_new_rem - {1'b0, div_divisor};
@@ -198,28 +206,26 @@ module pulse_gen
   always_ff @(posedge clk) begin
     if (!rstn || soft_reset || !enable) begin
       div_step        <= 6'd0;
-      div_rem         <= 32'd0;
+      div_rem         <= 33'd0;
       div_quot        <= 48'd0;
       div_active      <= 1'b0;
-      div_divisor     <= 32'd1;
+      div_divisor     <= 33'd1;
       div_base_valid  <= 1'b0;
-      period_valid_d  <= 1'b0;
       phase_step_base <= 48'sd0;
     end else begin
-      period_valid_d <= period_valid;
-
-      if (period_valid && !period_valid_d && !div_active) begin
+      if (period_sample_strobe && !div_active) begin
         div_active  <= 1'b1;
         div_step    <= 6'd0;
-        // rem initialised to edge_half = edge_cnt>>1; since edge_half < window_cycles
-        // (f_in << f_clk) this is already < divisor, so no pre-subtraction needed.
-        div_rem     <= (edge_cnt_out >> 1);
+        // Exclude the edge that opened the window; it is a boundary marker, not
+        // a completed edge interval. Keep the half-edge information by dividing
+        // by 2*window_cycles instead of shifting the edge count down first.
+        div_rem     <= {1'b0, edge_cnt_out - 32'd1};
         div_quot    <= 48'd0;
-        div_divisor <= (window_cycles != 32'd0) ? window_cycles : 32'd1;
+        div_divisor <= (window_cycles != 32'd0) ? {window_cycles, 1'b0} : 33'd1;
       end else if (div_active) begin
-        if (!div_sub[32]) begin
+        if (!div_sub[33]) begin
           // rem >= divisor: quotient bit = 1
-          div_rem  <= div_sub[31:0];
+          div_rem  <= div_sub[32:0];
           if (div_step == 6'd47) begin
             phase_step_base <= $signed({div_quot[46:0], 1'b1});
             div_active      <= 1'b0;
@@ -230,7 +236,7 @@ module pulse_gen
           end
         end else begin
           // rem < divisor: quotient bit = 0
-          div_rem  <= div_new_rem[31:0];
+          div_rem  <= div_new_rem[32:0];
           if (div_step == 6'd47) begin
             phase_step_base <= $signed({div_quot[46:0], 1'b0});
             div_active      <= 1'b0;
@@ -326,25 +332,23 @@ module pulse_gen
   end
 
   // ----------------------------------------------------------------
-  // DIO2 free-running square wave (independent of NCO / enable)
+  // DIO2 free-running square wave (independent of DIO1 NCO / enable)
   //
-  // trig_half_period = CLK_HZ / (2 * f_hz), rounded.
+  // f_DIO2 = trig_phase_step * CLK_HZ / 2^48.
   // 0 → output held low (disabled).
   // ----------------------------------------------------------------
-  logic [31:0] trig_cnt;
+  logic [47:0] trig_phase_acc;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
-      trig_cnt <= 32'd0;
-      trig_out <= 1'b0;
-    end else if (trig_half_period == 32'd0) begin
-      trig_cnt <= 32'd0;
-      trig_out <= 1'b0;
-    end else if (trig_cnt >= trig_half_period - 1) begin
-      trig_cnt <= 32'd0;
-      trig_out <= ~trig_out;
+      trig_phase_acc <= 48'd0;
+      trig_out       <= 1'b0;
+    end else if (trig_phase_step == 48'd0) begin
+      trig_phase_acc <= 48'd0;
+      trig_out       <= 1'b0;
     end else begin
-      trig_cnt <= trig_cnt + 32'd1;
+      trig_phase_acc <= trig_phase_acc + trig_phase_step;
+      trig_out       <= trig_phase_acc[47];
     end
   end
 

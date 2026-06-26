@@ -7,15 +7,15 @@
 // Register map (byte offset / 32-bit word):
 //   0x00 RW  control:  [0] enable, [1] soft_reset (self-clearing, reads 0),
 //                      [2] force_high (output forced to 1), [3] harmonic_mode
-//   0x04 RW  trig_half_period: CLK_HZ/(2*f_hz) cycles for DIO2 square wave (0=off)
+//   0x04 RW  trig_phase_step_lo: bits [31:0] of DIO2 48-bit NCO step (0=off)
 //   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
 //                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
-//   0x0C RW  pulse_delay    (kept for address stability; unused)
+//   0x0C RW  trig_phase_step_hi: bits [47:32] of DIO2 48-bit NCO step
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] period_stable, [3] timeout,
 //                      [4] freerun_active
 //                      (bit order matches the rdata concat below: see 4'd4 read)
 //   0x14 RO  period_cycles   (edge count from last window, same as edge_cnt_out)
-//   0x18 RO  edge_cnt_out    (edge count from last window; f_in = CLK_HZ * (val/2) / window_cycles)
+//   0x18 RO  edge_cnt_out    (edge count from last window; f_in = CLK_HZ * (val-1) / (2*window_cycles))
 //   0x1C RW  phase_step_offset_lo   bits [31:0]  of signed 48-bit NCO offset
 //   0x20 RW  phase_step_offset_hi   bits [47:32] of signed 48-bit NCO offset (in [15:0])
 //   0x24 RO  phase_step_base_lo     bits [31:0]  of computed base step
@@ -67,9 +67,8 @@ module axi4lite_pulse_regs
   output logic        pulse_soft_reset,
   output logic        force_high,
   output logic        harmonic_mode,
-  output logic [31:0] trig_half_period,  // DIO2 square wave half-period in clk cycles (0=off)
+  output logic [47:0] trig_phase_step,   // DIO2 48-bit NCO step (0=off)
   output logic [31:0] width_n,           // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
-  output logic [31:0] pulse_delay,
   output logic [31:0] meas_time_us,
   output logic signed [47:0] phase_step_offset,
 
@@ -86,9 +85,9 @@ module axi4lite_pulse_regs
 );
 
   logic [31:0] reg_control;
-  logic [31:0] reg_divider;
+  logic [31:0] reg_trig_phase_step_lo;
   logic [31:0] reg_width_n;
-  logic [31:0] reg_delay;
+  logic [15:0] reg_trig_phase_step_hi;
   logic [31:0] reg_meas_time_us;
   logic [31:0] reg_phase_step_offset_lo;
   logic [15:0] reg_phase_step_offset_hi;
@@ -110,18 +109,17 @@ module axi4lite_pulse_regs
   assign pulse_enable      = reg_control[0];
   assign force_high        = reg_control[2];
   assign harmonic_mode     = reg_control[3];
-  assign trig_half_period  = reg_divider;
+  assign trig_phase_step   = {reg_trig_phase_step_hi, reg_trig_phase_step_lo};
   assign width_n           = reg_width_n;
-  assign pulse_delay       = reg_delay;
   assign meas_time_us      = reg_meas_time_us;
   assign phase_step_offset = $signed({reg_phase_step_offset_hi, reg_phase_step_offset_lo});
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
       reg_control               <= 32'h00000001;
-      reg_divider               <= 32'h00000000;  // trig_half_period=0 → DIO2 off at boot
+      reg_trig_phase_step_lo    <= 32'h00000000;  // trig_phase_step=0 -> DIO2 off at boot
       reg_width_n               <= 32'h00000001;
-      reg_delay                 <= 32'h00000001;
+      reg_trig_phase_step_hi    <= 16'h0000;
       reg_meas_time_us          <= 32'd100_000;  // Default: 100 ms
       reg_phase_step_offset_lo  <= 32'h00000000;
       reg_phase_step_offset_hi  <= 16'h0000;
@@ -167,10 +165,10 @@ module axi4lite_pulse_regs
           end
 
           4'd1: begin
-            if (wstrb_latched[0]) reg_divider[ 7: 0] <= wdata_latched[ 7: 0];
-            if (wstrb_latched[1]) reg_divider[15: 8] <= wdata_latched[15: 8];
-            if (wstrb_latched[2]) reg_divider[23:16] <= wdata_latched[23:16];
-            if (wstrb_latched[3]) reg_divider[31:24] <= wdata_latched[31:24];
+            if (wstrb_latched[0]) reg_trig_phase_step_lo[ 7: 0] <= wdata_latched[ 7: 0];
+            if (wstrb_latched[1]) reg_trig_phase_step_lo[15: 8] <= wdata_latched[15: 8];
+            if (wstrb_latched[2]) reg_trig_phase_step_lo[23:16] <= wdata_latched[23:16];
+            if (wstrb_latched[3]) reg_trig_phase_step_lo[31:24] <= wdata_latched[31:24];
           end
 
           4'd2: begin  // 0x08  width_n
@@ -180,11 +178,9 @@ module axi4lite_pulse_regs
             if (wstrb_latched[3]) reg_width_n[31:24] <= wdata_latched[31:24];
           end
 
-          4'd3: begin
-            if (wstrb_latched[0]) reg_delay[ 7: 0] <= wdata_latched[ 7: 0];
-            if (wstrb_latched[1]) reg_delay[15: 8] <= wdata_latched[15: 8];
-            if (wstrb_latched[2]) reg_delay[23:16] <= wdata_latched[23:16];
-            if (wstrb_latched[3]) reg_delay[31:24] <= wdata_latched[31:24];
+          4'd3: begin  // 0x0C trig_phase_step_hi (bits [47:32] in [15:0])
+            if (wstrb_latched[0]) reg_trig_phase_step_hi[ 7:0] <= wdata_latched[ 7:0];
+            if (wstrb_latched[1]) reg_trig_phase_step_hi[15:8] <= wdata_latched[15:8];
           end
 
           // 4'd4 (status), 4'd5 (period_cycles), 4'd6 (edge_cnt_out): read-only
@@ -225,9 +221,9 @@ module axi4lite_pulse_regs
         case (s_axi_araddr[5:2])
           // bit 1 (soft_reset) always reads 0; bits 0, 2, 3 read back as stored
           4'd0:  s_axi_rdata <= {reg_control[31:4], reg_control[3], reg_control[2], 1'b0, reg_control[0]};
-          4'd1:  s_axi_rdata <= reg_divider;
+          4'd1:  s_axi_rdata <= reg_trig_phase_step_lo;
           4'd2:  s_axi_rdata <= reg_width_n;
-          4'd3:  s_axi_rdata <= reg_delay;
+          4'd3:  s_axi_rdata <= {16'd0, reg_trig_phase_step_hi};
           4'd4:  s_axi_rdata <= {27'd0, freerun_active, timeout_flag,
                                          period_stable, period_valid, pulse_busy};
           4'd5:  s_axi_rdata <= period_cycles;

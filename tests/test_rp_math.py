@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rp_math import (  # noqa: E402
     CLK_HZ, PHASE_BITS, PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
-    suggest_window, trig_hz_to_half_period, fmt_dur,
+    suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz,
+    measured_edges_to_phase_step, fmt_dur,
 )
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
@@ -84,21 +85,31 @@ class TestSuggestWindow(unittest.TestCase):
         self.assertEqual(suggest_window(2000), 0)
 
 
-class TestTrigHalfPeriod(unittest.TestCase):
+class TestTrigPhaseStep(unittest.TestCase):
     def test_off(self):
-        self.assertEqual(trig_hz_to_half_period(0), 0)
-        self.assertEqual(trig_hz_to_half_period(-1), 0)
+        self.assertEqual(trig_hz_to_phase_step(0), 0)
+        self.assertEqual(trig_hz_to_phase_step(-1), 0)
 
-    def test_known_values(self):
-        # half_period = round(CLK_HZ / (2 * f))
-        self.assertEqual(trig_hz_to_half_period(1), round(CLK_HZ / 2))
-        self.assertEqual(trig_hz_to_half_period(100), round(CLK_HZ / 200))
+    def test_uses_same_quantisation_as_delta(self):
+        self.assertEqual(trig_hz_to_phase_step(4.0), hz_to_phase(4.0))
 
     def test_reconstructed_frequency_is_close(self):
         for f in (1.0, 50.0, 1000.0):
-            half = trig_hz_to_half_period(f)
-            recon = CLK_HZ / (2.0 * half)
-            self.assertLess(abs(recon - f) / f, 1e-3)
+            step = trig_hz_to_phase_step(f)
+            recon = trig_phase_step_to_hz(step)
+            self.assertLessEqual(abs(recon - f), PHASE_RES_HZ / 2 + 1e-9)
+
+
+class TestInputMeasurementMath(unittest.TestCase):
+    def test_excludes_window_start_edge_and_preserves_half_edge_resolution(self):
+        window_cycles = 125_000_000
+        step = measured_edges_to_phase_step(526_260, window_cycles)
+        hz = phase_to_hz(step)
+
+        self.assertAlmostEqual(hz, 263_129.497894923, places=6)
+
+    def test_too_few_edges_reports_zero(self):
+        self.assertEqual(measured_edges_to_phase_step(3, 125_000), 0)
 
 
 class TestFormatters(unittest.TestCase):

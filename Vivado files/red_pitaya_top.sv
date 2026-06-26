@@ -94,7 +94,6 @@ logic        pulse_soft_reset;
 logic        force_high;
 logic        harmonic_mode;
 logic [31:0] width_n;
-logic [31:0] pulse_delay;
 logic [31:0] meas_time_us;
 logic        pulse_busy;
 logic        pulse_out;
@@ -111,7 +110,7 @@ logic signed [47:0] phase_step;
 logic        freerun_active;
 
 logic        trig_rise_dbg;
-logic [31:0] trig_half_period;
+logic [47:0] trig_phase_step;
 logic        trig_out;
 
 // force_high overrides the output pin HIGH; exp_p_io[0] is trigger input.
@@ -205,7 +204,7 @@ pulse_gen pulse_gen_i
   .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
 
-  .trig_half_period   (trig_half_period),
+  .trig_phase_step    (trig_phase_step),
 
   .trig_rise_dbg      (trig_rise_dbg),
 
@@ -255,9 +254,8 @@ axi4lite_pulse_regs regs_i
   .pulse_soft_reset    (pulse_soft_reset),
   .force_high          (force_high),
   .harmonic_mode       (harmonic_mode),
-  .trig_half_period    (trig_half_period),
+  .trig_phase_step     (trig_phase_step),
   .width_n             (width_n),
-  .pulse_delay         (pulse_delay),
   .meas_time_us        (meas_time_us),
   .phase_step_offset   (phase_step_offset),
 

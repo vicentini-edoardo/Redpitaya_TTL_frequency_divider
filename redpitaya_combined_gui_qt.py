@@ -55,7 +55,7 @@ from rp_math import (  # noqa: E402
     CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH,
     PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
-    suggest_window, trig_hz_to_half_period, fmt_dur,
+    suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
 )
 
 
@@ -159,11 +159,11 @@ class SshBackend(QObject):
                           lambda: self._do_set_control_harmonic(ctrl),
                           self.sig_status.emit)
 
-    def set_trig(self, half_period: int):
-        """Write trig_half_period register (DIO2 square wave). half_period=0 disables."""
+    def set_trig(self, phase_step: int):
+        """Write DIO2 48-bit NCO step. phase_step=0 disables."""
         if self._live:
             self._enqueue(self.P_USER,
-                          lambda: self._do_set_trig(half_period),
+                          lambda: self._do_set_trig(phase_step),
                           self.sig_status.emit)
 
     def set_window(self, window_us: int):
@@ -315,9 +315,9 @@ class SshBackend(QObject):
     def _do_window(self, meas_us: int) -> dict:
         return json.loads(self._exec(f"{self._active_cmd()} window {meas_us}"))
 
-    def _do_set_trig(self, half_period: int) -> dict:
+    def _do_set_trig(self, phase_step: int) -> dict:
         return json.loads(self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} trig {half_period}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} trig {phase_step}"
         ))
 
     def _do_upload_pulse(self, c_src: str, bit_src: Optional[str]):
@@ -1497,8 +1497,8 @@ class MainWindow(QMainWindow):
         row.addWidget(lbl)
 
         self._sp_trig = QDoubleSpinBox()
-        self._sp_trig.setRange(0.0, 1000.0)
-        self._sp_trig.setDecimals(3)
+        self._sp_trig.setRange(0.0, MAX_SHIFT_HZ)
+        self._sp_trig.setDecimals(6)
         self._sp_trig.setSingleStep(1.0)
         self._sp_trig.setSuffix(" Hz")
         self._sp_trig.setSpecialValueText("Off")
@@ -1542,21 +1542,22 @@ class MainWindow(QMainWindow):
 
     @Slot(dict)
     def _on_trig_status(self, d: dict):
-        raw = d.get("trig_half_period")
+        raw = d.get("trig_phase_step")
         if raw is None:
             return
-        half = int(raw)
-        if half == 0:
+        phase_step = int(raw)
+        if phase_step == 0:
             self._lbl_trig_actual.setText("actual: Off")
         else:
-            actual_hz = CLK_HZ / (2.0 * half)
-            self._lbl_trig_actual.setText(f"actual: {actual_hz:.3f} Hz")
+            actual_hz = trig_phase_step_to_hz(phase_step)
+            self._lbl_trig_actual.setText(f"actual: {actual_hz:.6f} Hz")
 
     def _on_trig_apply(self):
         f_hz = self._sp_trig.value()
-        half = trig_hz_to_half_period(f_hz)
-        self._be.set_trig(half)
-        self._log(f"[Trig] DIO2 → {f_hz:.3f} Hz  (half_period={half})")
+        phase_step = trig_hz_to_phase_step(f_hz)
+        actual_hz = trig_phase_step_to_hz(phase_step)
+        self._be.set_trig(phase_step)
+        self._log(f"[Trig] DIO2 → {actual_hz:.6f} Hz  (phase_step={phase_step})")
 
     def _build_log(self) -> QGroupBox:
         g = _make_group("Log")
