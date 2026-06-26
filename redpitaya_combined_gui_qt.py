@@ -675,6 +675,7 @@ class _NcoPanel(QWidget):
     """
 
     MODE: str = "pulse"   # "pulse" | "harmonic" — overridden by subclasses
+    sig_params_changed = Signal()
 
     def __init__(self, backend: SshBackend, log_fn: Callable[[str], None],
                  parent: Optional[QWidget] = None):
@@ -906,6 +907,7 @@ class _NcoPanel(QWidget):
         self._output_mode = mode
         self._update_mode_styles()
         self._update_mode_controls()
+        self.sig_params_changed.emit()
         if self._live:
             if mode == "off":
                 self._be_set_control(0x00)
@@ -1015,6 +1017,7 @@ class _NcoPanel(QWidget):
             self._debounce.start()
         self._update_local_displays()
         self._update_window_suggestion()
+        self.sig_params_changed.emit()
 
     def _on_window_changed(self, idx: int):
         if self._live and self._be.mode == self.MODE:
@@ -1140,6 +1143,13 @@ class PulsePanel(_NcoPanel):
             f"shift={actual_hz:+.6f} Hz  offset={offset_word:+d}"
         )
 
+    def get_params(self) -> dict:
+        return {
+            "freq_shift_hz": self._sp_offset.value(),
+            "duty_cycle_pct": self._sp_width.value(),
+            "output_mode": self._output_mode,
+        }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HarmonicPanel — f_out = N × f_in + f_shift, 50% duty cycle
@@ -1220,6 +1230,13 @@ class HarmonicPanel(_NcoPanel):
             f"offset={offset_word:+d}"
         )
 
+    def get_params(self) -> dict:
+        return {
+            "freq_shift_hz": self._sp_offset.value(),
+            "harmonic_n": self._sp_n.value(),
+            "output_mode": self._output_mode,
+        }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MainWindow — shared connection + tab host + shared log
@@ -1228,6 +1245,7 @@ class HarmonicPanel(_NcoPanel):
 class MainWindow(QMainWindow):
 
     sig_update_done = Signal(str)
+    _STATE_FILE = Path(__file__).resolve().parent / "rp_state.json"
 
     def __init__(self):
         super().__init__()
@@ -1313,6 +1331,8 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._pulse_panel,    "Pulse / Freq-Shift")
         self._tabs.addTab(self._harmonic_panel, "Harmonic Generator")
         self._tabs.currentChanged.connect(self._on_tab_changed)
+        self._pulse_panel.sig_params_changed.connect(self._write_state_file)
+        self._harmonic_panel.sig_params_changed.connect(self._write_state_file)
         root.addWidget(self._tabs, 1)
 
         shared = QWidget()
@@ -1324,6 +1344,7 @@ class MainWindow(QMainWindow):
         shared_lay.addWidget(self._build_trigger())
         shared_lay.addWidget(self._build_log())
         root.addWidget(shared)
+        self._write_state_file()
 
     def _do_git_update(self):
         self._btn_update.setEnabled(False)
@@ -1619,6 +1640,7 @@ class MainWindow(QMainWindow):
         """Switch the poll helper when the user changes tabs."""
         mode = "pulse" if idx == 0 else "harmonic"
         self._be.set_active_mode(mode)
+        self._write_state_file()
 
     # ── Ctrl+Return routes to whichever tab is active ─────────────────────────
 
@@ -1643,6 +1665,26 @@ class MainWindow(QMainWindow):
             self._poll.setInterval(interval)
 
     # ── error / log ────────────────────────────────────────────────────────────
+
+    def _write_state_file(self):
+        pp = self._pulse_panel.get_params()
+        hp = self._harmonic_panel.get_params()
+        active_mode = self._be.mode
+        state = {
+            "mode": active_mode,
+            "output_mode": pp["output_mode"] if active_mode == "pulse" else hp["output_mode"],
+            "pulse_freq_shift_hz": pp["freq_shift_hz"],
+            "harmonic_freq_shift_hz": hp["freq_shift_hz"],
+            "duty_cycle_pct": pp["duty_cycle_pct"],
+            "harmonic_n": hp["harmonic_n"],
+            "updated_at": time.time(),
+        }
+        try:
+            tmp = self._STATE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, indent=2))
+            os.replace(tmp, self._STATE_FILE)
+        except Exception as exc:
+            self._log(f"[state] write failed: {exc}")
 
     @Slot(str)
     def _on_error(self, msg: str):
