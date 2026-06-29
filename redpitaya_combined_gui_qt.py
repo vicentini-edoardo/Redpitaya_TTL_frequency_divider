@@ -961,6 +961,7 @@ class _NcoPanel(QWidget):
     @Slot()
     def _on_connected(self):
         self._live = True
+        self._refresh_pending = True
         if self._be.mode == self.MODE:
             self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
 
