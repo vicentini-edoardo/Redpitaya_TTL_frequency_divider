@@ -84,6 +84,20 @@ python3 -m unittest discover -s tests
 pytest tests/
 ```
 
+## Hardware verification with PicoSDK
+
+A PicoScope 4000A-family card can be used to validate the Red Pitaya output
+directly from captured input/output waveforms:
+
+```bash
+python3 -m pip install -r requirements-picosdk.txt
+python3 hardware_tests/redpitaya_picosdk_verify.py --host rp-xxxxxx.local
+```
+
+See [`docs/redpitaya_picosdk_hardware_tests.md`](docs/redpitaya_picosdk_hardware_tests.md)
+for wiring, PicoSDK setup, run commands, and how to send the generated debug
+bundle for analysis.
+
 ---
 
 ## Output modes

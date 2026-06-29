@@ -1,0 +1,6 @@
+# Optional hardware-validation dependencies.
+#
+# PicoSDK also requires Pico Technology's system driver/library package for your
+# OS. The Python package below is only the wrapper.
+paramiko>=3.0
+picosdk>=1.1
