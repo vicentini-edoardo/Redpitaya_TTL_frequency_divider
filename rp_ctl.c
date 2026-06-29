@@ -67,14 +67,18 @@
 #define REG_PHASE_STEP_LO         0x2C
 #define REG_PHASE_STEP_HI         0x30
 #define REG_MEAS_TIME_US          0x34
+#define REG_OSC_HALF_PERIOD       0x38
+#define REG_OSC_PHASE_PRELOAD_LO  0x3C
+#define REG_OSC_PHASE_PRELOAD_HI  0x40
 
 #define CTRL_ENABLE       0x01u
 #define CTRL_SOFT_RESET   0x02u
 #define CTRL_FORCE_HIGH   0x04u
 #define CTRL_HARMONIC     0x08u
+#define CTRL_OSC_MODE     0x10u   /* bit 4 — oscillating delay mode */
 
 /* Bits the caller may pass; harmonic_mode is managed internally */
-#define CTRL_USER_MASK    (CTRL_ENABLE | CTRL_FORCE_HIGH)
+#define CTRL_USER_MASK    (CTRL_ENABLE | CTRL_FORCE_HIGH | CTRL_OSC_MODE)
 
 static int g_harmonic;   /* 0 = pulse mode, 1 = harmonic mode */
 
@@ -91,7 +95,7 @@ static void usage(const char *prog) {
         "  %s <base_addr> read\n"
         "  %s <base_addr> write <%s> <phase_step_offset> <control>\n"
         "      phase_step_offset: signed 48-bit integer\n"
-        "      control: bit 0=enable, bit 2=force_high\n"
+        "      control: bit 0=enable, bit 2=force_high, bit 4=osc_mode\n"
         "  %s <base_addr> control <value>\n"
         "      Set only the control register (0=off, 1=modulated, 4=force-high/on).\n"
         "  %s <base_addr> window <microseconds>\n"
@@ -99,8 +103,11 @@ static void usage(const char *prog) {
         "  %s <base_addr> trig <phase_step>\n"
         "      DIO2 square wave: phase_step = round(f_hz * 2^48 / 124999999). 0=off.\n"
         "      e.g. 2251800=1Hz  225179983=100Hz  2251799832=1000Hz\n"
+        "  %s <base_addr> osc <half_period_cycles> <phase_preload_uint64>\n"
+        "      Set oscillating delay registers (write to osc_half_period and osc_phase_preload).\n"
+        "      Use write command with bit4=1 in control to enable osc_mode.\n"
         "  %s <base_addr> soft_reset\n",
-        prog, prog, arg3, prog, prog, prog, prog);
+        prog, prog, arg3, prog, prog, prog, prog, prog);
 }
 
 static uint32_t rd32(volatile uint8_t *base, off_t off) {
@@ -142,6 +149,7 @@ static void wr48u(volatile uint8_t *base, off_t lo_off, off_t hi_off, uint64_t v
 static void print_json(volatile uint8_t *base) {
     const uint32_t control           = rd32(base, REG_CONTROL);
     const uint32_t harmonic_mode     = (control >> 3) & 0x1u;
+    const uint32_t osc_mode          = (control >> 4) & 0x1u;
     const uint32_t force_high        = (control >> 2) & 0x1u;
     const uint32_t reg08             = rd32(base, REG_REG08);
     const uint32_t mult_n            = (reg08 < 1u) ? 1u : (reg08 > 5u) ? 5u : reg08;
@@ -153,14 +161,18 @@ static void print_json(volatile uint8_t *base) {
     const int64_t  step_offset       = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
     const int64_t  step_base         = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
     const int64_t  step_live         = rd48(base, REG_PHASE_STEP_LO,        REG_PHASE_STEP_HI);
+    const uint32_t osc_half_period   = rd32(base, REG_OSC_HALF_PERIOD);
+    const uint64_t osc_phase_preload = rd48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI);
 
-    printf("{\"control\":%u,\"harmonic_mode\":%u,\"force_high\":%u,"
+    printf("{\"control\":%u,\"harmonic_mode\":%u,\"osc_mode\":%u,\"force_high\":%u,"
            "\"width\":%u,\"mult_n\":%u,\"trig_phase_step\":%llu,"
            "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
            "\"raw_period\":%u,\"edge_cnt\":%u,"
-           "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld}\n",
+           "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld,"
+           "\"osc_half_period\":%u,\"osc_phase_preload\":%llu}\n",
            control,
            harmonic_mode,
+           osc_mode,
            force_high,
            reg08,
            mult_n,
@@ -173,7 +185,9 @@ static void print_json(volatile uint8_t *base) {
            rd32(base, REG_FILT_PERIOD),
            (long long)step_offset,
            (long long)step_base,
-           (long long)step_live);
+           (long long)step_live,
+           osc_half_period,
+           (unsigned long long)osc_phase_preload);
 }
 
 int main(int argc, char **argv) {
@@ -276,6 +290,20 @@ int main(int argc, char **argv) {
         }
         uint64_t trig_phase_step = (uint64_t)strtoull(argv[3], NULL, 0);
         wr48u(base, REG_TRIG_PHASE_STEP_LO, REG_TRIG_PHASE_STEP_HI, trig_phase_step);
+        print_json(base);
+
+    } else if (strcmp(argv[2], "osc") == 0) {
+        if (argc != 5) {
+            usage(argv[0]);
+            munmap(map, (size_t)page_size);
+            close(fd);
+            return 1;
+        }
+        uint32_t half_period   = (uint32_t)strtoul(argv[3], NULL, 0);
+        uint64_t phase_preload = (uint64_t)strtoull(argv[4], NULL, 0);
+        /* Write preload high word first for atomic FPGA latch */
+        wr48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI, phase_preload);
+        wr32(base, REG_OSC_HALF_PERIOD, half_period);
         print_json(base);
 
     } else {

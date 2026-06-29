@@ -52,10 +52,11 @@ except ImportError:
 # Hardware constants and pure conversion math live in a Qt-free module so they
 # can be unit-tested in isolation (see tests/test_rp_math.py).
 from rp_math import (  # noqa: E402
-    CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH,
+    CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH, CTRL_OSC_MODE,
     PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
+    f_shift_from_f_osc, osc_half_period_cycles, osc_phase_preload as osc_preload_word,
 )
 
 
@@ -176,6 +177,22 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
+    def apply_osc(self, width_cycles: int, half_period: int, preload: int, offset_word: int):
+        """Set osc registers then write to enable (osc_mode + enable bits)."""
+        if self._live:
+            ctrl = CTRL_ENABLE | CTRL_OSC_MODE
+            self._enqueue(self.P_USER,
+                          lambda: self._do_apply_osc(width_cycles, half_period,
+                                                     preload, offset_word, ctrl),
+                          self.sig_status.emit)
+
+    def disable_osc(self):
+        """Clear osc_mode bit, keep enable."""
+        if self._live:
+            self._enqueue(self.P_USER,
+                          lambda: self._do_set_control_pulse(CTRL_ENABLE),
+                          self.sig_status.emit)
+
     def upload_pulse(self, c_src: str, bit_src: Optional[str]):
         if self._live:
             self._enqueue(self.P_UPLOAD, lambda: self._do_upload_pulse(c_src, bit_src))
@@ -288,6 +305,15 @@ class SshBackend(QObject):
 
     def _do_read(self) -> dict:
         return json.loads(self._exec(f"{self._active_cmd()} read"))
+
+    def _do_apply_osc(self, wc: int, half_period: int, preload: int,
+                      offset: int, ctrl: int) -> dict:
+        self._exec(
+            f"/root/rp_pulse_ctl 0x{self._base:08X} osc {half_period} {preload}"
+        )
+        return json.loads(self._exec(
+            f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {offset} {ctrl}"
+        ))
 
     def _do_write_pulse(self, width: int, offset: int) -> dict:
         return json.loads(self._exec(
@@ -1239,6 +1265,297 @@ class HarmonicPanel(_NcoPanel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OscPanel — oscillating delay mode
+#   phase sweeps P0-P → P0+P → P0-P at rate f_osc
+#   f_shift = 4 * f_osc * P  (derived internally)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OscPanel(QWidget):
+    """Oscillating delay: stroboscopic phase-scan via alternating NCO sign."""
+
+    sig_params_changed = Signal()
+
+    def __init__(self, backend: SshBackend, log_fn: Callable[[str], None],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._be      = backend
+        self._log_fn  = log_fn
+        self._period_c = 0
+        self._live     = False
+        self._osc_active = False
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self._do_apply)
+
+        self._build_ui()
+
+        backend.sig_connected.connect(self._on_connected)
+        backend.sig_disconnected.connect(self._on_disconnected)
+        backend.sig_status.connect(self._on_status)
+
+    def _log(self, msg: str):
+        self._log_fn(f"[Osc] {msg}")
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(_SP_SM, _SP_MD, _SP_SM, _SP_SM)
+        root.setSpacing(_SP_LG)
+
+        # ── Status tiles ────────────────────────────────────────────────────
+        self._d_in   = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
+        self._d_osc  = BigDisplay("Osc. Rate",        "f_osc = f_shift / (4·P)", _GREEN)
+        self._d_amp  = BigDisplay("Phase Amplitude",  "P (% of T_in)",           _AMBER)
+        self._d_fsh  = BigDisplay("NCO Shift",        "derived f_shift",          _AMBER)
+
+        for d in (self._d_in, self._d_osc, self._d_amp, self._d_fsh):
+            d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            d.setMinimumHeight(80)
+
+        readouts = QFrame()
+        readouts.setObjectName("oscReadoutGrid")
+        readouts.setStyleSheet("QFrame#oscReadoutGrid { background: transparent; border: none; }")
+        grid = QGridLayout(readouts)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(_SP_MD)
+        grid.addWidget(self._d_in,  0, 0)
+        grid.addWidget(self._d_osc, 0, 1)
+        grid.addWidget(self._d_amp, 1, 0)
+        grid.addWidget(self._d_fsh, 1, 1)
+        for i in range(2):
+            grid.setRowStretch(i, 1)
+            grid.setColumnStretch(i, 1)
+        root.addWidget(readouts, 1)
+
+        # ── Controls ────────────────────────────────────────────────────────
+        controls = _make_group("Oscillating Delay Controls")
+        controls.setMinimumHeight(220)
+        cl = QHBoxLayout(controls)
+        cl.setContentsMargins(_SP_LG, 12, _SP_LG, _SP_LG)
+        cl.setSpacing(_SP_LG)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(_SP_MD)
+
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(12)
+        fields.setVerticalSpacing(14)
+
+        def _spin(lo, hi, dec, step, suffix, val, width=160):
+            s = QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setDecimals(dec)
+            s.setSingleStep(step)
+            s.setSuffix(suffix)
+            s.setValue(val)
+            s.setFixedHeight(34)
+            s.setMinimumWidth(width)
+            s.setFont(_mono_font(12, bold=True))
+            s.setStyleSheet(_spin_style())
+            return s
+
+        # Row 0: f_osc
+        fields.addWidget(_dim_label("f_osc:"), 0, 0)
+        self._sp_fosc = _spin(0.001, 1e6, 3, 100.0, " Hz", 10_000.0)
+        self._sp_fosc.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_fosc, 0, 1)
+
+        # Row 0 col 2-3: Width %
+        fields.addWidget(_dim_label("Width:", 80), 0, 2)
+        self._sp_width = _spin(0.1, 99.9, 2, 1.0, " %", 1.0, 120)
+        self._sp_width.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_width, 0, 3)
+
+        # Row 1: P (amplitude)
+        fields.addWidget(_dim_label("Phase P:"), 1, 0)
+        self._sp_P = _spin(0.1, 49.9, 2, 1.0, " %", 20.0)
+        self._sp_P.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_P, 1, 1)
+
+        # Row 1 col 2-3: P0 (centre)
+        fields.addWidget(_dim_label("Centre P0:", 80), 1, 2)
+        self._sp_P0 = _spin(-49.9, 49.9, 2, 1.0, " %", 0.0, 120)
+        self._sp_P0.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_P0, 1, 3)
+
+        # Row 2: auto-apply
+        auto_row = QHBoxLayout()
+        self._cb_auto = QCheckBox("Auto-Apply")
+        self._cb_auto.setChecked(True)
+        self._cb_auto.setFont(_mono_font(10))
+        self._cb_auto.setStyleSheet(_checkbox_style())
+        auto_row.addWidget(self._cb_auto)
+        auto_row.addStretch()
+        fields.addLayout(auto_row, 2, 0, 1, 4)
+
+        # Row 3: derived detail label
+        self._lbl_detail = QLabel()
+        self._lbl_detail.setFont(_mono_font(9))
+        self._lbl_detail.setWordWrap(True)
+        self._lbl_detail.setStyleSheet(f"color: {_MUTED}; background: transparent;")
+        fields.addWidget(self._lbl_detail, 3, 0, 1, 4)
+        fields.setColumnStretch(1, 1)
+
+        left_col.addLayout(fields)
+        cl.addLayout(left_col, 1)
+
+        # ── Action column ────────────────────────────────────────────────────
+        actions = QVBoxLayout()
+        actions.setSpacing(8)
+
+        self._btn_apply = QPushButton("Apply now\nCtrl+Return")
+        self._btn_apply.setFixedWidth(190)
+        self._btn_apply.setMinimumHeight(60)
+        self._btn_apply.setFont(_mono_font(12, bold=True))
+        self._btn_apply.setStyleSheet(_btn_style(_GREEN))
+        self._btn_apply.clicked.connect(self._do_apply)
+        self._btn_apply.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        actions.addWidget(self._btn_apply)
+
+        self._btn_stop = QPushButton("Stop osc")
+        self._btn_stop.setFixedWidth(190)
+        self._btn_stop.setFixedHeight(34)
+        self._btn_stop.setStyleSheet(_btn_style(_RED))
+        self._btn_stop.clicked.connect(self._do_stop)
+        actions.addWidget(self._btn_stop)
+
+        self._btn_upload = QPushButton("Upload && compile\nPulse mode")
+        self._btn_upload.setFixedWidth(190)
+        self._btn_upload.setFixedHeight(44)
+        self._btn_upload.setStyleSheet(_btn_style(_ACCENT))
+        self._btn_upload.clicked.connect(self._do_upload)
+        actions.addWidget(self._btn_upload)
+        actions.addStretch()
+        cl.addLayout(actions)
+
+        root.addWidget(controls)
+        self._update_detail()
+        self._set_controls_enabled(False)
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _set_controls_enabled(self, enabled: bool):
+        for w in (self._sp_fosc, self._sp_P, self._sp_P0, self._sp_width,
+                  self._cb_auto, self._btn_apply, self._btn_stop):
+            w.setEnabled(enabled)
+
+    def _current_f_shift(self) -> float:
+        return f_shift_from_f_osc(self._sp_fosc.value(), self._sp_P.value() / 100.0)
+
+    def _update_detail(self):
+        f_osc = self._sp_fosc.value()
+        P_frac = self._sp_P.value() / 100.0
+        P0_frac = self._sp_P0.value() / 100.0
+        f_shift = f_shift_from_f_osc(f_osc, P_frac)
+        half_p = osc_half_period_cycles(P_frac, f_shift) if f_shift > 0 else 0
+        osc_T_ms = (2 * half_p / CLK_HZ * 1e3) if half_p > 0 else 0.0
+        self._lbl_detail.setText(
+            f"f_shift = {f_shift:.4f} Hz    "
+            f"half_period = {half_p} clks    "
+            f"T_osc = {osc_T_ms:.3f} ms    "
+            f"scan range: ({P0_frac*100-P_frac*100:.1f}% … {P0_frac*100+P_frac*100:.1f}%) of T_in"
+        )
+        self._d_osc.set_data(fmt_freq(f_osc), f"T_osc = {osc_T_ms:.3f} ms", _GREEN)
+        self._d_amp.set_data(f"±{self._sp_P.value():.2f} %", f"centre P0 = {self._sp_P0.value():.2f}%", _AMBER)
+        self._d_fsh.set_data(fmt_freq(f_shift), "NCO f_shift", _AMBER)
+
+    # ── backend slots ──────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_connected(self):
+        self._live = True
+        self._set_controls_enabled(True)
+
+    @Slot(str)
+    def _on_disconnected(self, _reason: str):
+        self._live = False
+        self._period_c = 0
+        self._set_controls_enabled(False)
+        self._d_in.set_data("---", "disconnected", _RED)
+
+    @Slot(dict)
+    def _on_status(self, d: dict):
+        if int(d.get("harmonic_mode", 0)) != 0:
+            return  # harmonic helper JSON, skip
+
+        step_base = int(d.get("phase_step_base") or 0)
+        if step_base > 0:
+            self._period_c = (1 << PHASE_BITS) // step_base
+            in_hz  = phase_to_hz(step_base)
+            stable = bool(d.get("period_stable"))
+            self._d_in.set_data(
+                fmt_freq(in_hz),
+                "stable" if stable else "acquiring …",
+                _ACCENT if stable else _AMBER,
+            )
+
+        # Reflect hardware osc_mode state
+        ctrl = int(d.get("control") or 0)
+        self._osc_active = bool((ctrl >> 4) & 1)
+
+    # ── parameter controls ─────────────────────────────────────────────────────
+
+    def _param_changed(self, *_):
+        self._update_detail()
+        if self._live and self._cb_auto.isChecked():
+            self._debounce.start()
+        self.sig_params_changed.emit()
+
+    # ── actions ────────────────────────────────────────────────────────────────
+
+    def apply(self):
+        self._do_apply()
+
+    def _do_apply(self):
+        if not self._live:
+            return
+        f_osc  = self._sp_fosc.value()
+        P_frac = self._sp_P.value() / 100.0
+        P0_frac = self._sp_P0.value() / 100.0
+        width_pct = self._sp_width.value()
+
+        f_shift    = f_shift_from_f_osc(f_osc, P_frac)
+        half_p     = osc_half_period_cycles(P_frac, f_shift)
+        preload    = osc_preload_word(P0_frac, P_frac)
+        offset_w   = hz_to_phase(f_shift)
+        period     = self._period_c if self._period_c > 0 else 1000
+        wc         = duty_to_cycles(width_pct / 100.0, period)
+
+        self._be.apply_osc(wc, half_p, preload, offset_w)
+        self._log(
+            f"Apply  f_osc={fmt_freq(f_osc)}  P={P_frac*100:.2f}%  P0={P0_frac*100:.2f}%  "
+            f"f_shift={f_shift:.4f} Hz  half_period={half_p}  preload={preload}"
+        )
+
+    def _do_stop(self):
+        if not self._live:
+            return
+        self._be.disable_osc()
+        self._log("Osc mode disabled.")
+
+    def _do_upload(self):
+        here    = Path(__file__).resolve().parent
+        c_src   = os.fspath(here / "rp_ctl.c")
+        bit_src = os.fspath(here / "red_pitaya_top.bit.bin")
+        if not Path(c_src).exists():
+            self._log(f"ERROR: {c_src} not found")
+            return
+        self._be.upload_pulse(c_src, Path(bit_src) if Path(bit_src).exists() else None)
+        self._log("Upload queued.")
+
+    def get_params(self) -> dict:
+        return {
+            "f_osc_hz":    self._sp_fosc.value(),
+            "P_pct":       self._sp_P.value(),
+            "P0_pct":      self._sp_P0.value(),
+            "width_pct":   self._sp_width.value(),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MainWindow — shared connection + tab host + shared log
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1327,12 +1644,15 @@ class MainWindow(QMainWindow):
 
         self._pulse_panel    = PulsePanel(self._be, self._log)
         self._harmonic_panel = HarmonicPanel(self._be, self._log)
+        self._osc_panel      = OscPanel(self._be, self._log)
 
         self._tabs.addTab(self._pulse_panel,    "Pulse / Freq-Shift")
         self._tabs.addTab(self._harmonic_panel, "Harmonic Generator")
+        self._tabs.addTab(self._osc_panel,      "Osc. Delay")
         self._tabs.currentChanged.connect(self._on_tab_changed)
         self._pulse_panel.sig_params_changed.connect(self._write_state_file)
         self._harmonic_panel.sig_params_changed.connect(self._write_state_file)
+        self._osc_panel.sig_params_changed.connect(self._write_state_file)
         root.addWidget(self._tabs, 1)
 
         shared = QWidget()
@@ -1639,7 +1959,7 @@ class MainWindow(QMainWindow):
     @Slot(int)
     def _on_tab_changed(self, idx: int):
         """Switch the poll helper when the user changes tabs."""
-        mode = "pulse" if idx == 0 else "harmonic"
+        mode = "harmonic" if idx == 1 else "pulse"  # osc (idx=2) uses pulse helper
         self._be.set_active_mode(mode)
         self._write_state_file()
 
@@ -1647,7 +1967,7 @@ class MainWindow(QMainWindow):
 
     def _active_panel_apply(self):
         panel = self._tabs.currentWidget()
-        if isinstance(panel, _NcoPanel):
+        if isinstance(panel, (_NcoPanel, OscPanel)):
             panel.apply()
 
     # ── adaptive polling ──────────────────────────────────────────────────────
@@ -1668,16 +1988,23 @@ class MainWindow(QMainWindow):
     # ── error / log ────────────────────────────────────────────────────────────
 
     def _write_state_file(self):
-        pp = self._pulse_panel.get_params()
-        hp = self._harmonic_panel.get_params()
+        pp  = self._pulse_panel.get_params()
+        hp  = self._harmonic_panel.get_params()
+        op  = self._osc_panel.get_params()
+        idx = self._tabs.currentIndex()
         active_mode = self._be.mode
         state = {
             "mode": active_mode,
+            "active_tab": idx,
             "output_mode": pp["output_mode"] if active_mode == "pulse" else hp["output_mode"],
             "pulse_freq_shift_hz": pp["freq_shift_hz"],
             "harmonic_freq_shift_hz": hp["freq_shift_hz"],
             "duty_cycle_pct": pp["duty_cycle_pct"],
             "harmonic_n": hp["harmonic_n"],
+            "osc_f_osc_hz": op["f_osc_hz"],
+            "osc_P_pct":    op["P_pct"],
+            "osc_P0_pct":   op["P0_pct"],
+            "osc_width_pct": op["width_pct"],
             "updated_at": time.time(),
         }
         try:

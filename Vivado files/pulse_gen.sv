@@ -46,10 +46,14 @@ module pulse_gen
   input  logic        enable,
   input  logic        soft_reset,
   input  logic        harmonic_mode,
+  input  logic        osc_mode,
   input  logic [31:0] width_n,         // pulse_width cycles (pulse) or mult_n[2:0] (harmonic)
   input  logic [31:0] meas_time_us,
 
   input  logic signed [47:0] phase_step_offset,
+
+  input  logic [31:0] osc_half_period,    // clock ticks per half-oscillation
+  input  logic [47:0] osc_phase_preload,  // accumulator preload for delay = P0 - P
 
   input  logic [47:0] trig_phase_step,   // DIO2 free-running square wave: 48-bit NCO step (0=off)
 
@@ -256,6 +260,7 @@ module pulse_gen
   // Pulse mode:    phase_step = phase_step_base + phase_step_offset
   // Harmonic mode: phase_step = mult_n * phase_step_base + phase_step_offset
   //   mult_n = width_n[2:0] clamped to [1..5]
+  // Osc mode:      phase_step_offset sign alternates every osc_half_period ticks
   // ----------------------------------------------------------------
   logic [2:0] mult_n_raw;
   logic [2:0] mult_n_safe;
@@ -264,10 +269,17 @@ module pulse_gen
                        (mult_n_raw >  3'd5) ? 3'd5 : mult_n_raw;
 
   logic [50:0] mult_step;
-  assign mult_step  = harmonic_mode ?
+  assign mult_step = harmonic_mode ?
       (51'(phase_step_base[47:0])) * (51'(mult_n_safe)) :
       51'(phase_step_base[47:0]);
-  assign phase_step = $signed(mult_step[47:0]) + phase_step_offset;
+
+  // osc_sign=0: subtract offset (f_out < f_in → phase delay grows toward P0+P)
+  // osc_sign=1: add offset    (f_out > f_in → phase delay shrinks toward P0-P)
+  logic osc_sign;
+  logic signed [47:0] phase_step_eff;
+  assign phase_step_eff = osc_mode ? (osc_sign ? phase_step_offset : -phase_step_offset)
+                                   : phase_step_offset;
+  assign phase_step = $signed(mult_step[47:0]) + phase_step_eff;
 
   logic [47:0] phase_acc;
   logic [48:0] acc_sum;
@@ -276,20 +288,60 @@ module pulse_gen
 
   // ----------------------------------------------------------------
   // Freerun state + NCO accumulator
+  //
+  // Osc mode: sign alternates every osc_half_period ticks, sweeping
+  // output phase P0-P → P0+P → P0-P at rate f_shift / (4·P).
+  // Accumulator is preloaded on osc_mode enable so first pulse has
+  // delay = P0 - P (start of triangle wave).
   // ----------------------------------------------------------------
+  logic [31:0] osc_counter;
+  logic        osc_mode_prev;
+
   always_ff @(posedge clk) begin
     if (!rstn) begin
       freerun_active <= 1'b0;
       phase_acc      <= 48'd0;
+      osc_counter    <= 32'd0;
+      osc_sign       <= 1'b0;
+      osc_mode_prev  <= 1'b0;
     end else begin
+      osc_mode_prev <= osc_mode;
       if (soft_reset || !enable) begin
         freerun_active <= 1'b0;
         phase_acc      <= 48'd0;
+        osc_counter    <= 32'd0;
+        osc_sign       <= 1'b0;
       end else if (!freerun_active) begin
-        if (period_stable && div_base_valid && !div_active)
+        if (period_stable && div_base_valid && !div_active) begin
           freerun_active <= 1'b1;
+          if (osc_mode) begin
+            phase_acc   <= osc_phase_preload;
+            osc_counter <= 32'd0;
+            osc_sign    <= 1'b0;
+          end
+        end
       end else begin
-        phase_acc <= acc_sum[47:0];
+        // freerun active
+        if (osc_mode && !osc_mode_prev) begin
+          // rising edge of osc_mode: preload accumulator, reset oscillation
+          phase_acc   <= osc_phase_preload;
+          osc_counter <= 32'd0;
+          osc_sign    <= 1'b0;
+        end else begin
+          phase_acc <= acc_sum[47:0];
+          if (osc_mode) begin
+            if (osc_half_period > 32'd0 &&
+                osc_counter >= osc_half_period - 32'd1) begin
+              osc_counter <= 32'd0;
+              osc_sign    <= ~osc_sign;
+            end else begin
+              osc_counter <= osc_counter + 32'd1;
+            end
+          end else begin
+            osc_counter <= 32'd0;
+            osc_sign    <= 1'b0;
+          end
+        end
       end
     end
   end

@@ -17,6 +17,7 @@ from rp_math import (  # noqa: E402
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz,
     measured_edges_to_phase_step, fmt_dur,
+    f_shift_from_f_osc, f_osc_from_params, osc_half_period_cycles, osc_phase_preload,
 )
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
@@ -134,6 +135,52 @@ class TestFormatters(unittest.TestCase):
 
     def test_window_names_match_options(self):
         self.assertEqual(len(WINDOW_NAMES), len(WINDOW_OPTIONS_US))
+
+
+class TestOscMath(unittest.TestCase):
+    def test_f_shift_roundtrip_via_f_osc(self):
+        # f_shift = 4 * f_osc * P  ↔  f_osc = f_shift / (4 * P)
+        for f_osc, P in ((10_000, 0.20), (500, 0.05), (1, 0.10)):
+            f_shift = f_shift_from_f_osc(f_osc, P)
+            self.assertAlmostEqual(f_osc_from_params(f_shift, P), f_osc, places=9)
+
+    def test_f_shift_zero_P_guard(self):
+        self.assertEqual(f_osc_from_params(100.0, 0.0), 0.0)
+
+    def test_half_period_formula(self):
+        # half_period = round(2*P*CLK / f_shift) = round(CLK / (2*f_osc))
+        f_osc  = 10_000.0
+        P_frac = 0.20
+        f_shift = f_shift_from_f_osc(f_osc, P_frac)
+        hp = osc_half_period_cycles(P_frac, f_shift)
+        expected = round(CLK_HZ / (2 * f_osc))
+        self.assertEqual(hp, expected)
+
+    def test_half_period_zero_shift_guard(self):
+        self.assertEqual(osc_half_period_cycles(0.20, 0.0), 0)
+
+    def test_preload_zero_offset(self):
+        # P0=0, P=0.20 → first pulse at -20% delay → preload = (1 - (-0.20)) % 1.0 * 2^48
+        # = (1.20 % 1.0) * 2^48 = 0.20 * 2^48
+        PHASE_WRAP = 2 ** PHASE_BITS
+        expected = int(0.20 * PHASE_WRAP)
+        result = osc_phase_preload(0.0, 0.20)
+        # Allow ±1 for int() truncation
+        self.assertAlmostEqual(result, expected, delta=1)
+
+    def test_preload_symmetry(self):
+        # With P0=P, start delay = 0 → preload = (1 - 0) % 1.0 * 2^48 = 0 (or PHASE_WRAP)
+        # (1 - (P0 - P)) = 1 - 0 = 1.0, mod 1.0 = 0.0 → preload = 0
+        result = osc_phase_preload(0.20, 0.20)
+        self.assertEqual(result, 0)
+
+    def test_preload_P0_nonzero(self):
+        PHASE_WRAP = 2 ** PHASE_BITS
+        P0, P = 0.10, 0.05
+        # (1 - (0.10 - 0.05)) % 1.0 = (1 - 0.05) % 1.0 = 0.95
+        expected = int(0.95 * PHASE_WRAP)
+        result = osc_phase_preload(P0, P)
+        self.assertAlmostEqual(result, expected, delta=1)
 
 
 if __name__ == "__main__":

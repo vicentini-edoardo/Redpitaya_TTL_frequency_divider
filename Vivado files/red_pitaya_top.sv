@@ -93,6 +93,9 @@ logic        pulse_enable;
 logic        pulse_soft_reset;
 logic        force_high;
 logic        harmonic_mode;
+logic        osc_mode;
+logic [31:0] osc_half_period;
+logic [47:0] osc_phase_preload;
 logic [31:0] width_n;
 logic [31:0] meas_time_us;
 logic        pulse_busy;
@@ -197,12 +200,15 @@ pulse_gen pulse_gen_i
   .enable            (pulse_enable),
   .soft_reset        (pulse_soft_reset),
   .harmonic_mode     (harmonic_mode),
+  .osc_mode          (osc_mode),
 
   .trig_in           (exp_p_io[0]),
 
   .width_n            (width_n),
   .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
+  .osc_half_period    (osc_half_period),
+  .osc_phase_preload  (osc_phase_preload),
 
   .trig_phase_step    (trig_phase_step),
 
@@ -254,10 +260,13 @@ axi4lite_pulse_regs regs_i
   .pulse_soft_reset    (pulse_soft_reset),
   .force_high          (force_high),
   .harmonic_mode       (harmonic_mode),
+  .osc_mode            (osc_mode),
   .trig_phase_step     (trig_phase_step),
   .width_n             (width_n),
   .meas_time_us        (meas_time_us),
   .phase_step_offset   (phase_step_offset),
+  .osc_half_period     (osc_half_period),
+  .osc_phase_preload   (osc_phase_preload),
 
   .pulse_busy          (pulse_busy),
   .period_cycles       (period_cycles),
