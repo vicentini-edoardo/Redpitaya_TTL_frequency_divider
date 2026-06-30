@@ -97,6 +97,55 @@ class TestWaveformAnalysis(unittest.TestCase):
         self.assertAlmostEqual(result.metrics["delay_phase_amplitude"], p, delta=0.01)
         self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.6)
 
+    def test_identity_passes_when_undersampled_with_nco_jitter(self):
+        # Regression for the false "output frequency differs" FAIL on the
+        # shift=0 identity test. An NCO-generated output sampled at only
+        # ~11 samples/period gets a quantized, biased median-period estimate
+        # even though input and output carry the same number of edges. The
+        # span-based estimator must report f_out == f_in here.
+        clk_hz = 124_999_999.0
+        f_in = 259_000.0
+        scope_dt = 350e-9  # 2.857 MHz effective sample rate -> ~11 samples/period
+        duration_s = 0.05
+
+        # Clean external input.
+        in_times, in_v = square_wave(f_in, duration_s, 1.0 / scope_dt)
+
+        # NCO output: carry-out of a 48-bit accumulator stepped at the rate the
+        # FPGA derives for f_in. Reconstruct it on the scope sample grid so the
+        # per-edge jitter and grid quantization match a real capture.
+        phase_step = round(f_in * 2**48 / clk_hz)
+        out_v = []
+        for t in in_times:
+            # phase advanced by NCO at clk_hz, observed on the scope grid
+            phase = (t * clk_hz * phase_step / 2**48) % 1.0
+            out_v.append(3.3 if phase < 0.5 else 0.0)
+
+        result = analyze_capture(
+            test_name="identity_undersampled",
+            times_s=in_times,
+            channels_v={"A": in_v, "B": out_v},
+            input_channel="A",
+            output_channel="B",
+            expectation=PulseExpectation(input_multiplier=1, shift_hz=0.0, duty_frac=0.5),
+            cfg=AnalysisConfig(threshold_v=1.5, min_edges=4),
+        )
+
+        self.assertEqual(result.status, CheckStatus.PASS, result.messages)
+        # Span estimate must agree to well within tolerance...
+        self.assertAlmostEqual(result.metrics["output_hz"], result.metrics["input_hz"],
+                               delta=max(2.0, f_in * 0.002))
+        # ...and the under-sampling must be reported for diagnosis.
+        self.assertLess(result.metrics["output_samples_per_period"], 20.0)
+
+    def test_frequency_estimator_uses_span_not_median(self):
+        from hardware_tests.redpitaya_picosdk_verify import _frequency_from_rising_edges
+        # Edge times whose median interval differs from the mean interval:
+        # periods are 1, 1, 1, 1, 5 (median 1.0, mean 1.8). The estimator must
+        # follow the total span (mean), not the median.
+        edges = [0.0, 1.0, 2.0, 3.0, 4.0, 9.0]
+        self.assertAlmostEqual(_frequency_from_rising_edges(edges), 5 / 9.0, places=9)
+
 
 class TestCommandBuilder(unittest.TestCase):
     def test_builds_pulse_command_like_gui(self):

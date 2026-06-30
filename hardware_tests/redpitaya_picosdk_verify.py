@@ -492,12 +492,20 @@ def analyze_capture(
     input_hz = _frequency_from_rising_edges(in_rising)
     output_hz = _frequency_from_rising_edges(out_rising)
     output_duty = _duty_from_samples(out_v, cfg.threshold_v)
+    sample_dt = (times_s[1] - times_s[0]) if len(times_s) >= 2 else math.nan
     metrics.update({
         "input_edges": len(in_rising),
         "output_edges": len(out_rising),
         "input_hz": input_hz,
         "output_hz": output_hz,
         "output_duty": output_duty,
+        # Diagnostics: the median-period estimate quantizes onto the sample
+        # grid at low oversampling; keep it next to the span estimate above so
+        # a large gap between them flags an under-sampled capture rather than a
+        # real hardware frequency error.
+        "input_hz_median": (1.0 / _median_period(in_rising)) if len(in_rising) >= 2 else math.nan,
+        "output_hz_median": (1.0 / _median_period(out_rising)) if len(out_rising) >= 2 else math.nan,
+        "output_samples_per_period": (1.0 / (output_hz * sample_dt)) if (math.isfinite(output_hz) and output_hz > 0 and math.isfinite(sample_dt) and sample_dt > 0) else math.nan,
     })
 
     if isinstance(expectation, OscExpectation):
@@ -627,9 +635,22 @@ def _estimate_osc_rate_from_delay(times_s: Sequence[float], deltas: Sequence[flo
 
 
 def _frequency_from_rising_edges(rising_edges_s: Sequence[float]) -> float:
+    """Frequency from the total span of rising edges: (N-1) / (t_last - t_first).
+
+    This is the reciprocal of the *mean* edge interval and is robust to both
+    per-edge jitter and PicoScope sample-grid quantization. The previous
+    1/median(instantaneous_period) estimator quantizes onto the sample grid
+    when oversampling is low (e.g. ~11 samples/period for a 259 kHz signal at
+    a 2.86 MHz effective sample rate), biasing a clean external input and an
+    NCO-generated output by different amounts and producing false frequency
+    mismatches even when the two signals carry an identical number of edges.
+    """
     if len(rising_edges_s) < 2:
         return math.nan
-    return 1.0 / _median_period(rising_edges_s)
+    span = rising_edges_s[-1] - rising_edges_s[0]
+    if span <= 0:
+        return math.nan
+    return (len(rising_edges_s) - 1) / span
 
 
 def _median_period(times_s: Sequence[float]) -> float:
