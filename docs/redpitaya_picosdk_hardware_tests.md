@@ -138,6 +138,7 @@ can re-run or improve the analysis without another lab capture.
 
 | Failure | Likely cause |
 | --- | --- |
+| Output frequency off by a small % but `input_edges == output_edges` (×N for harmonic) | Not a hardware error: under-sampled capture. Check `output_samples_per_period` in `summary.json`; if it is small (≲20), raise `--sample-rate-hz` or shorten the capture. Frequency is reported from the edge span, but very low oversampling still degrades edge timing. |
 | Too few input rising edges | No TTL on `DIO0_P`, bad ground, threshold too high, or capture too short. |
 | OFF/ON test wrong | Output pin wiring issue, helper not installed, or wrong bitstream. |
 | Pulse frequency wrong by the shift amount | `phase_step_offset` write path or signed conversion issue. |
