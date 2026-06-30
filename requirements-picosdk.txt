@@ -4,3 +4,4 @@
 # OS. The Python package below is only the wrapper.
 paramiko>=3.0
 picosdk>=1.1
+scipy>=1.10

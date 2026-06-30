@@ -72,19 +72,20 @@ class TestWaveformAnalysis(unittest.TestCase):
         self.assertEqual(result.status, CheckStatus.FAIL)
         self.assertTrue(any("frequency" in msg for msg in result.messages))
 
-    def test_osc_delay_analysis_reports_center_amplitude_and_rate(self):
-        input_freq = 1_000.0
-        duration_s = 0.4
+    def test_osc_delay_sinusoidal_fit_recovers_parameters(self):
+        # Ideal sinusoidal delay oscillation: fit should recover P0, P, f_osc.
+        import math as _math
+        f_in = 10_000.0
+        duration_s = 1.0
         f_osc = 5.0
         p0 = 0.25
         p = 0.05
-        input_period = 1 / input_freq
-        input_edges = [i * input_period for i in range(int(duration_s * input_freq))]
-        output_edges = []
-        for t in input_edges:
-            tri = 2.0 * abs(2.0 * ((t * f_osc) % 1.0) - 1.0) - 1.0
-            phase = p0 + p * tri
-            output_edges.append(t + phase * input_period)
+        T_in = 1.0 / f_in
+        input_edges = [k * T_in for k in range(int(duration_s * f_in))]
+        output_edges = [
+            t + (p0 + p * _math.cos(2 * _math.pi * f_osc * t)) * T_in
+            for t in input_edges
+        ]
 
         result = analyze_osc_delay(
             input_rising_s=input_edges,
@@ -92,10 +93,65 @@ class TestWaveformAnalysis(unittest.TestCase):
             expectation=OscExpectation(f_osc_hz=f_osc, p_frac=p, p0_frac=p0),
         )
 
-        self.assertEqual(result.status, CheckStatus.PASS)
+        self.assertEqual(result.status, CheckStatus.PASS, result.messages)
         self.assertAlmostEqual(result.metrics["delay_phase_center"], p0, delta=0.01)
-        self.assertAlmostEqual(result.metrics["delay_phase_amplitude"], p, delta=0.01)
-        self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.6)
+        self.assertAlmostEqual(result.metrics["delay_phase_amplitude"], p, delta=0.005)
+        self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.5)
+        self.assertEqual(result.metrics["delay_fit_nonlinear"], 1)
+
+    def test_osc_delay_triangle_wave_passes_within_amplitude_tolerance(self):
+        # Hardware generates a triangle-wave delay (phase_step_offset alternates
+        # sign). The sinusoidal fit underestimates the amplitude by 8/π² ≈ 0.81,
+        # but the error (< 0.01 for P=0.05) stays within osc_phase_abs_tol=0.025.
+        import math as _math
+        f_in = 10_000.0
+        duration_s = 1.0
+        f_osc = 5.0
+        p0 = 0.25
+        p = 0.05
+        T_in = 1.0 / f_in
+        input_edges = [k * T_in for k in range(int(duration_s * f_in))]
+        output_edges = [
+            t + (p0 + p * (2.0 * abs(2.0 * ((t * f_osc) % 1.0) - 1.0) - 1.0)) * T_in
+            for t in input_edges
+        ]
+
+        result = analyze_osc_delay(
+            input_rising_s=input_edges,
+            output_rising_s=output_edges,
+            expectation=OscExpectation(f_osc_hz=f_osc, p_frac=p, p0_frac=p0),
+        )
+
+        self.assertEqual(result.status, CheckStatus.PASS, result.messages)
+        self.assertAlmostEqual(result.metrics["delay_phase_center"], p0, delta=0.01)
+        self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.5)
+        # Amplitude biased to ~0.81×P; must pass the hardware check (tol 0.025)
+        self.assertLess(abs(result.metrics["delay_phase_amplitude"] - p), 0.025)
+
+    def test_osc_delay_fails_when_oscillation_rate_wrong(self):
+        # f_osc is 10× higher than commanded: the fit must detect the mismatch.
+        import math as _math
+        f_in = 10_000.0
+        duration_s = 1.0
+        f_osc_actual = 50.0
+        f_osc_expected = 5.0
+        p0 = 0.25
+        p = 0.05
+        T_in = 1.0 / f_in
+        input_edges = [k * T_in for k in range(int(duration_s * f_in))]
+        output_edges = [
+            t + (p0 + p * _math.cos(2 * _math.pi * f_osc_actual * t)) * T_in
+            for t in input_edges
+        ]
+
+        result = analyze_osc_delay(
+            input_rising_s=input_edges,
+            output_rising_s=output_edges,
+            expectation=OscExpectation(f_osc_hz=f_osc_expected, p_frac=p, p0_frac=p0),
+        )
+
+        self.assertEqual(result.status, CheckStatus.FAIL)
+        self.assertTrue(any("oscillation rate" in m for m in result.messages))
 
     def test_identity_passes_when_undersampled_with_nco_jitter(self):
         # Regression for the false "output frequency differs" FAIL on the
