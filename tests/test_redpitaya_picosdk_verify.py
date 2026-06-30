@@ -146,6 +146,108 @@ class TestWaveformAnalysis(unittest.TestCase):
         edges = [0.0, 1.0, 2.0, 3.0, 4.0, 9.0]
         self.assertAlmostEqual(_frequency_from_rising_edges(edges), 5 / 9.0, places=9)
 
+    def test_coherent_frequency_resolves_far_below_a_millihertz(self):
+        from hardware_tests.redpitaya_picosdk_verify import _coherent_frequency
+        import random
+
+        f = 254_000.0
+        period = 1.0 / f
+        n = 100_000  # ~0.4 s of edges
+        rng = random.Random(1234)
+        jitter_s = 5e-9  # 5 ns RMS edge timing noise
+        edges = [k * period + rng.gauss(0.0, jitter_s) for k in range(n)]
+
+        freq, stderr = _coherent_frequency(edges)
+        self.assertTrue(math.isfinite(freq) and math.isfinite(stderr))
+        # The coherent fit must recover the true frequency to well under 1 mHz
+        # and report a standard error well under 1 mHz.
+        self.assertLess(abs(freq - f), 1e-3)
+        self.assertLess(stderr, 1e-3)
+
+    def test_coherent_frequency_rejects_trains_with_missing_edges(self):
+        from hardware_tests.redpitaya_picosdk_verify import _coherent_frequency
+        # A dropped edge leaves a ~2x gap; the integer-index fit is invalid, so
+        # the estimator must refuse rather than report a biased frequency.
+        edges = [0.0, 1.0, 2.0, 4.0, 5.0, 6.0]  # missing edge at 3.0
+        freq, stderr = _coherent_frequency(edges)
+        self.assertTrue(math.isnan(freq))
+        self.assertTrue(math.isnan(stderr))
+
+    def test_frequency_match_check_passes_when_output_equals_command(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_match_check,
+        )
+
+        commanded = 254_000.0
+        n = 120_000
+        out_edges = [k / commanded for k in range(n)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_match_check(out_hz, out_se, commanded, AnalysisConfig(), metrics)
+        self.assertEqual(msgs, [])
+        self.assertEqual(metrics["freq_match_resolved"], 1)
+        self.assertLess(abs(metrics["output_freq_error_hz"]), 1e-3)
+
+    def test_frequency_match_check_fails_when_output_off_command(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_match_check,
+        )
+
+        commanded = 254_000.0
+        # NCO actually emits 20 mHz high: with the clock allowance zeroed, the
+        # 1 mHz statistical floor governs and the error must be caught.
+        out_edges = [k / (commanded + 0.02) for k in range(120_000)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_match_check(
+            out_hz, out_se, commanded,
+            AnalysisConfig(freq_match_timebase_rel_tol=0.0), metrics,
+        )
+        self.assertEqual(metrics["freq_match_resolved"], 1)
+        self.assertTrue(any("FPGA-commanded" in m for m in msgs))
+
+    def test_frequency_match_check_tolerates_scope_clock_offset(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_match_check,
+        )
+
+        commanded = 254_000.0
+        # A 50 ppm scope-vs-RedPitaya clock offset (~12.7 Hz at 254 kHz) must NOT
+        # fail: absolute frequency agreement is bounded by the clock mismatch,
+        # which the timebase allowance covers.
+        out_edges = [k / (commanded * (1 + 50e-6)) for k in range(120_000)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_match_check(out_hz, out_se, commanded, AnalysisConfig(), metrics)
+        self.assertEqual(msgs, [])
+        self.assertEqual(metrics["freq_match_resolved"], 1)
+        self.assertGreater(abs(metrics["output_freq_error_hz"]), 1.0)
+
+    def test_frequency_match_check_skips_when_capture_cannot_resolve(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_match_check,
+        )
+        import random
+
+        # A short, coarsely-sampled train cannot resolve the 1 mHz floor (clock
+        # allowance zeroed): the check must record the error but not fail.
+        f = 254_000.0
+        n = 200  # ~0.8 ms of edges -> large standard error
+        rng = random.Random(7)
+        out_edges = [k / f + rng.gauss(0.0, 50e-9) for k in range(n)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_match_check(
+            out_hz, out_se, f,
+            AnalysisConfig(freq_match_timebase_rel_tol=0.0), metrics,
+        )
+        self.assertEqual(msgs, [])
+        self.assertEqual(metrics["freq_match_resolved"], 0)
+
 
 class TestCommandBuilder(unittest.TestCase):
     def test_builds_pulse_command_like_gui(self):

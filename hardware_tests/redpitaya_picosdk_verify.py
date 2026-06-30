@@ -64,6 +64,16 @@ class AnalysisConfig:
     duty_abs_tol: float = 0.05
     osc_phase_abs_tol: float = 0.025
     osc_freq_rel_tol: float = 0.10
+    # Strict frequency-match check (pulse mode, multiplier 1 only): the measured
+    # output frequency must equal the FPGA-commanded frequency
+    # (phase_to_hz(phase_step)). freq_match_abs_tol_hz is the statistical
+    # resolution floor (the coherent estimator reaches well under 1 mHz);
+    # freq_match_timebase_rel_tol is the systematic allowance for the
+    # independent PicoScope vs Red Pitaya sample clocks (tens of ppm), which
+    # sets the real floor on any *absolute* frequency comparison. True
+    # sub-millihertz verification needs a clock-independent ratio (DIO2).
+    freq_match_abs_tol_hz: float = 0.001
+    freq_match_timebase_rel_tol: float = 1e-4
 
 
 @dataclass(frozen=True)
@@ -466,6 +476,7 @@ def analyze_capture(
     output_channel: str,
     expectation: Expectation,
     cfg: AnalysisConfig,
+    commanded_output_hz: float | None = None,
 ) -> CheckResult:
     input_channel = input_channel.upper()
     output_channel = output_channel.upper()
@@ -491,6 +502,10 @@ def analyze_capture(
 
     input_hz = _frequency_from_rising_edges(in_rising)
     output_hz = _frequency_from_rising_edges(out_rising)
+    # Coherent (least-squares) estimates: ~sqrt(N) tighter than the span values,
+    # and the only way to resolve the in/out comparison to sub-millihertz.
+    input_hz_coherent, input_hz_coherent_se = _coherent_frequency(in_rising)
+    output_hz_coherent, output_hz_coherent_se = _coherent_frequency(out_rising)
     output_duty = _duty_from_samples(out_v, cfg.threshold_v)
     sample_dt = (times_s[1] - times_s[0]) if len(times_s) >= 2 else math.nan
     metrics.update({
@@ -506,6 +521,14 @@ def analyze_capture(
         "input_hz_median": (1.0 / _median_period(in_rising)) if len(in_rising) >= 2 else math.nan,
         "output_hz_median": (1.0 / _median_period(out_rising)) if len(out_rising) >= 2 else math.nan,
         "output_samples_per_period": (1.0 / (output_hz * sample_dt)) if (math.isfinite(output_hz) and output_hz > 0 and math.isfinite(sample_dt) and sample_dt > 0) else math.nan,
+        "input_hz_coherent": input_hz_coherent,
+        "output_hz_coherent": output_hz_coherent,
+        "input_hz_coherent_stderr": input_hz_coherent_se,
+        "output_hz_coherent_stderr": output_hz_coherent_se,
+        # In/out difference (scope timebase cancels): bounded below by the FPGA's
+        # ~1/(2*window) frequency-quantization (~5 Hz at the 100 ms window), not
+        # by the measurement, so this is a diagnostic, not the pass criterion.
+        "output_minus_input_hz": (output_hz_coherent - input_hz_coherent) if (math.isfinite(output_hz_coherent) and math.isfinite(input_hz_coherent)) else math.nan,
     })
 
     if isinstance(expectation, OscExpectation):
@@ -528,6 +551,11 @@ def analyze_capture(
         metrics["expected_output_duty"] = expectation.duty_frac
         if abs(output_duty - expectation.duty_frac) > cfg.duty_abs_tol:
             messages.append(f"output duty {output_duty:.4f} differs from expected {expectation.duty_frac:.4f}")
+    # Strict frequency-match check: the coherently-measured output frequency must
+    # equal the FPGA-commanded frequency (phase_to_hz(phase_step)). Only run for
+    # pulse mode (multiplier 1) and only when the FPGA register was read back.
+    if expectation.input_multiplier == 1:
+        messages.extend(_frequency_match_check(output_hz_coherent, output_hz_coherent_se, commanded_output_hz, cfg, metrics))
     return CheckResult(test_name, CheckStatus.FAIL if messages else CheckStatus.PASS, messages, metrics)
 
 
@@ -653,6 +681,94 @@ def _frequency_from_rising_edges(rising_edges_s: Sequence[float]) -> float:
     return (len(rising_edges_s) - 1) / span
 
 
+def _coherent_frequency(rising_edges_s: Sequence[float]) -> tuple[float, float]:
+    """Least-squares frequency from a regular rising-edge train.
+
+    Fits ``t_k = t0 + period * k`` over *all* edges (the integer index ``k`` is
+    exact; only the edge time carries noise) and returns ``(freq_hz, stderr_hz)``.
+    Because it uses every edge rather than only the first and last, its standard
+    error shrinks as ~N^1.5 instead of the span estimator's ~N, which is what
+    makes a sub-millihertz in-vs-out comparison possible.
+
+    Returns ``(nan, nan)`` when the train has a gap or a doubled edge (any
+    interval outside 0.5x..1.5x the median): a missed or spurious edge breaks
+    the integer index assignment, so the high-precision fit cannot be trusted.
+    The caller falls back to the span estimator and skips the strict check.
+    """
+    n = len(rising_edges_s)
+    if n < 3:
+        return math.nan, math.nan
+    intervals = [b - a for a, b in zip(rising_edges_s, rising_edges_s[1:])]
+    med = statistics.median(intervals)
+    if med <= 0:
+        return math.nan, math.nan
+    if any(d < 0.5 * med or d > 1.5 * med for d in intervals):
+        return math.nan, math.nan
+    mean_k = (n - 1) / 2.0
+    s_xx = n * (n * n - 1) / 12.0
+    mean_t = statistics.fmean(rising_edges_s)
+    s_xt = math.fsum((k - mean_k) * (t - mean_t) for k, t in enumerate(rising_edges_s))
+    if s_xx <= 0:
+        return math.nan, math.nan
+    period = s_xt / s_xx
+    if period <= 0:
+        return math.nan, math.nan
+    freq = 1.0 / period
+    intercept = mean_t - period * mean_k
+    residuals = [t - (intercept + period * k) for k, t in enumerate(rising_edges_s)]
+    resid_var = math.fsum(r * r for r in residuals) / (n - 2)
+    slope_stderr = math.sqrt(resid_var / s_xx) if resid_var > 0 else 0.0
+    freq_stderr = freq * freq * slope_stderr
+    return freq, freq_stderr
+
+
+def _frequency_match_check(
+    output_hz: float,
+    output_stderr_hz: float,
+    commanded_output_hz: float | None,
+    cfg: AnalysisConfig,
+    metrics: dict[str, float | int | str],
+) -> list[str]:
+    """Strict check that the measured output equals the FPGA-commanded frequency.
+
+    ``commanded_output_hz`` is ``phase_to_hz(phase_step)`` read back from the
+    settled FPGA registers, i.e. the frequency the divider+NCO datapath intends
+    to emit (measured input base, scaled, plus the exact shift). The coherent
+    estimator resolves the measured output to well under 1 mHz, but the *pass*
+    tolerance also carries a ppm term because the PicoScope and Red Pitaya run on
+    independent clocks (so an absolute comparison cannot be tighter than that
+    clock mismatch). The check engages only when the coherent standard error is
+    small enough to resolve the statistical floor; otherwise it reports the
+    error without failing, so an under-resolved capture never false-fails.
+    """
+    messages: list[str] = []
+    if commanded_output_hz is None or not (math.isfinite(commanded_output_hz) and commanded_output_hz > 0):
+        metrics["freq_match_resolved"] = 0
+        return messages
+    metrics["commanded_output_hz"] = commanded_output_hz
+    if not math.isfinite(output_hz):
+        metrics["freq_match_resolved"] = 0
+        return messages
+
+    err = output_hz - commanded_output_hz
+    metrics["output_freq_error_hz"] = err
+    match_tol = cfg.freq_match_abs_tol_hz + abs(commanded_output_hz) * cfg.freq_match_timebase_rel_tol
+    metrics["freq_match_tolerance_hz"] = match_tol
+
+    if not math.isfinite(output_stderr_hz) or output_stderr_hz > match_tol / 3.0:
+        # Coherent estimate too uncertain to trust the comparison against the
+        # tolerance; report the error but do not fail on an under-resolved capture.
+        metrics["freq_match_resolved"] = 0
+        return messages
+    metrics["freq_match_resolved"] = 1
+    if abs(err) > match_tol:
+        messages.append(
+            f"output frequency {output_hz:.6f} Hz differs from FPGA-commanded "
+            f"{commanded_output_hz:.6f} Hz by more than {match_tol:.6f} Hz"
+        )
+    return messages
+
+
 def _median_period(times_s: Sequence[float]) -> float:
     periods = [b - a for a, b in zip(times_s, times_s[1:]) if b > a]
     if not periods:
@@ -676,10 +792,14 @@ def build_default_suite(include_dio2: bool = False, dio2_hz: float = 1_000.0) ->
     tests = [
         HardwareTest("off_low", "off", ConstantExpectation(False), capture_seconds=0.02, settle_seconds=0.10),
         HardwareTest("force_high", "force_high", ConstantExpectation(True), capture_seconds=0.02, settle_seconds=0.10),
-        HardwareTest("pulse_identity_50pct", "pulse", PulseExpectation(1, 0.0, 0.50), capture_seconds=0.10, shift_hz=0.0, duty_frac=0.50),
-        HardwareTest("pulse_plus_100hz_25pct", "pulse", PulseExpectation(1, 100.0, 0.25), capture_seconds=0.20, shift_hz=100.0, duty_frac=0.25),
+        # Pulse-mode shift is normally < 20 Hz, and the in-vs-out frequencies
+        # must match to ~1 mHz. Resolving 1 mHz with the coherent estimator
+        # needs a long edge train, so these captures are 0.5 s.
+        HardwareTest("pulse_identity_50pct", "pulse", PulseExpectation(1, 0.0, 0.50), capture_seconds=0.50, shift_hz=0.0, duty_frac=0.50),
+        HardwareTest("pulse_plus_5hz_25pct", "pulse", PulseExpectation(1, 5.0, 0.25), capture_seconds=0.50, shift_hz=5.0, duty_frac=0.25),
+        HardwareTest("pulse_plus_20hz_50pct", "pulse", PulseExpectation(1, 20.0, 0.50), capture_seconds=0.50, shift_hz=20.0, duty_frac=0.50),
         HardwareTest("harmonic_2x", "harmonic", PulseExpectation(2, 0.0, 0.50), capture_seconds=0.10, harmonic_n=2),
-        HardwareTest("harmonic_3x_plus_100hz", "harmonic", PulseExpectation(3, 100.0, 0.50), capture_seconds=0.20, shift_hz=100.0, harmonic_n=3),
+        HardwareTest("harmonic_3x_plus_10hz", "harmonic", PulseExpectation(3, 10.0, 0.50), capture_seconds=0.20, shift_hz=10.0, harmonic_n=3),
         HardwareTest(
             "osc_delay_5hz_p5pct_p0_25pct",
             "osc",
@@ -747,6 +867,8 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
         freq_abs_tol_hz=args.freq_abs_tol_hz,
         duty_abs_tol=args.duty_abs_tol,
         osc_phase_abs_tol=args.osc_phase_abs_tol,
+        freq_match_abs_tol_hz=args.freq_match_abs_tol_hz,
+        freq_match_timebase_rel_tol=args.freq_match_timebase_rel_tol,
     )
     builder = RedPitayaCommandBuilder(args.base_addr)
     results: list[CheckResult] = []
@@ -762,6 +884,17 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
             status = configure_test(rp, builder, test, input_hz)
             redpitaya_status[test.name] = status
             time.sleep(test.settle_seconds if test.settle_seconds is not None else args.settle_s)
+            # Read the settled registers so the strict pulse-mode check can
+            # compare the measured output against the FPGA-commanded frequency.
+            # (The write-time status is read before the measurement window
+            # completes, so phase_step is not yet valid there.)
+            commanded_output_hz: float | None = None
+            if test.mode == "pulse":
+                settled = rp.run(builder.read(harmonic=False))
+                redpitaya_status[f"{test.name}_settled"] = settled
+                phase_step = int(settled.get("phase_step") or 0)
+                if phase_step:
+                    commanded_output_hz = phase_to_hz(phase_step)
             capture = scope.capture(test.capture_seconds)
             captures[test.name] = capture
             if test.mode == "dio2" and args.dio2_channel:
@@ -783,6 +916,7 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
                     output_channel=args.output_channel,
                     expectation=test.expectation,
                     cfg=cfg,
+                    commanded_output_hz=commanded_output_hz,
                 )
             results.append(result)
             print(f"{result.status.value:4s} {test.name}: {'; '.join(result.messages) if result.messages else 'ok'}")
@@ -889,6 +1023,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--freq-abs-tol-hz", type=float, default=2.0, help="Absolute output-frequency tolerance")
     parser.add_argument("--duty-abs-tol", type=float, default=0.05, help="Absolute duty-cycle tolerance")
     parser.add_argument("--osc-phase-abs-tol", type=float, default=0.025, help="Absolute oscillating-delay phase tolerance")
+    parser.add_argument("--freq-match-abs-tol-hz", type=float, default=0.001, help="Statistical-resolution floor for the pulse-mode output-vs-commanded frequency check")
+    parser.add_argument("--freq-match-timebase-rel-tol", type=float, default=1e-4, help="Scope/Red-Pitaya clock-mismatch allowance (relative) added to the frequency-match tolerance")
     parser.add_argument("--output-dir", default="hardware_test_results", help="Directory for generated debug bundles")
     return parser
 

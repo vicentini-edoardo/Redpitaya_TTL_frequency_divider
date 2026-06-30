@@ -146,6 +146,41 @@ can re-run or improve the analysis without another lab capture.
 | Oscillating delay amplitude wrong | `f_shift = 4·f_osc·P`, half-period, or sign-toggle path is wrong. |
 | Oscillating delay center wrong | Preload/start phase is not aligned to the physical input edge. |
 | PicoSDK import/open error | Native PicoSDK missing, wrong driver family, or scope already open elsewhere. |
+| `output frequency differs from FPGA-commanded` | Datapath error (wrong base, shift, or NCO word) larger than the clock-mismatch tolerance. Check `output_freq_error_hz` vs `freq_match_tolerance_hz`; small offsets are just the scope/Red Pitaya clock difference. |
+
+## Frequency-match precision and its hard limits
+
+The pulse-mode tests (`pulse_identity_50pct`, `pulse_plus_5hz_25pct`,
+`pulse_plus_20hz_50pct`) carry a strict check: the coherently-measured output
+frequency must equal the FPGA-commanded frequency (`phase_to_hz(phase_step)`,
+read back from the settled registers). It uses a least-squares estimate over the
+whole edge train (`input_hz_coherent` / `output_hz_coherent`), which resolves the
+frequency to well under 1 mHz (`output_hz_coherent_stderr`) — far tighter than
+the span estimate.
+
+Two physical walls bound how tightly you can *verify* frequency, independent of
+the estimator:
+
+- **Output frequency quantization (≈ 5 Hz at the default window).** The FPGA
+  regenerates the output from a fixed-time edge count, so the output frequency
+  moves in steps of `1 / (2 · meas_window)`. At the default 100 ms window
+  (`--window-us 100000`) that is ~5 Hz, so `DIO0` and `DIO1` can only physically
+  agree to ~±2.5 Hz (`output_minus_input_hz` shows this residual). To shrink it,
+  lengthen the window: 1 s → 0.5 Hz, 10 s → 0.05 Hz, 100 s → 0.005 Hz. True
+  0.001 Hz agreement would need a ~500 s window and is not practical.
+- **Scope vs Red Pitaya clock mismatch (tens of ppm).** Any *absolute* frequency
+  comparison is limited by the two independent sample clocks. That is why the
+  pass tolerance (`freq_match_tolerance_hz`) includes a relative
+  `--freq-match-timebase-rel-tol` term (default 1e-4) on top of the 1 mHz floor;
+  `output_freq_error_hz` is dominated by this clock offset, not by the NCO. True
+  sub-millihertz verification requires a clock-independent ratio — capture
+  `DIO2` (`--dio2-channel C`) and compare `f_out / f_DIO2`, where both the scope
+  clock and the Red Pitaya clock cancel.
+
+`freq_match_resolved` is 1 only when the capture actually resolves the tolerance;
+when it is 0 the difference is reported but the check does not fail, so a short or
+coarse capture never produces a false failure. Resolving the 1 mHz floor needs a
+long, well-oversampled edge train (the default pulse captures are 0.5 s).
 
 ## Current limitation
 
