@@ -253,17 +253,19 @@ class Pico4000aScope:
     """Small block-capture wrapper around the PicoSDK ps4000a Python module."""
 
     CHANNEL_NAMES = {"A": "PS4000A_CHANNEL_A", "B": "PS4000A_CHANNEL_B", "C": "PS4000A_CHANNEL_C", "D": "PS4000A_CHANNEL_D"}
+    # Integer indices match the ps4000a driver enum (0=10mV … 11=50V).
+    # The SDK examples pass these integers directly to ps4000aSetChannel and adc2mV.
     RANGE_BY_VOLTS = {
-        0.05: "PS4000A_50MV",
-        0.1: "PS4000A_100MV",
-        0.2: "PS4000A_200MV",
-        0.5: "PS4000A_500MV",
-        1.0: "PS4000A_1V",
-        2.0: "PS4000A_2V",
-        5.0: "PS4000A_5V",
-        10.0: "PS4000A_10V",
-        20.0: "PS4000A_20V",
-        50.0: "PS4000A_50V",
+        0.05: 2,   # 50 mV
+        0.1:  3,   # 100 mV
+        0.2:  4,   # 200 mV
+        0.5:  5,   # 500 mV
+        1.0:  6,   # 1 V
+        2.0:  7,   # 2 V
+        5.0:  8,   # 5 V
+        10.0: 9,   # 10 V
+        20.0: 10,  # 20 V
+        50.0: 11,  # 50 V
     }
 
     def __init__(self, channels: Sequence[str], sample_rate_hz: float, range_v: float = 5.0):
@@ -326,13 +328,13 @@ class Pico4000aScope:
 
     def _set_channel(self, channel: str, enabled: int) -> None:
         ps = self._ps
-        range_key = _nearest_range_key(self.range_v, self.RANGE_BY_VOLTS)
+        range_idx = self.RANGE_BY_VOLTS[_nearest_range_key(self.range_v, self.RANGE_BY_VOLTS)]
         status = ps.ps4000aSetChannel(
             self._handle,
             ps.PS4000A_CHANNEL[self.CHANNEL_NAMES[channel]],
             enabled,
             ps.PS4000A_COUPLING["PS4000A_DC"],
-            ps.PS4000A_RANGE[self.RANGE_BY_VOLTS[range_key]],
+            range_idx,
             0.0,
         )
         self._assert_pico_ok(status)
@@ -382,10 +384,9 @@ class Pico4000aScope:
         n = int(sample_count.value)
         dt = actual_interval_ns * 1e-9
         times = [i * dt for i in range(n)]
-        range_key = _nearest_range_key(self.range_v, self.RANGE_BY_VOLTS)
-        range_enum = ps.PS4000A_RANGE[self.RANGE_BY_VOLTS[range_key]]
+        range_idx = self.RANGE_BY_VOLTS[_nearest_range_key(self.range_v, self.RANGE_BY_VOLTS)]
         channels_v = {
-            channel: [mv / 1000.0 for mv in self._adc2mv(buffers[channel], range_enum, max_adc)[:n]]
+            channel: [mv / 1000.0 for mv in self._adc2mv(buffers[channel], range_idx, max_adc)[:n]]
             for channel in self.channels
         }
         return Capture(times, channels_v)
