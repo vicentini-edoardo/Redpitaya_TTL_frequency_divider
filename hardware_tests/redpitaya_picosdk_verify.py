@@ -477,6 +477,8 @@ def analyze_capture(
     expectation: Expectation,
     cfg: AnalysisConfig,
     commanded_output_hz: float | None = None,
+    dio2_channel: str | None = None,
+    commanded_ratio: float | None = None,
 ) -> CheckResult:
     input_channel = input_channel.upper()
     output_channel = output_channel.upper()
@@ -556,6 +558,15 @@ def analyze_capture(
     # pulse mode (multiplier 1) and only when the FPGA register was read back.
     if expectation.input_multiplier == 1:
         messages.extend(_frequency_match_check(output_hz_coherent, output_hz_coherent_se, commanded_output_hz, cfg, metrics))
+        # Clock-independent ratio check against DIO2, when that channel was captured.
+        if dio2_channel is not None and dio2_channel.upper() in channels_v:
+            dio2_rising = [e.time_s for e in detect_edges(times_s, channels_v[dio2_channel.upper()], cfg.threshold_v) if e.rising]
+            dio2_hz_coherent, dio2_hz_coherent_se = _coherent_frequency(dio2_rising)
+            messages.extend(_frequency_ratio_check(
+                output_hz_coherent, output_hz_coherent_se,
+                dio2_hz_coherent, dio2_hz_coherent_se,
+                commanded_ratio, cfg, metrics,
+            ))
     return CheckResult(test_name, CheckStatus.FAIL if messages else CheckStatus.PASS, messages, metrics)
 
 
@@ -769,6 +780,58 @@ def _frequency_match_check(
     return messages
 
 
+def _frequency_ratio_check(
+    output_hz: float,
+    output_stderr_hz: float,
+    dio2_hz: float,
+    dio2_stderr_hz: float,
+    commanded_ratio: float | None,
+    cfg: AnalysisConfig,
+    metrics: dict[str, float | int | str],
+) -> list[str]:
+    """Clock-independent check: measured f_out / f_DIO2 == phase_step / trig_phase_step.
+
+    DIO1 (output) and DIO2 are both NCOs on the Red Pitaya clock, so their
+    *register* ratio (phase_step / trig_phase_step) is exact and clock-free.
+    They are captured by the same PicoScope, so their *measured* ratio is also
+    clock-free. The two must agree to the coherent statistical floor — there is
+    no ppm timebase term here, which is what makes a genuine sub-millihertz
+    datapath verification possible. ``commanded_ratio`` is phase_step /
+    trig_phase_step from the settled FPGA registers.
+    """
+    messages: list[str] = []
+    if commanded_ratio is None or not (math.isfinite(commanded_ratio) and commanded_ratio > 0):
+        metrics["ratio_match_resolved"] = 0
+        return messages
+    if not (math.isfinite(output_hz) and math.isfinite(dio2_hz) and dio2_hz > 0):
+        metrics["ratio_match_resolved"] = 0
+        return messages
+    expected_output_hz = commanded_ratio * dio2_hz
+    err = output_hz - expected_output_hz
+    metrics["dio2_hz_coherent"] = dio2_hz
+    metrics["dio2_hz_coherent_stderr"] = dio2_stderr_hz
+    metrics["commanded_out_over_dio2_ratio"] = commanded_ratio
+    metrics["ratio_expected_output_hz"] = expected_output_hz
+    metrics["ratio_output_freq_error_hz"] = err
+    # The DIO2 error is scaled up by the ratio when projected onto the output.
+    combined_se = math.hypot(output_stderr_hz, commanded_ratio * dio2_stderr_hz)
+    metrics["ratio_output_stderr_hz"] = combined_se
+    tol = cfg.freq_match_abs_tol_hz
+    metrics["ratio_match_tolerance_hz"] = tol
+    if not math.isfinite(combined_se) or combined_se > tol / 3.0:
+        # Capture cannot resolve the floor (e.g. DIO2 too low, so its error is
+        # amplified, or the span is too short). Report but do not fail.
+        metrics["ratio_match_resolved"] = 0
+        return messages
+    metrics["ratio_match_resolved"] = 1
+    if abs(err) > tol:
+        messages.append(
+            f"output/DIO2 ratio implies output {expected_output_hz:.6f} Hz but measured "
+            f"{output_hz:.6f} Hz (>{tol:.6f} Hz, clock-independent)"
+        )
+    return messages
+
+
 def _median_period(times_s: Sequence[float]) -> float:
     periods = [b - a for a, b in zip(times_s, times_s[1:]) if b > a]
     if not periods:
@@ -792,12 +855,12 @@ def build_default_suite(include_dio2: bool = False, dio2_hz: float = 1_000.0) ->
     tests = [
         HardwareTest("off_low", "off", ConstantExpectation(False), capture_seconds=0.02, settle_seconds=0.10),
         HardwareTest("force_high", "force_high", ConstantExpectation(True), capture_seconds=0.02, settle_seconds=0.10),
-        # Pulse-mode shift is normally < 20 Hz, and the in-vs-out frequencies
-        # must match to ~1 mHz. Resolving 1 mHz with the coherent estimator
-        # needs a long edge train, so these captures are 0.5 s.
-        HardwareTest("pulse_identity_50pct", "pulse", PulseExpectation(1, 0.0, 0.50), capture_seconds=0.50, shift_hz=0.0, duty_frac=0.50),
-        HardwareTest("pulse_plus_5hz_25pct", "pulse", PulseExpectation(1, 5.0, 0.25), capture_seconds=0.50, shift_hz=5.0, duty_frac=0.25),
-        HardwareTest("pulse_plus_20hz_50pct", "pulse", PulseExpectation(1, 20.0, 0.50), capture_seconds=0.50, shift_hz=20.0, duty_frac=0.50),
+        # Pulse-mode shift is normally < 20 Hz. The clock-independent f_out/f_DIO2
+        # ratio check resolves ~1 mHz, but only over a long edge train, so these
+        # captures are 1.0 s.
+        HardwareTest("pulse_identity_50pct", "pulse", PulseExpectation(1, 0.0, 0.50), capture_seconds=1.00, shift_hz=0.0, duty_frac=0.50),
+        HardwareTest("pulse_plus_5hz_25pct", "pulse", PulseExpectation(1, 5.0, 0.25), capture_seconds=1.00, shift_hz=5.0, duty_frac=0.25),
+        HardwareTest("pulse_plus_20hz_50pct", "pulse", PulseExpectation(1, 20.0, 0.50), capture_seconds=1.00, shift_hz=20.0, duty_frac=0.50),
         HardwareTest("harmonic_2x", "harmonic", PulseExpectation(2, 0.0, 0.50), capture_seconds=0.10, harmonic_n=2),
         HardwareTest("harmonic_3x_plus_10hz", "harmonic", PulseExpectation(3, 10.0, 0.50), capture_seconds=0.20, shift_hz=10.0, harmonic_n=3),
         HardwareTest(
@@ -879,7 +942,13 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
         rp.run(builder.window(args.window_us, harmonic=False))
         rp.run(builder.window(args.window_us, harmonic=True))
         input_hz = args.input_hz or estimate_input_hz(rp, builder, args.settle_s)
-        tests = build_default_suite(include_dio2=bool(args.dio2_channel), dio2_hz=args.dio2_hz)
+        # DIO2 free-runs as the clock-independent reference for the f_out/f_DIO2
+        # ratio check. Default it near the input frequency so the ratio is ~1 and
+        # the DIO2 measurement error is not amplified when projected onto f_out.
+        dio2_ref_hz = args.dio2_hz if args.dio2_hz else round(input_hz)
+        if args.dio2_channel:
+            rp.run(builder.trig(dio2_ref_hz))
+        tests = build_default_suite(include_dio2=bool(args.dio2_channel), dio2_hz=dio2_ref_hz)
         for test in tests:
             status = configure_test(rp, builder, test, input_hz)
             redpitaya_status[test.name] = status
@@ -889,12 +958,16 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
             # (The write-time status is read before the measurement window
             # completes, so phase_step is not yet valid there.)
             commanded_output_hz: float | None = None
+            commanded_ratio: float | None = None
             if test.mode == "pulse":
                 settled = rp.run(builder.read(harmonic=False))
                 redpitaya_status[f"{test.name}_settled"] = settled
                 phase_step = int(settled.get("phase_step") or 0)
                 if phase_step:
                     commanded_output_hz = phase_to_hz(phase_step)
+                trig_phase_step = int(settled.get("trig_phase_step") or 0)
+                if phase_step and trig_phase_step:
+                    commanded_ratio = phase_step / trig_phase_step
             capture = scope.capture(test.capture_seconds)
             captures[test.name] = capture
             if test.mode == "dio2" and args.dio2_channel:
@@ -917,6 +990,8 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
                     expectation=test.expectation,
                     cfg=cfg,
                     commanded_output_hz=commanded_output_hz,
+                    dio2_channel=args.dio2_channel,
+                    commanded_ratio=commanded_ratio,
                 )
             results.append(result)
             print(f"{result.status.value:4s} {test.name}: {'; '.join(result.messages) if result.messages else 'ok'}")
@@ -1012,7 +1087,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-channel", default="A", choices=["A", "B", "C", "D"], help="PicoScope channel connected to DIO0_P input")
     parser.add_argument("--output-channel", default="B", choices=["A", "B", "C", "D"], help="PicoScope channel connected to DIO1_P output")
     parser.add_argument("--dio2-channel", default=None, choices=["A", "B", "C", "D"], help="Optional PicoScope channel connected to DIO2_P")
-    parser.add_argument("--dio2-hz", type=float, default=1_000.0, help="DIO2 frequency to test when --dio2-channel is set")
+    parser.add_argument("--dio2-hz", type=float, default=0.0, help="DIO2 reference frequency when --dio2-channel is set (0 = auto: match the input frequency so the f_out/f_DIO2 ratio is ~1)")
     parser.add_argument("--sample-rate-hz", type=float, default=5_000_000.0, help="Requested PicoScope sample rate")
     parser.add_argument("--range-v", type=float, default=5.0, help="PicoScope input range in volts")
     parser.add_argument("--threshold-v", type=float, default=1.5, help="TTL threshold used for edge detection")

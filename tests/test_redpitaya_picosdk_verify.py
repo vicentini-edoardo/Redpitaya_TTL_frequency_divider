@@ -248,6 +248,68 @@ class TestWaveformAnalysis(unittest.TestCase):
         self.assertEqual(msgs, [])
         self.assertEqual(metrics["freq_match_resolved"], 0)
 
+    def test_ratio_check_passes_and_cancels_common_scope_clock(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_ratio_check,
+        )
+
+        f_out = 254_000.0
+        f_dio2 = 200_000.0
+        ratio = f_out / f_dio2  # exact register ratio (Red Pitaya clock cancels)
+        skew = 1.0 + 50e-6      # common PicoScope clock offset on BOTH channels
+        out_edges = [k / f_out * skew for k in range(200_000)]
+        dio2_edges = [k / f_dio2 * skew for k in range(160_000)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+        d_hz, d_se = _coherent_frequency(dio2_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_ratio_check(out_hz, out_se, d_hz, d_se, ratio, AnalysisConfig(), metrics)
+        self.assertEqual(msgs, [])
+        self.assertEqual(metrics["ratio_match_resolved"], 1)
+        # The common 50 ppm scope skew cancels in the ratio: error stays sub-mHz.
+        self.assertLess(abs(metrics["ratio_output_freq_error_hz"]), 1e-3)
+
+    def test_ratio_check_fails_when_output_off_ratio(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_ratio_check,
+        )
+
+        f_out = 254_000.0
+        f_dio2 = 200_000.0
+        ratio = f_out / f_dio2
+        # NCO emits 5 mHz off the ratio the registers promise -> must be caught.
+        out_edges = [k / (f_out + 0.005) for k in range(200_000)]
+        dio2_edges = [k / f_dio2 for k in range(160_000)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+        d_hz, d_se = _coherent_frequency(dio2_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_ratio_check(out_hz, out_se, d_hz, d_se, ratio, AnalysisConfig(), metrics)
+        self.assertEqual(metrics["ratio_match_resolved"], 1)
+        self.assertTrue(any("ratio implies" in m for m in msgs))
+
+    def test_ratio_check_skips_when_dio2_too_low_to_resolve(self):
+        from hardware_tests.redpitaya_picosdk_verify import (
+            _coherent_frequency, _frequency_ratio_check,
+        )
+        import random
+
+        # A low, short DIO2 reference has its error amplified by the large ratio,
+        # so the floor is not resolved: report but do not fail.
+        f_out = 254_000.0
+        f_dio2 = 100.0
+        ratio = f_out / f_dio2
+        rng = random.Random(3)
+        out_edges = [k / f_out for k in range(200_000)]
+        dio2_edges = [k / f_dio2 + rng.gauss(0.0, 50e-9) for k in range(100)]
+        out_hz, out_se = _coherent_frequency(out_edges)
+        d_hz, d_se = _coherent_frequency(dio2_edges)
+
+        metrics: dict = {}
+        msgs = _frequency_ratio_check(out_hz, out_se, d_hz, d_se, ratio, AnalysisConfig(), metrics)
+        self.assertEqual(msgs, [])
+        self.assertEqual(metrics["ratio_match_resolved"], 0)
+
 
 class TestCommandBuilder(unittest.TestCase):
     def test_builds_pulse_command_like_gui(self):

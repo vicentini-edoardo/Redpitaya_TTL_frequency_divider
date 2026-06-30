@@ -14,7 +14,9 @@ The default suite checks:
 - Pulse / frequency-shift mode: `f_out = f_in + f_shift`, including duty cycle.
 - Harmonic mode: `f_out = N × f_in + f_shift`, with 50% duty.
 - Oscillating delay mode: output delay sweeps around `P0` with amplitude `P`.
-- Optional `DIO2_P`: free-running trigger square wave frequency.
+- Optional `DIO2_P`: free-running trigger square wave frequency, and — when
+  captured — a clock-independent `f_out / f_DIO2` ratio check that verifies the
+  pulse-mode output to ~1 mHz.
 
 ## Required equipment
 
@@ -147,6 +149,7 @@ can re-run or improve the analysis without another lab capture.
 | Oscillating delay center wrong | Preload/start phase is not aligned to the physical input edge. |
 | PicoSDK import/open error | Native PicoSDK missing, wrong driver family, or scope already open elsewhere. |
 | `output frequency differs from FPGA-commanded` | Datapath error (wrong base, shift, or NCO word) larger than the clock-mismatch tolerance. Check `output_freq_error_hz` vs `freq_match_tolerance_hz`; small offsets are just the scope/Red Pitaya clock difference. |
+| `output/DIO2 ratio implies ...` | Clock-independent datapath error at the 1 mHz level: the measured `f_out/f_DIO2` disagrees with `phase_step/trig_phase_step`. This is a genuine NCO/divider/shift fault (the scope and Red Pitaya clocks both cancel here). |
 
 ## Frequency-match precision and its hard limits
 
@@ -170,17 +173,28 @@ the estimator:
   0.001 Hz agreement would need a ~500 s window and is not practical.
 - **Scope vs Red Pitaya clock mismatch (tens of ppm).** Any *absolute* frequency
   comparison is limited by the two independent sample clocks. That is why the
-  pass tolerance (`freq_match_tolerance_hz`) includes a relative
+  absolute pass tolerance (`freq_match_tolerance_hz`) includes a relative
   `--freq-match-timebase-rel-tol` term (default 1e-4) on top of the 1 mHz floor;
-  `output_freq_error_hz` is dominated by this clock offset, not by the NCO. True
-  sub-millihertz verification requires a clock-independent ratio — capture
-  `DIO2` (`--dio2-channel C`) and compare `f_out / f_DIO2`, where both the scope
-  clock and the Red Pitaya clock cancel.
+  `output_freq_error_hz` is dominated by this clock offset, not by the NCO.
 
-`freq_match_resolved` is 1 only when the capture actually resolves the tolerance;
-when it is 0 the difference is reported but the check does not fail, so a short or
-coarse capture never produces a false failure. Resolving the 1 mHz floor needs a
-long, well-oversampled edge train (the default pulse captures are 0.5 s).
+### True sub-millihertz: the DIO2 ratio check
+
+Capture `DIO2` (`--dio2-channel C`) to escape the clock-mismatch wall. DIO1 and
+DIO2 are both NCOs on the Red Pitaya clock, so their register ratio
+`phase_step / trig_phase_step` is exact and clock-free, and the PicoScope measures
+both, so the measured `f_out / f_DIO2` is clock-free too. The pulse tests then
+verify `f_out == (phase_step / trig_phase_step) · f_DIO2` to the 1 mHz floor with
+**no ppm term** (`ratio_*` metrics: `ratio_output_freq_error_hz`,
+`ratio_match_tolerance_hz`, `ratio_match_resolved`). The harness auto-sets DIO2
+near the input frequency (`--dio2-hz 0`) so the ratio is ~1 and DIO2's own error
+is not amplified; pass an explicit `--dio2-hz` to override.
+
+Both checks self-gate: `freq_match_resolved` / `ratio_match_resolved` are 1 only
+when the capture actually resolves the tolerance; when 0 the error is reported but
+the check does not fail, so a short or coarse capture never produces a false
+failure. Resolving the 1 mHz floor needs a long, well-oversampled edge train (the
+default pulse captures are 1.0 s); raise `--sample-rate-hz` if
+`output_samples_per_period` is small.
 
 ## Current limitation
 
