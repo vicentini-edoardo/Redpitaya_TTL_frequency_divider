@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 try:
     from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QFont, QFontMetrics, QKeySequence
+    from PySide6.QtGui import QAction, QFont, QFontMetrics, QIcon, QKeySequence
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -58,6 +58,34 @@ from rp_math import (  # noqa: E402
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
     f_shift_from_f_osc, osc_half_period_cycles, osc_phase_preload as osc_preload_word,
 )
+
+_APP_DIR = Path(__file__).resolve().parent
+_APP_ICON_PATH = _APP_DIR / "6713611.ico"
+_WINDOWS_APP_ID = "VicentiniEdoardo.RedPitayaTTLFrequencyDivider"
+
+
+def _set_windows_app_id():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_WINDOWS_APP_ID)
+    except Exception:
+        pass
+
+
+def _apply_app_icon(window: Optional[QWidget] = None) -> Optional[QIcon]:
+    if not _APP_ICON_PATH.exists():
+        return None
+    icon = QIcon(os.fspath(_APP_ICON_PATH))
+    if icon.isNull():
+        return None
+    app = QApplication.instance()
+    if app is not None:
+        app.setWindowIcon(icon)
+    if window is not None:
+        window.setWindowIcon(icon)
+    return icon
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1570,6 +1598,7 @@ class MainWindow(QMainWindow):
         self.setObjectName("rpDarkWorkbench")
         self.setWindowTitle("Red Pitaya TTL Frequency Control")
         self.setMinimumSize(1040, 900)
+        _apply_app_icon(self)
 
         self._be = SshBackend(self)
         self._be.sig_connected.connect(self._on_connected)
@@ -2035,6 +2064,7 @@ class MainWindow(QMainWindow):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    _set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("RP Combined Control")
     win = MainWindow()

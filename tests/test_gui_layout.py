@@ -32,6 +32,13 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
         self.assertIn("Red Pitaya", title.text())
         self.assertIn("TTL", title.text())
 
+    def test_main_window_applies_repo_icon_to_window_and_app(self):
+        win = gui.MainWindow()
+        self.addCleanup(win.close)
+
+        self.assertFalse(win.windowIcon().isNull())
+        self.assertFalse(self.app.windowIcon().isNull())
+
     def test_readout_value_font_shrinks_to_fit_long_values(self):
         tile = gui.BigDisplay("Output Frequency", "shift +0.000000 Hz", gui._GREEN)
         self.addCleanup(tile.close)
