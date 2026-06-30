@@ -133,6 +133,7 @@ class HardwareTest:
     f_osc_hz: float = 0.0
     p_frac: float = 0.0
     p0_frac: float = 0.0
+    osc_sample_rate_hz: float = 0.0
 
 
 class RedPitayaCommandBuilder:
@@ -349,12 +350,13 @@ class Pico4000aScope:
         )
         self._assert_pico_ok(status)
 
-    def capture(self, duration_s: float) -> Capture:
+    def capture(self, duration_s: float, sample_rate_hz: float | None = None) -> Capture:
         ps = self._ps
         if ps is None:
             raise RuntimeError("PicoScope is not open")
-        samples = max(100, int(round(duration_s * self.sample_rate_hz)))
-        timebase, actual_interval_ns = self._choose_timebase(samples)
+        rate = sample_rate_hz if sample_rate_hz is not None else self.sample_rate_hz
+        samples = max(100, int(round(duration_s * rate)))
+        timebase, actual_interval_ns = self._choose_timebase(samples, rate)
         buffers: dict[str, Any] = {}
         max_adc = ctypes.c_int16()
         self._assert_pico_ok(ps.ps4000aMaximumValue(self._handle, ctypes.byref(max_adc)))
@@ -401,9 +403,9 @@ class Pico4000aScope:
         }
         return Capture(times, channels_v)
 
-    def _choose_timebase(self, samples: int) -> tuple[int, float]:
+    def _choose_timebase(self, samples: int, sample_rate_hz: float | None = None) -> tuple[int, float]:
         ps = self._ps
-        desired_ns = 1e9 / self.sample_rate_hz
+        desired_ns = 1e9 / (sample_rate_hz if sample_rate_hz is not None else self.sample_rate_hz)
         # For ps4000a, timebase 1 gives 8 ns, 2 gives 16 ns; >=3 gives (timebase-2)*8 ns.
         first_guess = 1 if desired_ns <= 8 else 2 if desired_ns <= 16 else int(round(desired_ns / 8 + 2))
         first_guess = max(1, first_guess)
@@ -596,81 +598,159 @@ def analyze_osc_delay(
     expectation: OscExpectation,
     cfg: AnalysisConfig | None = None,
 ) -> CheckResult:
+    """Verify oscillating-delay mode with a sinusoidal least-squares fit.
+
+    Uses the coherent period estimator for T_in, wraps each detected output
+    edge into a fractional delay within [0, 1), rejects gross outliers, then
+    fits δ(t) = P·cos(2π·f_osc·t + φ) + offset via a frequency-grid linear
+    LS search followed by scipy.optimize.curve_fit nonlinear refinement.
+
+    The hardware generates a triangle-wave delay oscillation; a sinusoidal fit
+    underestimates the amplitude by factor 8/π² ≈ 0.81, which is within the
+    default osc_phase_abs_tol of 0.025 for P ≤ 0.15.
+
+    Capture recommendation: use 25 MS/s (set osc_sample_rate_hz on the test)
+    so 80 ns output pulses are detected at ~100 % rate; 5 MHz gives only ~23 %
+    detection, which corrupts the phase time-series via timing quantisation.
+    """
+    import numpy as np
+    from scipy.optimize import curve_fit
+
     cfg = cfg or AnalysisConfig()
-    if len(input_rising_s) < cfg.min_edges or len(output_rising_s) < cfg.min_edges:
-        return CheckResult("osc_delay", CheckStatus.FAIL, ["too few edges for oscillating-delay analysis"], {
-            "input_edges": len(input_rising_s),
-            "output_edges": len(output_rising_s),
-        })
-    input_period = _median_period(input_rising_s)
+    n_in, n_out = len(input_rising_s), len(output_rising_s)
+    if n_in < cfg.min_edges or n_out < cfg.min_edges:
+        return CheckResult("osc_delay", CheckStatus.FAIL,
+                           ["too few edges for oscillating-delay analysis"],
+                           {"input_edges": n_in, "output_edges": n_out})
+
+    # Accurate T_in from coherent estimator; fall back to median.
+    input_freq_coh, _ = _coherent_frequency(input_rising_s)
+    if math.isfinite(input_freq_coh) and input_freq_coh > 0:
+        T_in = 1.0 / input_freq_coh
+    else:
+        T_in = _median_period(input_rising_s)
+    if not (math.isfinite(T_in) and T_in > 0):
+        return CheckResult("osc_delay", CheckStatus.FAIL,
+                           ["cannot estimate input period"], {})
+
+    # Build phase time-series: for each output edge find the last preceding
+    # input edge and compute the fractional delay modulo T_in.
     phases: list[float] = []
-    output_times: list[float] = []
+    times: list[float] = []
     i = 0
     for out_t in output_rising_s:
         while i + 1 < len(input_rising_s) and input_rising_s[i + 1] <= out_t:
             i += 1
         if i < len(input_rising_s):
-            phase = ((out_t - input_rising_s[i]) / input_period) % 1.0
-            phases.append(phase)
-            output_times.append(out_t)
-    if len(phases) < cfg.min_edges:
-        return CheckResult("osc_delay", CheckStatus.FAIL, ["too few matched output/input edges"], {"matched_edges": len(phases)})
+            phases.append(((out_t - input_rising_s[i]) / T_in) % 1.0)
+            times.append(out_t)
 
-    deltas = [_wrap_signed_unit(phase - expectation.p0_frac) for phase in phases]
-    center = expectation.p0_frac + statistics.fmean(deltas)
-    amplitude = (max(deltas) - min(deltas)) / 2.0
-    measured_rate = _estimate_osc_rate_from_delay(output_times, deltas)
-    metrics: dict[str, float | int | str] = {
-        "matched_edges": len(phases),
-        "input_period_s": input_period,
-        "delay_phase_min": min(phases),
-        "delay_phase_max": max(phases),
-        "delay_phase_center": center % 1.0,
-        "delay_phase_amplitude": amplitude,
-        "delay_osc_hz": measured_rate,
-        "expected_delay_phase_center": expectation.p0_frac,
+    n_matched = len(phases)
+    p0_exp = expectation.p0_frac
+    deltas_all = [_wrap_signed_unit(ph - p0_exp) for ph in phases]
+
+    # Outlier rejection: discard phases more than 4× the expected amplitude
+    # from the expected centre.  The 0.1 floor handles very small P values.
+    reject_lim = max(4.0 * expectation.p_frac, 4.0 * cfg.osc_phase_abs_tol, 0.1)
+    mask = [abs(d) <= reject_lim for d in deltas_all]
+    t_arr = np.array([t for t, m in zip(times, mask) if m])
+    d_arr = np.array([d for d, m in zip(deltas_all, mask) if m])
+    n_inlier = len(d_arr)
+
+    base_metrics: dict[str, float | int] = {
+        "input_period_s": T_in,
+        "matched_edges": n_matched,
+        "inlier_edges": n_inlier,
+        "expected_delay_phase_center": p0_exp,
         "expected_delay_phase_amplitude": expectation.p_frac,
         "expected_delay_osc_hz": expectation.f_osc_hz,
     }
+    if n_inlier < 16:
+        return CheckResult("osc_delay", CheckStatus.FAIL,
+                           ["too few inlier edges after outlier rejection"],
+                           base_metrics)
+
+    t0 = float(t_arr[0])
+    t_rel = t_arr - t0
+    f_lo = max(0.01, expectation.f_osc_hz * 0.1)
+    f_hi = expectation.f_osc_hz * 10.0
+
+    # Grid search: evaluate linear LS at candidate frequencies and keep the
+    # winner as the initial guess for nonlinear refinement.  Step ≤ 0.5 Hz
+    # keeps the grid tight enough for any ±10 % tolerance check.
+    n_grid = max(50, int(math.ceil((f_hi - f_lo) / 0.5)) + 1)
+    f_grid = np.linspace(f_lo, f_hi, n_grid).tolist()
+    if expectation.f_osc_hz not in f_grid:
+        f_grid.append(expectation.f_osc_hz)
+
+    best_rss = float("inf")
+    best_f = expectation.f_osc_hz
+    best_A = best_B = best_C = 0.0
+    for f_cand in f_grid:
+        omega_c = 2.0 * np.pi * f_cand
+        X_c = np.column_stack([np.cos(omega_c * t_rel),
+                                np.sin(omega_c * t_rel),
+                                np.ones(n_inlier)])
+        co, _, _, _ = np.linalg.lstsq(X_c, d_arr, rcond=None)
+        rss_c = float(np.sum((d_arr - X_c @ co) ** 2))
+        if rss_c < best_rss:
+            best_rss, best_f = rss_c, f_cand
+            best_A, best_B, best_C = co
+
+    amp_init = math.sqrt(best_A ** 2 + best_B ** 2)
+    phi_init = math.atan2(-best_B, best_A) if amp_init > 0 else 0.0
+
+    # Nonlinear refinement: allow f_osc to move within [f_lo, f_hi].
+    def _sinusoid(t: Any, amp: float, f_hz: float, phi: float, offset: float) -> Any:
+        return amp * np.cos(2.0 * np.pi * f_hz * t + phi) + offset
+
+    amp_fit, f_osc_fit, phi_fit, offset_fit = amp_init, best_f, phi_init, best_C
+    fit_nonlinear = False
+    try:
+        popt, _ = curve_fit(
+            _sinusoid, t_rel, d_arr,
+            p0=[max(amp_init, 1e-4), best_f, phi_init, best_C],
+            bounds=([0.0, f_lo, -math.pi, -0.5], [0.5, f_hi, math.pi, 0.5]),
+            maxfev=5000,
+        )
+        amp_fit, f_osc_fit, phi_fit, offset_fit = popt
+        fit_nonlinear = True
+    except Exception:
+        pass  # keep grid winner as fall-back
+
+    fitted = _sinusoid(t_rel, amp_fit, f_osc_fit, phi_fit, offset_fit)
+    rms = float(np.sqrt(np.mean((d_arr - fitted) ** 2)))
+    center_fit = (p0_exp + float(offset_fit)) % 1.0
+
+    metrics: dict[str, float | int] = {
+        **base_metrics,
+        "delay_phase_center": center_fit,
+        "delay_phase_amplitude": float(amp_fit),
+        "delay_osc_hz": float(f_osc_fit),
+        "delay_fit_residual_rms": rms,
+        "delay_fit_nonlinear": int(fit_nonlinear),
+    }
+
     messages: list[str] = []
-    if abs(amplitude - expectation.p_frac) > cfg.osc_phase_abs_tol:
-        messages.append(f"delay amplitude {amplitude:.5f} differs from expected {expectation.p_frac:.5f}")
-    center_err = abs(_wrap_signed_unit((center % 1.0) - expectation.p0_frac))
+    if abs(amp_fit - expectation.p_frac) > cfg.osc_phase_abs_tol:
+        messages.append(
+            f"delay amplitude {amp_fit:.5f} differs from expected {expectation.p_frac:.5f}")
+    center_err = abs(_wrap_signed_unit(center_fit - p0_exp))
     if center_err > cfg.osc_phase_abs_tol:
-        messages.append(f"delay center {(center % 1.0):.5f} differs from expected {expectation.p0_frac:.5f}")
-    if math.isfinite(measured_rate):
-        rate_tol = max(0.5, expectation.f_osc_hz * cfg.osc_freq_rel_tol)
-        metrics["delay_osc_tolerance_hz"] = rate_tol
-        if abs(measured_rate - expectation.f_osc_hz) > rate_tol:
-            messages.append(f"delay oscillation rate {measured_rate:.5f} Hz differs from expected {expectation.f_osc_hz:.5f} Hz")
-    else:
-        messages.append("could not estimate delay oscillation rate")
-    return CheckResult("osc_delay", CheckStatus.FAIL if messages else CheckStatus.PASS, messages, metrics)
+        messages.append(
+            f"delay center {center_fit:.5f} differs from expected {p0_exp:.5f}")
+    rate_tol = max(0.5, expectation.f_osc_hz * cfg.osc_freq_rel_tol)
+    metrics["delay_osc_tolerance_hz"] = rate_tol
+    if abs(f_osc_fit - expectation.f_osc_hz) > rate_tol:
+        messages.append(
+            f"delay oscillation rate {f_osc_fit:.5f} Hz differs from expected {expectation.f_osc_hz:.5f} Hz")
+
+    return CheckResult("osc_delay", CheckStatus.FAIL if messages else CheckStatus.PASS,
+                       messages, metrics)
 
 
 def _wrap_signed_unit(value: float) -> float:
     return ((value + 0.5) % 1.0) - 0.5
-
-
-def _estimate_osc_rate_from_delay(times_s: Sequence[float], deltas: Sequence[float]) -> float:
-    if len(times_s) < 4:
-        return math.nan
-    peaks: list[float] = []
-    for i in range(1, len(deltas) - 1):
-        if deltas[i] >= deltas[i - 1] and deltas[i] > deltas[i + 1]:
-            peaks.append(times_s[i])
-    if len(peaks) >= 2:
-        return 1.0 / _median_period(peaks)
-    # Fallback: a full triangle has two extrema per period.
-    extrema: list[float] = []
-    for i in range(1, len(deltas) - 1):
-        if (deltas[i] >= deltas[i - 1] and deltas[i] > deltas[i + 1]) or (
-            deltas[i] <= deltas[i - 1] and deltas[i] < deltas[i + 1]
-        ):
-            extrema.append(times_s[i])
-    if len(extrema) >= 2:
-        return 1.0 / (2.0 * _median_period(extrema))
-    return math.nan
 
 
 def _frequency_from_rising_edges(rising_edges_s: Sequence[float]) -> float:
@@ -867,11 +947,14 @@ def build_default_suite(include_dio2: bool = False, dio2_hz: float = 1_000.0) ->
             "osc_delay_5hz_p5pct_p0_25pct",
             "osc",
             OscExpectation(f_osc_hz=5.0, p_frac=0.05, p0_frac=0.25),
-            capture_seconds=0.60,
+            capture_seconds=1.00,
             f_osc_hz=5.0,
             p_frac=0.05,
             p0_frac=0.25,
             duty_frac=0.02,
+            # 25 MS/s gives 40 ns/sample: 80 ns output pulses are ~2 samples
+            # wide → ~100 % detection vs ~23 % at 5 MS/s.
+            osc_sample_rate_hz=25_000_000,
         ),
     ]
     if include_dio2:
@@ -968,7 +1051,9 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
                 trig_phase_step = int(settled.get("trig_phase_step") or 0)
                 if phase_step and trig_phase_step:
                     commanded_ratio = phase_step / trig_phase_step
-            capture = scope.capture(test.capture_seconds)
+            osc_rate = (args.osc_sample_rate_hz or test.osc_sample_rate_hz) or None
+            capture_rate = osc_rate if (test.mode == "osc" and osc_rate) else None
+            capture = scope.capture(test.capture_seconds, sample_rate_hz=capture_rate)
             captures[test.name] = capture
             if test.mode == "dio2" and args.dio2_channel:
                 result = analyze_capture(
@@ -1006,6 +1091,7 @@ def run_hardware_suite(args: argparse.Namespace) -> Path:
         captures=captures,
         metadata={
             "sample_rate_hz": args.sample_rate_hz,
+            "osc_sample_rate_hz": args.osc_sample_rate_hz or None,
             "range_v": args.range_v,
             "threshold_v": args.threshold_v,
             "input_channel": args.input_channel.upper(),
@@ -1089,6 +1175,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dio2-channel", default=None, choices=["A", "B", "C", "D"], help="Optional PicoScope channel connected to DIO2_P")
     parser.add_argument("--dio2-hz", type=float, default=0.0, help="DIO2 reference frequency when --dio2-channel is set (0 = auto: match the input frequency so the f_out/f_DIO2 ratio is ~1)")
     parser.add_argument("--sample-rate-hz", type=float, default=5_000_000.0, help="Requested PicoScope sample rate")
+    parser.add_argument("--osc-sample-rate-hz", type=float, default=0.0, help="Override sample rate for osc_delay captures (0 = use test-spec default of 25 MS/s)")
     parser.add_argument("--range-v", type=float, default=5.0, help="PicoScope input range in volts")
     parser.add_argument("--threshold-v", type=float, default=1.5, help="TTL threshold used for edge detection")
     parser.add_argument("--input-hz", type=float, default=None, help="Known input frequency. If omitted, the Red Pitaya measurement is used.")

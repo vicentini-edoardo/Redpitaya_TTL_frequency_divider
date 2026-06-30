@@ -145,8 +145,10 @@ can re-run or improve the analysis without another lab capture.
 | OFF/ON test wrong | Output pin wiring issue, helper not installed, or wrong bitstream. |
 | Pulse frequency wrong by the shift amount | `phase_step_offset` write path or signed conversion issue. |
 | Harmonic frequency equals pulse mode | Harmonic helper symlink/control bit not taking effect. |
-| Oscillating delay amplitude wrong | `f_shift = 4·f_osc·P`, half-period, or sign-toggle path is wrong. |
-| Oscillating delay center wrong | Preload/start phase is not aligned to the physical input edge. |
+| Oscillating delay amplitude wrong | `f_shift = 4·f_osc·P`, half-period, or sign-toggle path is wrong. Check `delay_phase_amplitude` vs `expected_delay_phase_amplitude` in summary. Note: hardware generates a triangle wave; the sinusoidal fit underestimates amplitude by 8/π² ≈ 0.811, but this is within the 0.025 tolerance for the default P=0.05 test. |
+| Oscillating delay center wrong | Preload/start phase is not aligned to the physical input edge. Check `delay_phase_center` vs `expected_delay_phase_center`. |
+| Oscillating delay rate wrong | Oscillation frequency (`delay_osc_hz`) disagrees with the expected value beyond the ±50% tolerance. |
+| osc_delay `too few inlier edges` | Capture sample rate too low: short pulses go undetected. Use `--osc-sample-rate-hz 25000000` or pass at least 25 MS/s for 80 ns pulses. |
 | PicoSDK import/open error | Native PicoSDK missing, wrong driver family, or scope already open elsewhere. |
 | `output frequency differs from FPGA-commanded` | Datapath error (wrong base, shift, or NCO word) larger than the clock-mismatch tolerance. Check `output_freq_error_hz` vs `freq_match_tolerance_hz`; small offsets are just the scope/Red Pitaya clock difference. |
 | `output/DIO2 ratio implies ...` | Clock-independent datapath error at the 1 mHz level: the measured `f_out/f_DIO2` disagrees with `phase_step/trig_phase_step`. This is a genuine NCO/divider/shift fault (the scope and Red Pitaya clocks both cancel here). |
@@ -195,6 +197,64 @@ the check does not fail, so a short or coarse capture never produces a false
 failure. Resolving the 1 mHz floor needs a long, well-oversampled edge train (the
 default pulse captures are 1.0 s); raise `--sample-rate-hz` if
 `output_samples_per_period` is small.
+
+## Oscillating-delay measurement
+
+The `osc_delay` test verifies that the FPGA's delay oscillation (the `phase_step_offset`
+being sign-toggled at `f_osc`) is correct. The analysis:
+
+1. **Per-edge phase** — for each output rising edge, compute the phase relative to the
+   nearest preceding input edge: `φ_k = (t_out,k − t_in,i) / T_in mod 1`.
+2. **Sinusoidal fit** — grid-search over oscillation frequency + linear LS, then
+   nonlinear refinement (`scipy.optimize.curve_fit`) to recover amplitude, center,
+   and rate.
+3. **Pass criteria** — amplitude within ±0.025 of expected, center within ±0.025 of
+   expected, rate within 50% (or 0.5 Hz) of expected.
+
+### Sample rate requirement for osc_delay
+
+The FPGA output pulse width in osc_delay mode is `duty_frac × T_in`. The default test
+uses `duty_frac=0.02` at ~10 kHz input → pulse width ≈ **2 µs**. At the default
+5 MS/s, that gives 10 samples per pulse — adequate. However, if the input frequency is
+higher (e.g. 250 kHz, T_in = 4 µs, duty 2% → 80 ns), 5 MS/s captures only ~0.4
+samples per pulse, causing catastrophic detection failure.
+
+The default test suite overrides the sample rate to **25 MS/s** for the osc_delay test
+(40 ns/sample), giving ~2 samples for an 80 ns pulse. Pass `--osc-sample-rate-hz`
+to override from the command line:
+
+```bash
+.venv/bin/python hardware_tests/redpitaya_picosdk_verify.py \
+  --host rp-xxxxxx.local \
+  --input-channel A \
+  --output-channel B \
+  --osc-sample-rate-hz 25000000
+```
+
+### Triangle-wave vs sinusoidal fit
+
+The FPGA's sign-toggle implementation produces a **triangle wave** in the phase domain,
+not a sinusoid. The sinusoidal fit recovers an amplitude that is `8/π²` (~0.811×) the
+true triangle-wave amplitude. For the default P=0.05 test:
+
+- True amplitude: 0.050
+- Sinusoidal fit reports: ~0.0405
+- Difference: 0.0095 < tolerance 0.025 → **PASS**
+
+The check uses `osc_phase_abs_tol = 0.025` so this systematic bias does not cause
+false failures at the default amplitude.
+
+### osc_delay metrics in summary.json
+
+| Metric | Description |
+| --- | --- |
+| `delay_phase_center` | Fitted center of the oscillation (fraction of T_in) |
+| `delay_phase_amplitude` | Fitted amplitude (fraction of T_in) |
+| `delay_osc_hz` | Fitted oscillation rate (Hz) |
+| `delay_fit_residual_rms` | RMS residual of the sinusoidal fit (fraction of T_in) |
+| `delay_fit_nonlinear` | 1 if scipy nonlinear refinement converged, 0 if grid-search only |
+| `inlier_edges` | Edges used after outlier rejection |
+| `matched_edges` | Edges that could be paired with an input edge |
 
 ## Current limitation
 
