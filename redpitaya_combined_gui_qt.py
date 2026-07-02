@@ -53,6 +53,7 @@ except ImportError:
 # can be unit-tested in isolation (see tests/test_rp_math.py).
 from rp_math import (  # noqa: E402
     CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH, CTRL_OSC_MODE,
+    CTRL_EDGE_LOCK,
     PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
@@ -160,18 +161,22 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
 
-    def apply_pulse(self, width_cycles: int, offset_word: int):
+    def apply_pulse(self, width_cycles: int, offset_word: int,
+                    edge_lock: bool = False):
         """Pulse-mode modulated write (enable=1, harmonic_mode=0 via helper)."""
         if self._live:
+            ctrl = CTRL_ENABLE | (CTRL_EDGE_LOCK if edge_lock else 0)
             self._enqueue(self.P_USER,
-                          lambda: self._do_write_pulse(width_cycles, offset_word),
+                          lambda: self._do_write_pulse(width_cycles, offset_word, ctrl),
                           self.sig_status.emit)
 
-    def apply_harmonic(self, mult_n: int, offset_word: int):
+    def apply_harmonic(self, mult_n: int, offset_word: int,
+                       edge_lock: bool = False):
         """Harmonic-mode modulated write (enable=1, harmonic_mode=1 via helper)."""
         if self._live:
+            ctrl = CTRL_ENABLE | (CTRL_EDGE_LOCK if edge_lock else 0)
             self._enqueue(self.P_USER,
-                          lambda: self._do_write_harmonic(mult_n, offset_word),
+                          lambda: self._do_write_harmonic(mult_n, offset_word, ctrl),
                           self.sig_status.emit)
 
     def set_control_pulse(self, ctrl: int):
@@ -339,18 +344,27 @@ class SshBackend(QObject):
         self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} osc {half_period} {preload}"
         )
+        # Clear the osc bit first: the FPGA latches the preload and re-arms
+        # the sweep on the RISING edge of osc_mode, so a re-apply while osc
+        # is already running needs an explicit off→on toggle. The output and
+        # the frequency measurement keep running throughout.
+        self._exec(
+            f"/root/rp_pulse_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+        )
         return json.loads(self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {offset} {ctrl}"
         ))
 
-    def _do_write_pulse(self, width: int, offset: int) -> dict:
+    def _do_write_pulse(self, width: int, offset: int,
+                        ctrl: int = CTRL_ENABLE) -> dict:
         return json.loads(self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} write {width} {offset} {CTRL_ENABLE}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} write {width} {offset} {ctrl}"
         ))
 
-    def _do_write_harmonic(self, mult_n: int, offset: int) -> dict:
+    def _do_write_harmonic(self, mult_n: int, offset: int,
+                           ctrl: int = CTRL_ENABLE) -> dict:
         return json.loads(self._exec(
-            f"/root/rp_harmonic_ctl 0x{self._base:08X} write {mult_n} {offset} {CTRL_ENABLE}"
+            f"/root/rp_harmonic_ctl 0x{self._base:08X} write {mult_n} {offset} {ctrl}"
         ))
 
     def _do_set_control_pulse(self, ctrl: int) -> dict:
@@ -900,13 +914,28 @@ class _NcoPanel(QWidget):
         self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
         fields.addWidget(self._lbl_win_suggest, 1, 2, 1, 2)
 
-        # Row 2: auto-apply
+        # Row 2: auto-apply + edge lock
         auto_row = QHBoxLayout()
         self._cb_auto = QCheckBox("Auto-Apply")
         self._cb_auto.setChecked(True)
         self._cb_auto.setFont(_mono_font(10))
         self._cb_auto.setStyleSheet(_checkbox_style())
         auto_row.addWidget(self._cb_auto)
+
+        self._cb_lock = QCheckBox("Edge lock")
+        self._cb_lock.setChecked(False)
+        self._cb_lock.setFont(_mono_font(10))
+        self._cb_lock.setStyleSheet(_checkbox_style())
+        self._cb_lock.setToolTip(
+            "Anchor the NCO phase to every input rising edge.\n"
+            "The output-to-input frequency shift becomes exactly f_shift with\n"
+            "the beat phase coherent indefinitely (no drift from measurement\n"
+            "error) — recommended for stroboscopic / FFT measurements.\n"
+            "Cost: output pulses inherit the input edge timing jitter\n"
+            "(~±8 ns synchronizer quantization + source jitter)."
+        )
+        self._cb_lock.toggled.connect(self._on_lock_toggled)
+        auto_row.addWidget(self._cb_lock)
         auto_row.addStretch()
         fields.addLayout(auto_row, 2, 0, 1, 4)
 
@@ -981,8 +1010,15 @@ class _NcoPanel(QWidget):
     def _update_mode_controls(self):
         enabled = (self._output_mode == "modulated")
         for w in (self._sp_offset, self._secondary_widget, self._cb_window,
-                  self._cb_auto, self._btn_apply):
+                  self._cb_auto, self._cb_lock, self._btn_apply):
             w.setEnabled(enabled)
+
+    def _on_lock_toggled(self, checked: bool):
+        self._log(f"Edge lock {'ON' if checked else 'OFF'} "
+                  "(applies with the next write)")
+        self.sig_params_changed.emit()
+        if self._live and self._output_mode == "modulated":
+            self._do_apply()
 
     # ── backend signal handlers ────────────────────────────────────────────────
 
@@ -1059,7 +1095,12 @@ class _NcoPanel(QWidget):
             step_off  = int(d.get("phase_step_offset") or (step_live - step_base))
             out_hz    = phase_to_hz(step_live)
             delta     = phase_to_hz(step_off)
-            self._d_out.set_data(fmt_freq(out_hz), f"shift {fmt_signed_freq(delta)}")
+            locked    = bool(int(d.get("edge_lock") or 0))
+            self._d_out.set_data(
+                fmt_freq(out_hz),
+                f"shift {fmt_signed_freq(delta)}"
+                + (" · edge-locked" if locked else ""),
+            )
             self._update_shift_detail()
             self._update_status_tiles(d, step_base, stable)
         else:
@@ -1192,10 +1233,12 @@ class PulsePanel(_NcoPanel):
         wc          = duty_to_cycles(frac, period)
         offset_word = hz_to_phase(off_hz)
         actual_hz   = phase_to_hz(offset_word)
-        self._be.apply_pulse(wc, offset_word)
+        lock        = self._cb_lock.isChecked()
+        self._be.apply_pulse(wc, offset_word, edge_lock=lock)
         self._log(
             f"Apply  width={self._sp_width.value():.2f}%  "
             f"shift={actual_hz:+.6f} Hz  offset={offset_word:+d}"
+            + ("  edge-locked" if lock else "")
         )
 
     def get_params(self) -> dict:
@@ -1203,6 +1246,7 @@ class PulsePanel(_NcoPanel):
             "freq_shift_hz": self._sp_offset.value(),
             "duty_cycle_pct": self._sp_width.value(),
             "output_mode": self._output_mode,
+            "edge_lock": self._cb_lock.isChecked(),
         }
 
 
@@ -1279,10 +1323,12 @@ class HarmonicPanel(_NcoPanel):
         off_hz      = self._sp_offset.value()
         offset_word = hz_to_phase(off_hz)
         actual_hz   = phase_to_hz(offset_word)
-        self._be.apply_harmonic(n, offset_word)
+        lock        = self._cb_lock.isChecked()
+        self._be.apply_harmonic(n, offset_word, edge_lock=lock)
         self._log(
             f"Apply  N={n}  shift={actual_hz:+.6f} Hz  "
             f"offset={offset_word:+d}"
+            + ("  edge-locked" if lock else "")
         )
 
     def get_params(self) -> dict:
@@ -1290,6 +1336,7 @@ class HarmonicPanel(_NcoPanel):
             "freq_shift_hz": self._sp_offset.value(),
             "harmonic_n": self._sp_n.value(),
             "output_mode": self._output_mode,
+            "edge_lock": self._cb_lock.isChecked(),
         }
 
 
@@ -1297,6 +1344,11 @@ class HarmonicPanel(_NcoPanel):
 # OscPanel — oscillating delay mode
 #   phase sweeps P0-P → P0+P → P0-P at rate f_osc
 #   f_shift = 4 * f_osc * P  (derived internally)
+#
+#   The FPGA re-anchors the NCO to the input on every rising edge
+#   (edge-locked osc mode), so P0 and P are true phases referenced to the
+#   input edge and the sweep does not drift with measurement error.
+#   Requires a bitstream built from the current pulse_gen.sv.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OscPanel(QWidget):
@@ -1552,6 +1604,24 @@ class OscPanel(QWidget):
         offset_w   = hz_to_phase(f_shift)
         period     = self._period_c if self._period_c > 0 else 1000
         wc         = duty_to_cycles(width_pct / 100.0, period)
+
+        # Sanity-check against the measured input, when available.
+        if self._period_c > 0:
+            f_in = CLK_HZ / self._period_c
+            if f_shift >= f_in:
+                self._log(
+                    f"ERROR: derived f_shift {fmt_freq(f_shift)} >= measured "
+                    f"f_in {fmt_freq(f_in)} (f_shift = 4·f_osc·P) — reduce "
+                    "f_osc or P. Not applied."
+                )
+                return
+            min_p = 2.0 / self._period_c
+            if P_frac < min_p:
+                self._log(
+                    f"WARNING: P = {P_frac*100:.3f}% is below the NCO step "
+                    f"({min_p*100:.3f}% of T_in at this f_in); the delay sweep "
+                    "will be unresolvable."
+                )
 
         self._be.apply_osc(wc, half_p, preload, offset_w)
         self._log(

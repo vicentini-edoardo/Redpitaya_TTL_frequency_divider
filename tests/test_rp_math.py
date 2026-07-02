@@ -102,15 +102,22 @@ class TestTrigPhaseStep(unittest.TestCase):
 
 
 class TestInputMeasurementMath(unittest.TestCase):
-    def test_excludes_window_start_edge_and_preserves_half_edge_resolution(self):
-        window_cycles = 125_000_000
-        step = measured_edges_to_phase_step(526_260, window_cycles)
+    def test_whole_periods_over_span(self):
+        # 100_001 rising edges → 100_000 whole periods over 12_500_000 cycles
+        step = measured_edges_to_phase_step(100_001, 12_500_000)
         hz = phase_to_hz(step)
+        self.assertAlmostEqual(hz, CLK_HZ * 100_000 / 12_500_000,
+                               delta=PHASE_RES_HZ)
 
-        self.assertAlmostEqual(hz, 263_129.497894923, places=6)
+    def test_excludes_window_opening_edge(self):
+        # 3 rising edges = exactly 2 whole periods inside the span
+        step = measured_edges_to_phase_step(3, 250_000)
+        self.assertAlmostEqual(phase_to_hz(step), CLK_HZ * 2 / 250_000,
+                               delta=PHASE_RES_HZ)
 
     def test_too_few_edges_reports_zero(self):
-        self.assertEqual(measured_edges_to_phase_step(3, 125_000), 0)
+        self.assertEqual(measured_edges_to_phase_step(2, 125_000), 0)
+        self.assertEqual(measured_edges_to_phase_step(3, 0), 0)
 
 
 class TestFormatters(unittest.TestCase):

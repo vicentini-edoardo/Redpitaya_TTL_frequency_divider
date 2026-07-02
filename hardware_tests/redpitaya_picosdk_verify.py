@@ -173,8 +173,11 @@ class RedPitayaCommandBuilder:
         preload: int,
         shift_hz: float,
     ) -> list[list[str]]:
+        # Clear the osc bit before the write: the FPGA latches the preload and
+        # re-arms the sweep on the rising edge of osc_mode (matches the GUI).
         return [
             ["/root/rp_pulse_ctl", self.base, "osc", str(half_period_cycles), str(preload)],
+            ["/root/rp_pulse_ctl", self.base, "control", str(CTRL_ENABLE)],
             self.pulse_write(width_cycles, shift_hz, CTRL_ENABLE | CTRL_OSC_MODE),
         ]
 

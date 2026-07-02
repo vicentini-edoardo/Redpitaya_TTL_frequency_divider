@@ -384,7 +384,9 @@ class TestCommandBuilder(unittest.TestCase):
                                shift_hz=20.0)
 
         self.assertEqual(commands[0][:3], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "osc"])
-        self.assertEqual(commands[1], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "write",
+        # osc bit cleared before the write so its rising edge re-arms the sweep
+        self.assertEqual(commands[1], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "control", "1"])
+        self.assertEqual(commands[2], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "write",
                                        "12", str(hz_to_phase(20.0)), "17"])
 
 

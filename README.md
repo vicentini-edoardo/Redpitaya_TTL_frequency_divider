@@ -164,12 +164,14 @@ Base address: `0x40600000`
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0 = off) |
 | `0x08` | `width_n` / `mult_n` | Pulse width in clock cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
-| `0x14` | `raw_period` | Edge count from last measurement window (legacy name) |
-| `0x18` | `edge_cnt` | Edge count from last measurement window |
+| `0x14` | `meas_span` | Clock cycles between first and last rising edge of last window |
+| `0x18` | `edge_cnt` | Rising-edge count from last window; f_in = CLK_HZ·(edge_cnt−1)/meas_span |
 | `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset |
 | `0x24/0x28` | `phase_step_base` | Computed base step (read-only) |
 | `0x2C/0x30` | `phase_step` | Live `[N·]base + offset` (read-only) |
 | `0x34` | `meas_time_us` | Measurement window in µs (min 1000) |
+| `0x38` | `osc_half_period` | Clock ticks per half-oscillation (osc mode) |
+| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload (osc mode) |
 
 ### control register bits
 
@@ -179,6 +181,8 @@ Base address: `0x40600000`
 | 1 | soft_reset | Self-clearing reset; clears the NCO and restarts measurement |
 | 2 | force_high | Override output HIGH regardless of NCO state (LASER ON) |
 | 3 | harmonic_mode | 0 = pulse mode, 1 = harmonic mode (set by binary name) |
+| 4 | osc_mode | Oscillating delay mode (phase sweep P0±P, pulse mode only) |
+| 5 | edge_lock | Anchor NCO phase to input rising edges: f_out − [N·]f_in is exactly f_shift, beat coherent indefinitely |
 
 ---
 

@@ -20,6 +20,7 @@ DEFAULT_BASE  = 0x40600000
 CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
 CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
 CTRL_OSC_MODE   = 0x10   # bit 4 — oscillating delay mode
+CTRL_EDGE_LOCK  = 0x20   # bit 5 — anchor NCO phase to input edges
 # bit 3 (harmonic_mode) is enforced by the respective C helper
 
 _PHASE_MAX    = 2 ** (PHASE_BITS - 1)
@@ -46,10 +47,13 @@ def duty_to_cycles(frac: float, period: int) -> int:
     return max(1, min(period - 1, int(round(frac * period))))
 
 
-def measured_edges_to_phase_step(edge_count: int, window_cycles: int) -> int:
-    if edge_count < 4 or window_cycles <= 0:
+def measured_edges_to_phase_step(edge_count: int, span_cycles: int) -> int:
+    """phase_step_base from a true reciprocal measurement: edge_count rising
+    edges enclose edge_count - 1 whole input periods over span_cycles clock
+    cycles (first→last rising edge). Mirrors the pulse_gen.sv divider."""
+    if edge_count < 3 or span_cycles <= 0:
         return 0
-    return ((edge_count - 1) << PHASE_BITS) // (2 * window_cycles)
+    return ((edge_count - 1) << PHASE_BITS) // span_cycles
 
 
 def fmt_freq(hz: float) -> str:

@@ -108,16 +108,22 @@ which the C helper sets/clears based on its invocation name.
 
 | Offset | Register | Notes |
 |--------|----------|-------|
-| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode |
+| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode, bit 5=edge_lock |
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0=off) |
 | `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
-| `0x14` | `raw_period` | edge count from last measurement window (legacy name) |
-| `0x18` | `edge_cnt` | edge count from last measurement window |
+| `0x14` | `meas_span` | clock cycles between first and last rising edge of last window |
+| `0x18` | `edge_cnt` | rising-edge count from last window; f_in = CLK_HZ·(edge_cnt−1)/meas_span |
 | `0x1C/0x20` | `phase_step_offset` | signed 48-bit NCO frequency offset |
 | `0x24/0x28` | `phase_step_base` | computed base step (read-only) |
 | `0x2C/0x30` | `phase_step` | live `[N·]base + offset` (read-only) |
 | `0x34` | `meas_time_us` | measurement window in µs (min 1000) |
+| `0x38` | `osc_half_period` | clock ticks per half-oscillation (osc mode) |
+| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload (osc mode) |
+
+48-bit register pairs latch atomically into the datapath one cycle after the
+**low** word is written (the helper writes high first, then low). `write` no
+longer drops `enable`, so parameter updates do not restart the measurement.
 
 The authoritative `status` bit order is the rdata concatenation in
 `axi4lite_pulse_regs.sv` (the `4'd4` read case), **not** any prose comment.

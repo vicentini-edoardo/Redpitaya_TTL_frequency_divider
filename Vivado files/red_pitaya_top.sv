@@ -94,6 +94,7 @@ logic        pulse_soft_reset;
 logic        force_high;
 logic        harmonic_mode;
 logic        osc_mode;
+logic        edge_lock;
 logic [31:0] osc_half_period;
 logic [47:0] osc_phase_preload;
 logic [31:0] width_n;
@@ -101,7 +102,7 @@ logic [31:0] meas_time_us;
 logic        pulse_busy;
 logic        pulse_out;
 
-logic [31:0] period_cycles;
+logic [31:0] meas_span;
 logic [31:0] edge_cnt_out;
 logic        period_valid;
 logic        period_stable;
@@ -201,6 +202,7 @@ pulse_gen pulse_gen_i
   .soft_reset        (pulse_soft_reset),
   .harmonic_mode     (harmonic_mode),
   .osc_mode          (osc_mode),
+  .edge_lock         (edge_lock),
 
   .trig_in           (exp_p_io[0]),
 
@@ -218,7 +220,7 @@ pulse_gen pulse_gen_i
   .trig_out           (trig_out),
   .busy               (pulse_busy),
 
-  .period_cycles      (period_cycles),
+  .meas_span          (meas_span),
   .edge_cnt_out       (edge_cnt_out),
   .period_valid       (period_valid),
   .period_stable      (period_stable),
@@ -261,6 +263,7 @@ axi4lite_pulse_regs regs_i
   .force_high          (force_high),
   .harmonic_mode       (harmonic_mode),
   .osc_mode            (osc_mode),
+  .edge_lock           (edge_lock),
   .trig_phase_step     (trig_phase_step),
   .width_n             (width_n),
   .meas_time_us        (meas_time_us),
@@ -269,7 +272,7 @@ axi4lite_pulse_regs regs_i
   .osc_phase_preload   (osc_phase_preload),
 
   .pulse_busy          (pulse_busy),
-  .period_cycles       (period_cycles),
+  .meas_span           (meas_span),
   .edge_cnt_out        (edge_cnt_out),
   .period_valid        (period_valid),
   .period_stable       (period_stable),
