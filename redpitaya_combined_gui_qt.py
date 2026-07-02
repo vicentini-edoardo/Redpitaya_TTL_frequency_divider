@@ -339,6 +339,13 @@ class SshBackend(QObject):
         self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} osc {half_period} {preload}"
         )
+        # Clear the osc bit first: the FPGA latches the preload and re-arms
+        # the sweep on the RISING edge of osc_mode, so a re-apply while osc
+        # is already running needs an explicit off→on toggle. The output and
+        # the frequency measurement keep running throughout.
+        self._exec(
+            f"/root/rp_pulse_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+        )
         return json.loads(self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {offset} {ctrl}"
         ))

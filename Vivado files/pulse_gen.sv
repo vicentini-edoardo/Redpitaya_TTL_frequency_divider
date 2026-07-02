@@ -8,15 +8,23 @@
 // Operation (two phases):
 //
 //   MEASURE phase (!freerun_active):
-//     Incoming trigger edges (both rising and falling) are counted over a fixed
-//     time window selected via meas_time_us.
-//     After a complete valid window, period_stable asserts.
-//     An iterative divider (48 cycles) computes:
-//       phase_step_base = 2^48 * (edge_count - 1) / (2 * window_cycles)
-//     The first edge opens the window, so it is not a completed interval.
-//     This avoids the intermediate integer period_avg truncation that was the
-//     source of systematic frequency error for non-integer-period signals (e.g. 300 kHz).
+//     True reciprocal counting: rising trigger edges are counted over a time
+//     window selected via meas_time_us, and the elapsed clock cycles between
+//     the FIRST and LAST rising edge (meas_span) are latched. After a valid
+//     window, period_stable asserts and an iterative divider (48 cycles)
+//     computes:
+//       phase_step_base = 2^48 * (edge_count - 1) / meas_span
+//     edge_count - 1 is the number of whole input periods inside meas_span,
+//     so the quantization error is ±1 clock at each end of the span
+//     (~2 / meas_span relative) instead of ±1 edge per window
+//     (f_clk / (2 * window_cycles) Hz) of the previous fixed-window scheme.
+//     Using rising edges only also makes the result independent of the input
+//     duty cycle, and dead time after the last edge no longer biases the
+//     estimate. The 2-FF synchronizer latency cancels because both ends of
+//     the span pass through the same path.
 //     Once period_stable and division complete, transitions to FREERUN.
+//     Measurement keeps running in FREERUN; phase_step_base refreshes every
+//     window so the output tracks slow input drift.
 //
 //   FREERUN phase (freerun_active):
 //     48-bit NCO: phase_acc += phase_step each clock.
@@ -78,8 +86,8 @@ module pulse_gen
   output logic        pulse_out,
   output logic        trig_out,
 
-  output logic [31:0] period_cycles,
-  output logic [31:0] edge_cnt_out,    // edge count from last window (reported at 0x18)
+  output logic [31:0] meas_span,       // cycles between first/last rising edge (reported at 0x14)
+  output logic [31:0] edge_cnt_out,    // rising-edge count from last window (reported at 0x18)
   output logic        period_valid,
   output logic        period_stable,
   output logic        timeout_flag,
@@ -97,8 +105,6 @@ module pulse_gen
   // no hardcoded clock assumption in the NCO path.
   localparam logic [31:0] CLK_HZ                = 32'd124_999_999;
   localparam logic [31:0] CLK_PER_US            = 32'd125;
-  localparam logic [31:0] PERIOD_TIMEOUT_CYCLES = CLK_HZ;
-  localparam logic [31:0] MIN_PERIOD_CYCLES     = 32'd200;
 
   // Measurement window in clock cycles: meas_time_us * CLK_PER_US.
   // Minimum enforced at 1 ms (125,000 cycles) to avoid division issues.
@@ -130,10 +136,17 @@ module pulse_gen
   assign trig_rise_dbg = trig_rise;
 
   // ----------------------------------------------------------------
-  // Reciprocal frequency counter: count edges over fixed time window
+  // True reciprocal frequency counter.
+  //
+  // The window opens on a rising edge; rising edges are counted and the
+  // clock count at each one is latched (span_last). At window close the
+  // span between the first and last rising edge holds edge_cnt-1 whole
+  // input periods regardless of duty cycle, and any dead time after the
+  // last edge is excluded from the measurement.
   // ----------------------------------------------------------------
   logic [31:0] clk_cnt;
-  logic [31:0] edge_cnt;
+  logic [31:0] edge_cnt;    // rising edges since the window opened
+  logic [31:0] span_last;   // elapsed cycles at the most recent rising edge
   logic        window_active;
   logic        period_sample_strobe;
 
@@ -141,7 +154,8 @@ module pulse_gen
     if (!rstn) begin
       clk_cnt       <= 32'd0;
       edge_cnt      <= 32'd0;
-      period_cycles <= 32'd0;
+      span_last     <= 32'd0;
+      meas_span     <= 32'd0;
       edge_cnt_out  <= 32'd0;
       period_valid  <= 1'b0;
       period_stable <= 1'b0;
@@ -154,7 +168,8 @@ module pulse_gen
       if (soft_reset || !enable) begin
         clk_cnt       <= 32'd0;
         edge_cnt      <= 32'd0;
-        period_cycles <= 32'd0;
+        span_last     <= 32'd0;
+        meas_span     <= 32'd0;
         edge_cnt_out  <= 32'd0;
         period_valid  <= 1'b0;
         period_stable <= 1'b0;
@@ -163,20 +178,23 @@ module pulse_gen
         period_sample_strobe <= 1'b0;
       end else begin
         if (!window_active) begin
-          if (trig_edge) begin
+          if (trig_rise) begin
             window_active <= 1'b1;
             clk_cnt       <= 32'd0;
             edge_cnt      <= 32'd1;
+            span_last     <= 32'd0;
             timeout_flag  <= 1'b0;
           end
         end else begin
-          if (trig_edge) begin
-            edge_cnt <= edge_cnt + 32'd1;
+          if (trig_rise) begin
+            edge_cnt  <= edge_cnt + 32'd1;
+            span_last <= clk_cnt + 32'd1;   // cycles since the opening edge
           end
 
           if (clk_cnt >= window_cycles - 1) begin
-            if (edge_cnt >= 4) begin
-              period_cycles <= edge_cnt;
+            // >= 3 rising edges = >= 2 whole periods inside the span
+            if (edge_cnt >= 3 && span_last != 32'd0) begin
+              meas_span     <= span_last;
               edge_cnt_out  <= edge_cnt;
               period_valid  <= 1'b1;
               period_stable <= 1'b1;
@@ -190,6 +208,7 @@ module pulse_gen
             window_active <= 1'b0;
             clk_cnt       <= 32'd0;
             edge_cnt      <= 32'd0;
+            span_last     <= 32'd0;
           end else begin
             clk_cnt <= clk_cnt + 32'd1;
           end
@@ -200,14 +219,15 @@ module pulse_gen
 
   // ----------------------------------------------------------------
   // Iterative divider:
-  //   phase_step_base = 2^48 * (edge_cnt - 1) / (2 * window_cycles)
+  //   phase_step_base = 2^48 * (edge_cnt - 1) / meas_span
   //
-  // Avoids the integer truncation in the old reciprocal-period formula
-  // by computing the fraction directly. Since edge_interval_count/(2*window) < 1
-  // (f_in << f_clk), we initialise rem = edge_cnt - 1 and shift in 48 zero-bits
-  // from the dividend, using 2*window_cycles as divisor. This is equivalent to
-  // standard long-division of ((edge_cnt - 1) << 48) / (2*window_cycles) but
-  // without needing an 80-bit shift register. 48 steps, one quotient bit per clock.
+  // edge_cnt - 1 whole input periods span meas_span clock cycles, so the
+  // fraction is computed directly with no intermediate truncation. Since
+  // (edge_cnt - 1) / meas_span < 1 (period > 1 clock), we initialise
+  // rem = edge_cnt - 1 and shift in 48 zero-bits from the dividend, using
+  // meas_span as divisor. This is equivalent to standard long-division of
+  // ((edge_cnt - 1) << 48) / meas_span but without needing an 80-bit shift
+  // register. 48 steps, one quotient bit per clock.
   // ----------------------------------------------------------------
   logic [5:0]  div_step;
   logic [32:0] div_rem;
@@ -235,12 +255,12 @@ module pulse_gen
       if (period_sample_strobe && !div_active) begin
         div_active  <= 1'b1;
         div_step    <= 6'd0;
-        // Exclude the edge that opened the window; it is a boundary marker, not
-        // a completed edge interval. Keep the half-edge information by dividing
-        // by 2*window_cycles instead of shifting the edge count down first.
+        // Exclude the edge that opened the window; it is a boundary marker,
+        // not a completed period. edge_cnt_out - 1 whole periods elapsed in
+        // meas_span cycles.
         div_rem     <= {1'b0, edge_cnt_out - 32'd1};
         div_quot    <= 48'd0;
-        div_divisor <= (window_cycles != 32'd0) ? {window_cycles, 1'b0} : 33'd1;
+        div_divisor <= (meas_span != 32'd0) ? {1'b0, meas_span} : 33'd1;
       end else if (div_active) begin
         if (!div_sub[33]) begin
           // rem >= divisor: quotient bit = 1

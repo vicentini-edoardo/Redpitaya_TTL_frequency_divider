@@ -23,8 +23,8 @@
  *   0x0C  trig_phase_step_hi  bits [47:32] of DIO2 48-bit NCO step
  *   0x10  status            bit 0 = busy, bit 1 = period_valid, bit 2 = period_stable,
  *                           bit 3 = timeout, bit 4 = freerun_active
- *   0x14  period            edge count from last measurement window
- *   0x18  edge_cnt          edge count from last measurement window
+ *   0x14  meas_span         clock cycles between first and last rising edge of last window
+ *   0x18  edge_cnt          rising-edge count from last measurement window
  *   0x1C  phase_step_offset_lo  bits [31:0]  of signed 48-bit NCO offset
  *   0x20  phase_step_offset_hi  bits [47:32] of signed 48-bit NCO offset (in [15:0])
  *   0x24  phase_step_base_lo    bits [31:0]  of computed base step (read-only)
@@ -36,11 +36,12 @@
  * JSON output fields (same for both modes):
  *   control, harmonic_mode, force_high, width, mult_n,
  *   trig_phase_step, status, period_stable, freerun_active, meas_time_us,
- *   raw_period (legacy name; edge count mirror), edge_cnt,
+ *   meas_span, edge_cnt,
  *   phase_step_offset, phase_step_base, phase_step
  *
  * Frequency conversions (use phase_step_base for accuracy):
  *   input_hz  = 124999999.0 * phase_step_base / 2^48
+ *             = 124999999.0 * (edge_cnt - 1) / meas_span
  *   output_hz = phase_step * 124999999.0 / 2^48
  *   NCO res   ≈ 0.44 mHz per LSB at 124.999999 MHz
  */
@@ -58,8 +59,8 @@
 #define REG_REG08                 0x08
 #define REG_TRIG_PHASE_STEP_HI    0x0C
 #define REG_STATUS                0x10
-#define REG_RAW_PERIOD            0x14
-#define REG_FILT_PERIOD           0x18
+#define REG_MEAS_SPAN             0x14
+#define REG_EDGE_CNT              0x18
 #define REG_PHASE_STEP_OFFSET_LO  0x1C
 #define REG_PHASE_STEP_OFFSET_HI  0x20
 #define REG_PHASE_STEP_BASE_LO    0x24
@@ -167,7 +168,7 @@ static void print_json(volatile uint8_t *base) {
     printf("{\"control\":%u,\"harmonic_mode\":%u,\"osc_mode\":%u,\"force_high\":%u,"
            "\"width\":%u,\"mult_n\":%u,\"trig_phase_step\":%llu,"
            "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
-           "\"raw_period\":%u,\"edge_cnt\":%u,"
+           "\"meas_span\":%u,\"edge_cnt\":%u,"
            "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld,"
            "\"osc_half_period\":%u,\"osc_phase_preload\":%llu}\n",
            control,
@@ -181,8 +182,8 @@ static void print_json(volatile uint8_t *base) {
            period_stable,
            freerun_active,
            meas_time_us,
-           rd32(base, REG_RAW_PERIOD),
-           rd32(base, REG_FILT_PERIOD),
+           rd32(base, REG_MEAS_SPAN),
+           rd32(base, REG_EDGE_CNT),
            (long long)step_offset,
            (long long)step_base,
            (long long)step_live,
@@ -234,21 +235,19 @@ int main(int argc, char **argv) {
         uint32_t user_ctrl         = (uint32_t)strtoul(argv[5], NULL, 0) & CTRL_USER_MASK;
 
         if (g_harmonic) {
-            /* Clamp mult_n to [1, 5] */
+            /* Clamp mult_n to [1, 5]; osc_mode is a pulse-mode feature */
             if (reg08_val < 1u) reg08_val = 1u;
             if (reg08_val > 5u) reg08_val = 5u;
-            /* Disable output but keep harmonic_mode asserted during register update */
-            wr32(base, REG_CONTROL, CTRL_HARMONIC);
-            wr32(base, REG_REG08, reg08_val);
-            wr48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI, phase_step_offset);
-            wr32(base, REG_CONTROL, user_ctrl | CTRL_HARMONIC);
-        } else {
-            /* Disable output; harmonic_mode stays 0 */
-            wr32(base, REG_CONTROL, 0);
-            wr32(base, REG_REG08, reg08_val);
-            wr48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI, phase_step_offset);
-            wr32(base, REG_CONTROL, user_ctrl);   /* harmonic_mode bit 3 = 0 */
+            user_ctrl &= ~CTRL_OSC_MODE;
+            user_ctrl |= CTRL_HARMONIC;
         }
+        /* Registers first, control last. The FPGA commits 48-bit values
+         * atomically on their low-word write, so the output keeps running
+         * during an update — no disable/re-enable cycle, which would reset
+         * the frequency measurement and drop the output for a full window. */
+        wr32(base, REG_REG08, reg08_val);
+        wr48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI, phase_step_offset);
+        wr32(base, REG_CONTROL, user_ctrl);
         print_json(base);
 
     } else if (strcmp(argv[2], "control") == 0) {
@@ -259,8 +258,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         uint32_t ctrl = (uint32_t)strtoul(argv[3], NULL, 0) & CTRL_USER_MASK;
-        if (g_harmonic)
+        if (g_harmonic) {
+            ctrl &= ~CTRL_OSC_MODE;   /* osc_mode is a pulse-mode feature */
             ctrl |= CTRL_HARMONIC;
+        }
         wr32(base, REG_CONTROL, ctrl);
         print_json(base);
 

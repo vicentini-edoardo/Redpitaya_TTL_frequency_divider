@@ -16,10 +16,11 @@ oscilloscope):
   - the mode is enabled at an arbitrary instant relative to the input
     edges (start_frac), so the legacy open-loop triangle is centred at a
     random phase instead of P0
-  - step_base comes from the reciprocal counter,
-    (edge_cnt - 1) << 48 // (2 * window_cycles), quantized to ±1 edge per
-    window → frequency error up to f_clk / (2 * window_cycles) Hz, which
-    makes the legacy open-loop phase drift continuously
+  - step_base comes from the reciprocal counter. The legacy fixed-window
+    counter was quantized to ±1 edge per window → frequency error up to
+    f_clk / (2 * window_cycles) Hz, which made the legacy open-loop phase
+    drift continuously. The current RTL measures the span between the
+    first and last rising edge (true reciprocal counting, ±1 clk per end).
 
 Usage:
     python3 osc_delay_sim.py
@@ -58,17 +59,31 @@ def osc_half_period_cycles(P_frac: float, f_shift_hz: float) -> int:
     """
     return round(2 * P_frac * CLK_HZ / f_shift_hz)
 
-def measured_step_base(f_in_hz: float, window_cycles: int) -> int:
+def measured_step_base(f_in_hz: float, window_cycles: int,
+                       legacy: bool = False) -> int:
     """
-    Reciprocal-counter model (pulse_gen.sv): the window opens on an edge,
-    both rising and falling edges are counted, and
+    Reciprocal-counter model of pulse_gen.sv.
+
+    Current RTL (legacy=False): true reciprocal counting — rising edges are
+    counted and the span (clock cycles between the first and last rising
+    edge) is latched; phase_step_base = (edge_cnt - 1) << 48 // span.
+    Quantization: ±1 clock at each end of the span (~2 clk / window).
+
+    Legacy RTL (legacy=True): both edges counted over a fixed window;
     phase_step_base = (edge_cnt - 1) << 48 // (2 * window_cycles).
-    The result is quantized to ±1 edge per window → frequency error up to
+    Quantization: ±1 edge per window → frequency error up to
     f_clk / (2 * window_cycles) Hz.
     """
-    edges_after_open = int(2.0 * f_in_hz * window_cycles / CLK_HZ)
-    edge_cnt = 1 + edges_after_open
-    return ((edge_cnt - 1) << PHASE_BITS) // (2 * window_cycles)
+    if legacy:
+        edges_after_open = int(2.0 * f_in_hz * window_cycles / CLK_HZ)
+        edge_cnt = 1 + edges_after_open
+        return ((edge_cnt - 1) << PHASE_BITS) // (2 * window_cycles)
+    T_in_clks = CLK_HZ / f_in_hz
+    n_rise = 1 + int(window_cycles / T_in_clks)   # rising edges in window
+    span   = round((n_rise - 1) * T_in_clks)      # ±1 clk quantization
+    if n_rise < 3 or span <= 0:
+        return 0
+    return ((n_rise - 1) << PHASE_BITS) // span
 
 # ── Limit checker ──────────────────────────────────────────────────────────────
 
@@ -117,9 +132,10 @@ def simulate_osc_nco(
     P_frac:       float,  # half-amplitude [0,0.5) as fraction of T_in
     n_osc_cycles: int = 8,
     *,
-    edge_locked:   bool = True,
-    window_cycles: int | None = WINDOW_100MS,
-    start_frac:    float = 0.0,
+    edge_locked:    bool = True,
+    window_cycles:  int | None = WINDOW_100MS,
+    start_frac:     float = 0.0,
+    legacy_counter: bool = False,
 ) -> dict:
     """
     Tick-accurate NCO simulation of pulse_gen.sv osc mode.
@@ -138,7 +154,7 @@ def simulate_osc_nco(
     (what an oscilloscope triggered on the input shows) and should follow
     a triangle wave between P0-P and P0+P.
     """
-    step_base = (measured_step_base(f_in_hz, window_cycles)
+    step_base = (measured_step_base(f_in_hz, window_cycles, legacy_counter)
                  if window_cycles else hz_to_phase_step(f_in_hz))
     step_offset = hz_to_phase_step(f_shift_hz)
     half_period = osc_half_period_cycles(P_frac, f_shift_hz)
@@ -305,7 +321,7 @@ def plot_results(res, f_in_hz, f_shift_hz, P0_frac, P_frac, outpath, title=""):
 
 def run_scenario(label, f_in, f_shift, P0, P, n_osc=8, plot=False, plot_path=None,
                  edge_locked=True, window_cycles=WINDOW_100MS, start_frac=0.0,
-                 expect_fail=False):
+                 legacy_counter=False, expect_fail=False):
     print(f"\n{'='*60}")
     print(f"Scenario: {label}")
     print(f"  f_in={f_in:.0f} Hz  f_shift={f_shift:.1f} Hz  P0={P0*100:.1f}%  P={P*100:.1f}%")
@@ -324,7 +340,7 @@ def run_scenario(label, f_in, f_shift, P0, P, n_osc=8, plot=False, plot_path=Non
 
     res = simulate_osc_nco(f_in, f_shift, P0, P, n_osc_cycles=n_osc,
                            edge_locked=edge_locked, window_cycles=window_cycles,
-                           start_frac=start_frac)
+                           start_frac=start_frac, legacy_counter=legacy_counter)
     if window_cycles:
         f_meas = res["step_base"] * CLK_HZ / PHASE_WRAP
         print(f"  measured f_in = {f_meas:.3f} Hz  (error {f_meas - f_in:+.3f} Hz)")
@@ -352,7 +368,7 @@ if __name__ == "__main__":
     legacy_ok = run_scenario(
         "HW conditions — LEGACY open-loop (demonstrates the bug)",
         999_983, 100, 0.20, 0.05, start_frac=0.37,
-        edge_locked=False, expect_fail=True, plot=True,
+        edge_locked=False, legacy_counter=True, expect_fail=True, plot=True,
         plot_path="/tmp/osc_legacy.png")
     if legacy_ok:
         print("  [WARN] legacy logic unexpectedly passed — non-idealities too mild?")

@@ -101,7 +101,7 @@ logic [31:0] meas_time_us;
 logic        pulse_busy;
 logic        pulse_out;
 
-logic [31:0] period_cycles;
+logic [31:0] meas_span;
 logic [31:0] edge_cnt_out;
 logic        period_valid;
 logic        period_stable;
@@ -218,7 +218,7 @@ pulse_gen pulse_gen_i
   .trig_out           (trig_out),
   .busy               (pulse_busy),
 
-  .period_cycles      (period_cycles),
+  .meas_span          (meas_span),
   .edge_cnt_out       (edge_cnt_out),
   .period_valid       (period_valid),
   .period_stable      (period_stable),
@@ -269,7 +269,7 @@ axi4lite_pulse_regs regs_i
   .osc_phase_preload   (osc_phase_preload),
 
   .pulse_busy          (pulse_busy),
-  .period_cycles       (period_cycles),
+  .meas_span           (meas_span),
   .edge_cnt_out        (edge_cnt_out),
   .period_valid        (period_valid),
   .period_stable       (period_stable),

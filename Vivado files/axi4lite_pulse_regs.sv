@@ -15,8 +15,8 @@
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] period_stable, [3] timeout,
 //                      [4] freerun_active
 //                      (bit order matches the rdata concat below: see 5'd4 read)
-//   0x14 RO  period_cycles   (edge count from last window, same as edge_cnt_out)
-//   0x18 RO  edge_cnt_out    (edge count from last window; f_in = CLK_HZ * (val-1) / (2*window_cycles))
+//   0x14 RO  meas_span       (clock cycles between first and last rising edge of last window)
+//   0x18 RO  edge_cnt_out    (rising-edge count from last window; f_in = CLK_HZ * (val-1) / meas_span)
 //   0x1C RW  phase_step_offset_lo   bits [31:0]  of signed 48-bit NCO offset
 //   0x20 RW  phase_step_offset_hi   bits [47:32] of signed 48-bit NCO offset (in [15:0])
 //   0x24 RO  phase_step_base_lo     bits [31:0]  of computed base step
@@ -37,6 +37,10 @@
 //   force_high (control[2]) overrides the output pin HIGH regardless of NCO state.
 //   harmonic_mode (control[3]) selects output: NCO carry-out (0) vs phase_acc[47] (1).
 //   Writes to read-only or undefined addresses are silently accepted (BRESP=OKAY).
+//   48-bit values (trig_phase_step, phase_step_offset, osc_phase_preload) are
+//   staged in hi/lo shadow registers and COMMITTED to pulse_gen one cycle after
+//   the LO word is written (write order: hi first, then lo — matching rp_ctl.c).
+//   pulse_gen therefore never sees a torn {new_hi, old_lo} value while running.
 
 module axi4lite_pulse_regs
 (
@@ -81,7 +85,7 @@ module axi4lite_pulse_regs
 
   // Status inputs <- pulse_gen
   input  logic        pulse_busy,
-  input  logic [31:0] period_cycles,
+  input  logic [31:0] meas_span,
   input  logic [31:0] edge_cnt_out,
   input  logic        period_valid,
   input  logic        period_stable,
@@ -102,6 +106,15 @@ module axi4lite_pulse_regs
   logic [31:0] reg_osc_phase_preload_lo;
   logic [15:0] reg_osc_phase_preload_hi;
 
+  // Committed 48-bit values presented to pulse_gen (updated atomically one
+  // cycle after the LO word of the pair is written).
+  logic [47:0] trig_phase_step_q;
+  logic [47:0] phase_step_offset_q;
+  logic [47:0] osc_phase_preload_q;
+  logic        commit_trig;
+  logic        commit_offset;
+  logic        commit_preload;
+
   logic [31:0] awaddr_latched;
   logic [31:0] wdata_latched;
   logic [ 3:0] wstrb_latched;
@@ -120,12 +133,12 @@ module axi4lite_pulse_regs
   assign force_high        = reg_control[2];
   assign harmonic_mode     = reg_control[3];
   assign osc_mode          = reg_control[4];
-  assign trig_phase_step   = {reg_trig_phase_step_hi, reg_trig_phase_step_lo};
+  assign trig_phase_step   = trig_phase_step_q;
   assign width_n           = reg_width_n;
   assign meas_time_us      = reg_meas_time_us;
-  assign phase_step_offset = $signed({reg_phase_step_offset_hi, reg_phase_step_offset_lo});
+  assign phase_step_offset = $signed(phase_step_offset_q);
   assign osc_half_period   = reg_osc_half_period;
-  assign osc_phase_preload = {reg_osc_phase_preload_hi, reg_osc_phase_preload_lo};
+  assign osc_phase_preload = osc_phase_preload_q;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -140,6 +153,13 @@ module axi4lite_pulse_regs
       reg_osc_phase_preload_lo  <= 32'h00000000;
       reg_osc_phase_preload_hi  <= 16'h0000;
 
+      trig_phase_step_q         <= 48'd0;
+      phase_step_offset_q       <= 48'd0;
+      osc_phase_preload_q       <= 48'd0;
+      commit_trig               <= 1'b0;
+      commit_offset             <= 1'b0;
+      commit_preload            <= 1'b0;
+
       pulse_soft_reset <= 1'b0;
 
       awaddr_latched   <= 32'd0;
@@ -153,6 +173,17 @@ module axi4lite_pulse_regs
       s_axi_rdata      <= 32'd0;
     end else begin
       pulse_soft_reset <= 1'b0;
+
+      // ---- 48-bit commit (one cycle after the LO word write) ----
+      if (commit_trig)
+        trig_phase_step_q   <= {reg_trig_phase_step_hi,   reg_trig_phase_step_lo};
+      if (commit_offset)
+        phase_step_offset_q <= {reg_phase_step_offset_hi, reg_phase_step_offset_lo};
+      if (commit_preload)
+        osc_phase_preload_q <= {reg_osc_phase_preload_hi, reg_osc_phase_preload_lo};
+      commit_trig    <= 1'b0;
+      commit_offset  <= 1'b0;
+      commit_preload <= 1'b0;
 
       // ---- AW channel ----
       if (s_axi_awready && s_axi_awvalid) begin
@@ -186,6 +217,7 @@ module axi4lite_pulse_regs
             if (wstrb_latched[1]) reg_trig_phase_step_lo[15: 8] <= wdata_latched[15: 8];
             if (wstrb_latched[2]) reg_trig_phase_step_lo[23:16] <= wdata_latched[23:16];
             if (wstrb_latched[3]) reg_trig_phase_step_lo[31:24] <= wdata_latched[31:24];
+            commit_trig <= 1'b1;
           end
 
           5'd2: begin  // 0x08  width_n
@@ -200,13 +232,14 @@ module axi4lite_pulse_regs
             if (wstrb_latched[1]) reg_trig_phase_step_hi[15:8] <= wdata_latched[15:8];
           end
 
-          // 5'd4 (status), 5'd5 (period_cycles), 5'd6 (edge_cnt_out): read-only
+          // 5'd4 (status), 5'd5 (meas_span), 5'd6 (edge_cnt_out): read-only
 
           5'd7: begin  // 0x1C phase_step_offset_lo
             if (wstrb_latched[0]) reg_phase_step_offset_lo[ 7: 0] <= wdata_latched[ 7: 0];
             if (wstrb_latched[1]) reg_phase_step_offset_lo[15: 8] <= wdata_latched[15: 8];
             if (wstrb_latched[2]) reg_phase_step_offset_lo[23:16] <= wdata_latched[23:16];
             if (wstrb_latched[3]) reg_phase_step_offset_lo[31:24] <= wdata_latched[31:24];
+            commit_offset <= 1'b1;
           end
 
           5'd8: begin  // 0x20 phase_step_offset_hi (bits [47:32] in [15:0])
@@ -235,6 +268,7 @@ module axi4lite_pulse_regs
             if (wstrb_latched[1]) reg_osc_phase_preload_lo[15: 8] <= wdata_latched[15: 8];
             if (wstrb_latched[2]) reg_osc_phase_preload_lo[23:16] <= wdata_latched[23:16];
             if (wstrb_latched[3]) reg_osc_phase_preload_lo[31:24] <= wdata_latched[31:24];
+            commit_preload <= 1'b1;
           end
 
           5'd16: begin  // 0x40 osc_phase_preload_hi (bits [47:32] in [15:0])
@@ -262,7 +296,7 @@ module axi4lite_pulse_regs
           5'd3:  s_axi_rdata <= {16'd0, reg_trig_phase_step_hi};
           5'd4:  s_axi_rdata <= {27'd0, freerun_active, timeout_flag,
                                          period_stable, period_valid, pulse_busy};
-          5'd5:  s_axi_rdata <= period_cycles;
+          5'd5:  s_axi_rdata <= meas_span;
           5'd6:  s_axi_rdata <= edge_cnt_out;
           5'd7:  s_axi_rdata <= reg_phase_step_offset_lo;
           5'd8:  s_axi_rdata <= {16'd0, reg_phase_step_offset_hi};
