@@ -108,7 +108,7 @@ which the C helper sets/clears based on its invocation name.
 
 | Offset | Register | Notes |
 |--------|----------|-------|
-| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode |
+| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode, bit 5=edge_lock |
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0=off) |
 | `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |

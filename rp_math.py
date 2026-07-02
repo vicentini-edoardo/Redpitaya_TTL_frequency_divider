@@ -20,6 +20,7 @@ DEFAULT_BASE  = 0x40600000
 CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
 CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
 CTRL_OSC_MODE   = 0x10   # bit 4 — oscillating delay mode
+CTRL_EDGE_LOCK  = 0x20   # bit 5 — anchor NCO phase to input edges
 # bit 3 (harmonic_mode) is enforced by the respective C helper
 
 _PHASE_MAX    = 2 ** (PHASE_BITS - 1)

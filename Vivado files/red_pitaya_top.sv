@@ -94,6 +94,7 @@ logic        pulse_soft_reset;
 logic        force_high;
 logic        harmonic_mode;
 logic        osc_mode;
+logic        edge_lock;
 logic [31:0] osc_half_period;
 logic [47:0] osc_phase_preload;
 logic [31:0] width_n;
@@ -201,6 +202,7 @@ pulse_gen pulse_gen_i
   .soft_reset        (pulse_soft_reset),
   .harmonic_mode     (harmonic_mode),
   .osc_mode          (osc_mode),
+  .edge_lock         (edge_lock),
 
   .trig_in           (exp_p_io[0]),
 
@@ -261,6 +263,7 @@ axi4lite_pulse_regs regs_i
   .force_high          (force_high),
   .harmonic_mode       (harmonic_mode),
   .osc_mode            (osc_mode),
+  .edge_lock           (edge_lock),
   .trig_phase_step     (trig_phase_step),
   .width_n             (width_n),
   .meas_time_us        (meas_time_us),

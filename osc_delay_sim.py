@@ -136,6 +136,8 @@ def simulate_osc_nco(
     window_cycles:  int | None = WINDOW_100MS,
     start_frac:     float = 0.0,
     legacy_counter: bool = False,
+    constant_shift: bool = False,
+    duration_ticks: int | None = None,
 ) -> dict:
     """
     Tick-accurate NCO simulation of pulse_gen.sv osc mode.
@@ -143,6 +145,9 @@ def simulate_osc_nco(
     edge_locked=True  → corrected RTL: phase_acc snaps to osc_target on
                         every input rising edge (delay anchored to input).
     edge_locked=False → legacy RTL: open-loop dead reckoning from preload.
+    constant_shift=True → models the edge_lock control bit in pulse mode:
+                        constant +offset sign, no triangle sign flips
+                        (f_out = f_in + f_shift; osc_half_period unused).
     window_cycles     → reciprocal-counter measurement window; the NCO base
                         step is the quantized measured value. None = exact
                         base step (the original idealized assumption).
@@ -160,7 +165,8 @@ def simulate_osc_nco(
     half_period = osc_half_period_cycles(P_frac, f_shift_hz)
     T_in_clks   = CLK_HZ / f_in_hz
 
-    total_ticks = n_osc_cycles * 2 * half_period + half_period // 2
+    total_ticks = (duration_ticks if duration_ticks is not None
+                   else n_osc_cycles * 2 * half_period + half_period // 2)
 
     # Preload: first pulse arrives with delay P0-P (minimum of triangle wave).
     # φ_start = P0-P  →  acc = (1 - (P0-P)) % 1.0 * PHASE_WRAP
@@ -168,7 +174,7 @@ def simulate_osc_nco(
     # sign=-1: f_out = f_in - f_shift (slower) → delay φ increases P0-P → P0+P
     acc     = int((1.0 - (P0_frac - P_frac)) % 1.0 * PHASE_WRAP)
     target  = acc                                  # osc_target (corrected RTL)
-    sign    = -1                                   # first sweep: φ increases toward P0+P
+    sign    = 1 if constant_shift else -1          # osc: φ increases toward P0+P
     counter = 0
     armed   = edge_locked  # corrected RTL: NCO held until first anchoring edge
 
@@ -189,8 +195,8 @@ def simulate_osc_nco(
                 next_edge_int = round(next_edge_f)
             continue
 
-        # sign flip
-        if counter >= half_period:
+        # sign flip (osc triangle only)
+        if not constant_shift and counter >= half_period:
             counter = 0
             sign    = -sign
             flip_ticks.append(tick)
@@ -353,6 +359,40 @@ def run_scenario(label, f_in, f_shift, P0, P, n_osc=8, plot=False, plot_path=Non
     return ok
 
 
+def check_edge_lock_shift(f_in, f_shift, duration_s=0.05,
+                          window_cycles=WINDOW_100MS, start_frac=0.37):
+    """
+    Verify the edge_lock control bit (constant frequency shift, pulse mode):
+    the beat f_out - f_in must equal f_shift exactly when edge-locked,
+    whereas open-loop it equals f_shift + (measurement error).
+    The beat frequency is the slope of the unwrapped pulse phase vs time.
+    """
+    print(f"\n{'='*60}")
+    print(f"Edge-lock shift check: f_in={f_in:.0f} Hz  f_shift={f_shift:.1f} Hz  "
+          f"duration={duration_s*1e3:.0f} ms")
+    n_ticks = int(duration_s * CLK_HZ)
+    errors = {}
+    for label, locked in (("open-loop", False), ("edge-locked", True)):
+        res = simulate_osc_nco(f_in, f_shift, 0.0, 0.01,
+                               edge_locked=locked, window_cycles=window_cycles,
+                               start_frac=start_frac, constant_shift=True,
+                               duration_ticks=n_ticks)
+        ph  = np.unwrap(res["rel_phases"], period=1.0)          # cycles
+        t   = res["pulse_ticks"] / CLK_HZ                       # seconds
+        # rel_phase is the pulse position relative to the edge grid: a faster
+        # output (f_out = f_in + f_shift) makes it *decrease*, so beat = -slope
+        beat = -np.polyfit(t, ph, 1)[0]
+        errors[label] = beat - f_shift
+        print(f"  {label:12s}: beat = {beat:+12.6f} Hz   "
+              f"error vs f_shift = {beat - f_shift:+.6f} Hz")
+    ok = bool(abs(errors["edge-locked"]) < 0.02 and
+              abs(errors["edge-locked"]) < abs(errors["open-loop"]))
+    print(f"  → {'PASS' if ok else 'FAIL'}  "
+          "(edge-locked beat must equal f_shift; open-loop carries the "
+          "measurement error)")
+    return ok
+
+
 if __name__ == "__main__":
     all_ok = True
 
@@ -377,6 +417,9 @@ if __name__ == "__main__":
         "HW conditions — EDGE-LOCKED (corrected logic)",
         999_983, 100, 0.20, 0.05, start_frac=0.37, plot=True,
         plot_path="/tmp/osc_locked.png"))
+
+    # ── A2. edge_lock control bit: constant frequency shift (pulse mode) ──────
+    _track(check_edge_lock_shift(999_983, 1000.0))
 
     # ── B. Verification suite (corrected logic, hardware non-idealities) ──────
     # 1. Nominal
