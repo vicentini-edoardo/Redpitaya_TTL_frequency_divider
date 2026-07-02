@@ -1297,6 +1297,11 @@ class HarmonicPanel(_NcoPanel):
 # OscPanel — oscillating delay mode
 #   phase sweeps P0-P → P0+P → P0-P at rate f_osc
 #   f_shift = 4 * f_osc * P  (derived internally)
+#
+#   The FPGA re-anchors the NCO to the input on every rising edge
+#   (edge-locked osc mode), so P0 and P are true phases referenced to the
+#   input edge and the sweep does not drift with measurement error.
+#   Requires a bitstream built from the current pulse_gen.sv.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OscPanel(QWidget):
@@ -1552,6 +1557,24 @@ class OscPanel(QWidget):
         offset_w   = hz_to_phase(f_shift)
         period     = self._period_c if self._period_c > 0 else 1000
         wc         = duty_to_cycles(width_pct / 100.0, period)
+
+        # Sanity-check against the measured input, when available.
+        if self._period_c > 0:
+            f_in = CLK_HZ / self._period_c
+            if f_shift >= f_in:
+                self._log(
+                    f"ERROR: derived f_shift {fmt_freq(f_shift)} >= measured "
+                    f"f_in {fmt_freq(f_in)} (f_shift = 4·f_osc·P) — reduce "
+                    "f_osc or P. Not applied."
+                )
+                return
+            min_p = 2.0 / self._period_c
+            if P_frac < min_p:
+                self._log(
+                    f"WARNING: P = {P_frac*100:.3f}% is below the NCO step "
+                    f"({min_p*100:.3f}% of T_in at this f_in); the delay sweep "
+                    "will be unresolvable."
+                )
 
         self._be.apply_osc(wc, half_p, preload, offset_w)
         self._log(

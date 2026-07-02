@@ -32,6 +32,21 @@
 //       mult_n = width_n[2:0] clamped to [1..5].
 //       f_out = mult_n * f_in + phase_step_offset * f_clk / 2^48
 //
+//     Oscillating delay mode (osc_mode = 1, pulse mode only):
+//       The sign of phase_step_offset alternates every osc_half_period
+//       ticks, so the output pulse delay relative to the input sweeps a
+//       triangle wave P0-P → P0+P → P0-P at rate f_shift / (4·P).
+//       A separate register (osc_target) integrates only the ±offset part
+//       of the step; on every synchronized input rising edge phase_acc is
+//       re-anchored to osc_target. Each pulse therefore fires
+//       (2^48 - osc_target) / phase_step_base clock ticks after the
+//       physical input edge: the reciprocal-counter quantization error
+//       (up to f_clk / (2·window_cycles) Hz) cannot accumulate into a
+//       phase drift, and P0 / P are true phases referenced to the input
+//       edge instead of the arbitrary instant freerun started.
+//       (The 2-FF trigger synchronizer plus output register add a fixed
+//       ~4-clock latency — a constant, calibratable delay offset.)
+//
 //   Resetting:
 //     soft_reset or deasserting enable clears freerun_active, resets the NCO,
 //     and restarts the MEASURE phase from scratch.
@@ -291,11 +306,28 @@ module pulse_gen
   //
   // Osc mode: sign alternates every osc_half_period ticks, sweeping
   // output phase P0-P → P0+P → P0-P at rate f_shift / (4·P).
-  // Accumulator is preloaded on osc_mode enable so first pulse has
-  // delay = P0 - P (start of triangle wave).
+  //
+  // osc_target integrates only the ±phase_step_offset (triangle) part
+  // of the step. On every synchronized input rising edge phase_acc is
+  // re-anchored to osc_target, so the pulse delay is referenced to the
+  // physical input edge and the measured-vs-actual f_in mismatch is
+  // cleared once per input period instead of accumulating forever.
+  // Between edges (or if the input stops) the NCO freeruns as before.
+  //
+  // On osc_mode enable the accumulator and target are preloaded and the
+  // NCO is held (osc_run = 0) until the first input rising edge, so the
+  // triangle starts at that edge and the very first pulse already has
+  // delay = P0 - P. Without the hold, the pulses emitted between the
+  // (arbitrary) preload instant and the first edge would sit at a random
+  // phase.
   // ----------------------------------------------------------------
   logic [31:0] osc_counter;
   logic        osc_mode_prev;
+  logic        osc_run;          // 0 = preloaded, waiting for anchoring edge
+  logic [47:0] osc_target;
+  logic [47:0] osc_target_next;
+
+  assign osc_target_next = osc_target + phase_step_eff[47:0];   // mod 2^48
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -304,6 +336,8 @@ module pulse_gen
       osc_counter    <= 32'd0;
       osc_sign       <= 1'b0;
       osc_mode_prev  <= 1'b0;
+      osc_run        <= 1'b0;
+      osc_target     <= 48'd0;
     end else begin
       osc_mode_prev <= osc_mode;
       if (soft_reset || !enable) begin
@@ -311,13 +345,17 @@ module pulse_gen
         phase_acc      <= 48'd0;
         osc_counter    <= 32'd0;
         osc_sign       <= 1'b0;
+        osc_run        <= 1'b0;
+        osc_target     <= 48'd0;
       end else if (!freerun_active) begin
         if (period_stable && div_base_valid && !div_active) begin
           freerun_active <= 1'b1;
           if (osc_mode) begin
             phase_acc   <= osc_phase_preload;
+            osc_target  <= osc_phase_preload;
             osc_counter <= 32'd0;
             osc_sign    <= 1'b0;
+            osc_run     <= 1'b0;
           end
         end
       end else begin
@@ -325,11 +363,26 @@ module pulse_gen
         if (osc_mode && !osc_mode_prev) begin
           // rising edge of osc_mode: preload accumulator, reset oscillation
           phase_acc   <= osc_phase_preload;
+          osc_target  <= osc_phase_preload;
           osc_counter <= 32'd0;
           osc_sign    <= 1'b0;
+          osc_run     <= 1'b0;
+        end else if (osc_mode && !osc_run) begin
+          // armed: hold the preload until the first input rising edge so
+          // the triangle wave starts anchored to the input
+          phase_acc   <= osc_phase_preload;
+          osc_target  <= osc_phase_preload;
+          osc_counter <= 32'd0;
+          osc_sign    <= 1'b0;
+          if (trig_rise)
+            osc_run <= 1'b1;
         end else begin
-          phase_acc <= acc_sum[47:0];
+          // Re-anchor to the input on every rising edge (osc mode only);
+          // nco_tick still evaluates the pre-snap acc_sum this tick.
+          phase_acc <= (osc_mode && trig_rise) ? osc_target_next
+                                               : acc_sum[47:0];
           if (osc_mode) begin
+            osc_target <= osc_target_next;
             if (osc_half_period > 32'd0 &&
                 osc_counter >= osc_half_period - 32'd1) begin
               osc_counter <= 32'd0;
@@ -340,6 +393,8 @@ module pulse_gen
           end else begin
             osc_counter <= 32'd0;
             osc_sign    <= 1'b0;
+            osc_run     <= 1'b0;
+            osc_target  <= 48'd0;
           end
         end
       end
@@ -355,7 +410,9 @@ module pulse_gen
   logic [31:0] width_cnt;
   logic        nco_tick;
 
-  assign nco_tick = acc_sum[48] & freerun_active;
+  // In osc mode no pulses are emitted until the first input edge has
+  // anchored the triangle (osc_run).
+  assign nco_tick = acc_sum[48] & freerun_active & (~osc_mode | osc_run);
   assign busy     = freerun_active;
 
   always_ff @(posedge clk) begin
