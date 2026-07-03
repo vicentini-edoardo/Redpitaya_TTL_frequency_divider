@@ -138,7 +138,9 @@ One binary, two symlink names; mode detected from `argv[0]`:
 | `/root/rp_harmonic_ctl` | Harmonic | `write <mult_n> <phase_step_offset> <control>` |
 
 Subcommands (both modes): `read`, `write`, `control <value>`, `window <us>`,
-`trig <phase_step>`, `soft_reset`. Every subcommand prints one JSON object on stdout
+`trig <phase_step>`, `preload <word>`, `soft_reset`. (`preload` sets only
+`osc_phase_preload` — the edge-lock phase offset — leaving `osc_half_period`; the
+GUI re-arms `edge_lock` off→on so the new phase latches.) Every subcommand prints one JSON object on stdout
 that the GUI treats as the source of truth. 48-bit NCO values are split across two AXI
 words; the helper writes the high word first for atomic latching.
 

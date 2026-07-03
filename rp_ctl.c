@@ -109,8 +109,11 @@ static void usage(const char *prog) {
         "  %s <base_addr> osc <half_period_cycles> <phase_preload_uint64>\n"
         "      Set oscillating delay registers (write to osc_half_period and osc_phase_preload).\n"
         "      Use write command with bit4=1 in control to enable osc_mode.\n"
+        "  %s <base_addr> preload <phase_preload_uint64>\n"
+        "      Set osc_phase_preload only (edge-lock phase offset); leaves osc_half_period.\n"
+        "      Re-arm edge_lock (bit5 off→on via write) to apply the new phase.\n"
         "  %s <base_addr> soft_reset\n",
-        prog, prog, arg3, prog, prog, prog, prog, prog);
+        prog, prog, arg3, prog, prog, prog, prog, prog, prog);
 }
 
 static uint32_t rd32(volatile uint8_t *base, off_t off) {
@@ -309,6 +312,21 @@ int main(int argc, char **argv) {
         /* Write preload high word first for atomic FPGA latch */
         wr48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI, phase_preload);
         wr32(base, REG_OSC_HALF_PERIOD, half_period);
+        print_json(base);
+
+    } else if (strcmp(argv[2], "preload") == 0) {
+        if (argc != 4) {
+            usage(argv[0]);
+            munmap(map, (size_t)page_size);
+            close(fd);
+            return 1;
+        }
+        /* Edge-lock phase offset: set only osc_phase_preload, leaving
+         * osc_half_period untouched (it is ignored unless osc_mode is on).
+         * phase_acc reloads the preload on the RISING edge of edge_lock, so
+         * the caller must re-arm (drop bit5, then write with bit5=1) to apply. */
+        uint64_t phase_preload = (uint64_t)strtoull(argv[3], NULL, 0);
+        wr48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI, phase_preload);
         print_json(base);
 
     } else {
