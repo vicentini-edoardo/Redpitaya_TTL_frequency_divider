@@ -135,3 +135,31 @@ def osc_half_period_cycles(P_frac: float, f_shift_hz: float) -> int:
 def osc_phase_preload(P0_frac: float, P_frac: float) -> int:
     """48-bit accumulator preload so the first output pulse has delay = P0 − P."""
     return int((1.0 - (P0_frac - P_frac)) % 1.0 * 2**PHASE_BITS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge-locked phase offset (pulse mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def phase_offset_to_preload(offset_turns: float) -> int:
+    """48-bit accumulator preload for a constant edge-lock phase offset.
+
+    In edge-locked pulse mode the output pulse fires one NCO overflow after each
+    anchored input rising edge. Seeding phase_acc with this preload makes that
+    pulse lag the input edge by ``offset_turns`` of one output period. Because
+    the pulse fires on the carry out of 2^48, the preload is the complement of
+    the delay: (1 − offset_turns) mod 1, scaled onto the 48-bit NCO grid.
+
+    offset_turns is a fraction of one output period (turns); 0.25 == 90°.
+    Reduces mod 1, so any real value is accepted.
+    """
+    word = int(round((1.0 - offset_turns) % 1.0 * 2**PHASE_BITS))
+    return word & (2**PHASE_BITS - 1)
+
+
+def preload_to_phase_offset(word: int) -> float:
+    """Inverse of :func:`phase_offset_to_preload`: preload word → offset turns.
+
+    Returns the phase offset in turns, in the half-open interval [0, 1).
+    """
+    return (1.0 - (word & (2**PHASE_BITS - 1)) / 2**PHASE_BITS) % 1.0
