@@ -163,3 +163,22 @@ def preload_to_phase_offset(word: int) -> float:
     Returns the phase offset in turns, in the half-open interval [0, 1).
     """
     return (1.0 - (word & (2**PHASE_BITS - 1)) / 2**PHASE_BITS) % 1.0
+
+
+def harmonic_phase_offset_to_preload(offset_turns: float) -> int:
+    """48-bit accumulator preload for a constant edge-lock phase offset in
+    *harmonic* mode.
+
+    The harmonic output is the accumulator MSB (a 50%-duty square wave), so its
+    rising edge occurs when phase_acc crosses 2^47 — not the 2^48 wrap the pulse
+    carry uses. Seeding phase_acc with (0.5 − offset_turns) mod 1 makes the
+    output rising edge lag each anchored input edge by ``offset_turns`` of one
+    output period; offset 0 (preload = 2^47) aligns them.
+    """
+    word = int(round((0.5 - offset_turns) % 1.0 * 2**PHASE_BITS))
+    return word & (2**PHASE_BITS - 1)
+
+
+def harmonic_preload_to_phase_offset(word: int) -> float:
+    """Inverse of :func:`harmonic_phase_offset_to_preload` → offset turns [0, 1)."""
+    return (0.5 - (word & (2**PHASE_BITS - 1)) / 2**PHASE_BITS) % 1.0

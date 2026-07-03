@@ -19,6 +19,7 @@ from rp_math import (  # noqa: E402
     measured_edges_to_phase_step, fmt_dur,
     f_shift_from_f_osc, f_osc_from_params, osc_half_period_cycles, osc_phase_preload,
     phase_offset_to_preload, preload_to_phase_offset,
+    harmonic_phase_offset_to_preload, harmonic_preload_to_phase_offset,
 )
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
@@ -221,6 +222,44 @@ class TestPhaseOffsetPreload(unittest.TestCase):
         for turns in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9):
             word = phase_offset_to_preload(turns)
             back = preload_to_phase_offset(word)
+            self.assertLessEqual(abs(back - turns), 1.0 / self.PHASE_WRAP + 1e-12,
+                                 msg=f"roundtrip failed for {turns} turns")
+
+
+class TestHarmonicPhaseOffsetPreload(unittest.TestCase):
+    PHASE_WRAP = 2 ** PHASE_BITS
+
+    def test_zero_offset_aligns_msb(self):
+        # 0 turns → output rising edge at the input edge → preload = 2^47.
+        self.assertEqual(harmonic_phase_offset_to_preload(0.0), self.PHASE_WRAP // 2)
+
+    def test_quarter_turn(self):
+        # 0.25 turn delay → preload = (0.5 - 0.25) * 2^48 = 0.25 * 2^48.
+        expected = int(round(0.25 * self.PHASE_WRAP))
+        self.assertEqual(harmonic_phase_offset_to_preload(0.25), expected)
+
+    def test_result_within_48_bits(self):
+        for turns in (0.0, 0.1, 0.5, 0.999, 1.0, 2.5, -0.25):
+            word = harmonic_phase_offset_to_preload(turns)
+            self.assertGreaterEqual(word, 0)
+            self.assertLess(word, self.PHASE_WRAP)
+
+    def test_reduces_mod_one_turn(self):
+        self.assertEqual(harmonic_phase_offset_to_preload(0.3),
+                         harmonic_phase_offset_to_preload(1.3))
+        self.assertEqual(harmonic_phase_offset_to_preload(-0.25),
+                         harmonic_phase_offset_to_preload(0.75))
+
+    def test_half_turn_from_pulse_reference(self):
+        # Harmonic preload leads the pulse preload by exactly half a turn.
+        for turns in (0.0, 0.1, 0.37, 0.8):
+            self.assertEqual(harmonic_phase_offset_to_preload(turns),
+                             phase_offset_to_preload(turns - 0.5))
+
+    def test_roundtrip_within_one_lsb(self):
+        for turns in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9):
+            word = harmonic_phase_offset_to_preload(turns)
+            back = harmonic_preload_to_phase_offset(word)
             self.assertLessEqual(abs(back - turns), 1.0 / self.PHASE_WRAP + 1e-12,
                                  msg=f"roundtrip failed for {turns} turns")
 

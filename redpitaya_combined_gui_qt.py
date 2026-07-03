@@ -59,6 +59,7 @@ from rp_math import (  # noqa: E402
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
     f_shift_from_f_osc, osc_half_period_cycles, osc_phase_preload as osc_preload_word,
     phase_offset_to_preload, preload_to_phase_offset,
+    harmonic_phase_offset_to_preload, harmonic_preload_to_phase_offset,
 )
 
 _APP_DIR = Path(__file__).resolve().parent
@@ -182,13 +183,23 @@ class SshBackend(QObject):
                               self.sig_status.emit)
 
     def apply_harmonic(self, mult_n: int, offset_word: int,
-                       edge_lock: bool = False):
-        """Harmonic-mode modulated write (enable=1, harmonic_mode=1 via helper)."""
+                       edge_lock: bool = False, preload: Optional[int] = None):
+        """Harmonic-mode modulated write (enable=1, harmonic_mode=1 via helper).
+
+        When ``edge_lock`` is on and ``preload`` is given, the phase-offset
+        preload is written and the lock is re-armed so the new phase takes
+        effect (see ``_do_apply_harmonic_locked``)."""
         if self._live:
             ctrl = CTRL_ENABLE | (CTRL_EDGE_LOCK if edge_lock else 0)
-            self._enqueue(self.P_USER,
-                          lambda: self._do_write_harmonic(mult_n, offset_word, ctrl),
-                          self.sig_status.emit)
+            if edge_lock and preload is not None:
+                self._enqueue(self.P_USER,
+                              lambda: self._do_apply_harmonic_locked(
+                                  mult_n, offset_word, preload, ctrl),
+                              self.sig_status.emit)
+            else:
+                self._enqueue(self.P_USER,
+                              lambda: self._do_write_harmonic(mult_n, offset_word, ctrl),
+                              self.sig_status.emit)
 
     def set_control_pulse(self, ctrl: int):
         """Set control register via the pulse helper (keeps harmonic_mode=0)."""
@@ -388,6 +399,21 @@ class SshBackend(QObject):
                         ctrl: int = CTRL_ENABLE) -> dict:
         return json.loads(self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} write {width} {offset} {ctrl}"
+        ))
+
+    def _do_apply_harmonic_locked(self, mult_n: int, offset: int, preload: int,
+                                  ctrl: int) -> dict:
+        self._exec(
+            f"/root/rp_harmonic_ctl 0x{self._base:08X} preload {preload}"
+        )
+        # See _do_apply_pulse_locked: the preload latches on the rising edge of
+        # edge_lock, so re-arm it (drop bit5, then the modulated write) to apply
+        # a new phase while the lock is already engaged.
+        self._exec(
+            f"/root/rp_harmonic_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+        )
+        return json.loads(self._exec(
+            f"/root/rp_harmonic_ctl 0x{self._base:08X} write {mult_n} {offset} {ctrl}"
         ))
 
     def _do_write_harmonic(self, mult_n: int, offset: int,
@@ -814,9 +840,41 @@ class _NcoPanel(QWidget):
         raise NotImplementedError
 
     def _build_lock_extras(self, auto_row) -> None:
-        """Optional widgets placed next to the Edge-lock checkbox (pulse adds a
-        phase-offset spin here). Default: nothing."""
-        return None
+        """A phase-offset spin placed next to the Edge-lock checkbox. The offset
+        is only meaningful while the phase is anchored to the input, so it is
+        enabled together with edge lock (see _update_mode_controls)."""
+        lbl = _dim_label("Phase:")
+        lbl.setToolTip(
+            "Constant phase offset of the output relative to each anchored\n"
+            "input rising edge, as a fraction of one output period.\n"
+            "Only active with Edge lock on (the phase needs an input anchor).\n"
+            "0° = output edge aligned to the input edge; 90° = quarter period later."
+        )
+        auto_row.addSpacing(12)
+        auto_row.addWidget(lbl)
+        self._sp_phase = QDoubleSpinBox()
+        self._sp_phase.setRange(0.0, 360.0)
+        self._sp_phase.setWrapping(True)
+        self._sp_phase.setDecimals(1)
+        self._sp_phase.setSingleStep(1.0)
+        self._sp_phase.setSuffix(" °")
+        self._sp_phase.setValue(0.0)
+        self._sp_phase.setFixedHeight(30)
+        self._sp_phase.setMinimumWidth(96)
+        self._sp_phase.setFont(_mono_font(11, bold=True))
+        self._sp_phase.setStyleSheet(_spin_style())
+        self._sp_phase.setEnabled(False)   # gated on edge lock via _update_mode_controls
+        self._sp_phase.valueChanged.connect(self._param_changed)
+        auto_row.addWidget(self._sp_phase)
+
+    # Phase-offset ↔ NCO preload conversion. Defaults are the pulse-mode
+    # formulas (pulse fires on the 2^48 carry); HarmonicPanel overrides these
+    # because its square-wave output rises at the 2^47 MSB crossing.
+    def _phase_turns_to_preload(self, turns: float) -> int:
+        return phase_offset_to_preload(turns)
+
+    def _preload_to_phase_turns(self, word: int) -> float:
+        return preload_to_phase_offset(word)
 
     def _be_set_control(self, ctrl: int):
         raise NotImplementedError
@@ -1141,9 +1199,9 @@ class _NcoPanel(QWidget):
             sub       = f"shift {fmt_signed_freq(delta)}"
             if locked:
                 sub += " · edge-locked"
-                # Pulse mode exposes a phase offset; show the device's live value.
+                # Show the device's live phase offset (mode-specific mapping).
                 if self._sp_phase is not None:
-                    ph = preload_to_phase_offset(int(d.get("osc_phase_preload") or 0)) * 360.0
+                    ph = self._preload_to_phase_turns(int(d.get("osc_phase_preload") or 0)) * 360.0
                     sub += f" · φ={ph:.1f}°"
             self._d_out.set_data(fmt_freq(out_hz), sub)
             self._update_shift_detail()
@@ -1233,31 +1291,6 @@ class PulsePanel(_NcoPanel):
         fields.addWidget(self._sp_width, 0, 3)
         return self._sp_width
 
-    def _build_lock_extras(self, auto_row) -> None:
-        lbl = _dim_label("Phase:")
-        lbl.setToolTip(
-            "Constant phase offset of the output pulse relative to each\n"
-            "anchored input rising edge, as a fraction of one output period.\n"
-            "Only active with Edge lock on (the phase needs an input anchor).\n"
-            "0° = pulse aligned to the input edge; 90° = quarter period later."
-        )
-        auto_row.addSpacing(12)
-        auto_row.addWidget(lbl)
-        self._sp_phase = QDoubleSpinBox()
-        self._sp_phase.setRange(0.0, 360.0)
-        self._sp_phase.setWrapping(True)
-        self._sp_phase.setDecimals(1)
-        self._sp_phase.setSingleStep(1.0)
-        self._sp_phase.setSuffix(" °")
-        self._sp_phase.setValue(0.0)
-        self._sp_phase.setFixedHeight(30)
-        self._sp_phase.setMinimumWidth(96)
-        self._sp_phase.setFont(_mono_font(11, bold=True))
-        self._sp_phase.setStyleSheet(_spin_style())
-        self._sp_phase.setEnabled(False)   # gated on edge lock via _update_mode_controls
-        self._sp_phase.valueChanged.connect(self._param_changed)
-        auto_row.addWidget(self._sp_phase)
-
     def _be_set_control(self, ctrl: int):
         self._be.set_control_pulse(ctrl)
 
@@ -1305,7 +1338,7 @@ class PulsePanel(_NcoPanel):
         actual_hz   = phase_to_hz(offset_word)
         lock        = self._cb_lock.isChecked()
         phase_deg   = self._sp_phase.value() if self._sp_phase is not None else 0.0
-        preload     = phase_offset_to_preload(phase_deg / 360.0) if lock else None
+        preload     = self._phase_turns_to_preload(phase_deg / 360.0) if lock else None
         self._be.apply_pulse(wc, offset_word, edge_lock=lock, preload=preload)
         self._log(
             f"Apply  width={self._sp_width.value():.2f}%  "
@@ -1359,6 +1392,14 @@ class HarmonicPanel(_NcoPanel):
     def _be_upload(self, c_src: str, bit_src: Optional[str]):
         self._be.upload_harmonic(c_src, bit_src)
 
+    # The square-wave output rises at the MSB (2^47) crossing, not the 2^48
+    # carry, so harmonic phase-offset preload is shifted a half turn.
+    def _phase_turns_to_preload(self, turns: float) -> int:
+        return harmonic_phase_offset_to_preload(turns)
+
+    def _preload_to_phase_turns(self, word: int) -> float:
+        return harmonic_preload_to_phase_offset(word)
+
     def _on_disconnected_extra(self):
         self._d_status.set_data("---", "", _AMBER)
 
@@ -1397,11 +1438,13 @@ class HarmonicPanel(_NcoPanel):
         offset_word = hz_to_phase(off_hz)
         actual_hz   = phase_to_hz(offset_word)
         lock        = self._cb_lock.isChecked()
-        self._be.apply_harmonic(n, offset_word, edge_lock=lock)
+        phase_deg   = self._sp_phase.value() if self._sp_phase is not None else 0.0
+        preload     = self._phase_turns_to_preload(phase_deg / 360.0) if lock else None
+        self._be.apply_harmonic(n, offset_word, edge_lock=lock, preload=preload)
         self._log(
             f"Apply  N={n}  shift={actual_hz:+.6f} Hz  "
             f"offset={offset_word:+d}"
-            + ("  edge-locked" if lock else "")
+            + (f"  edge-locked  phase={phase_deg:.1f}°" if lock else "")
         )
 
     def get_params(self) -> dict:
@@ -1410,6 +1453,7 @@ class HarmonicPanel(_NcoPanel):
             "harmonic_n": self._sp_n.value(),
             "output_mode": self._output_mode,
             "edge_lock": self._cb_lock.isChecked(),
+            "phase_offset_deg": self._sp_phase.value() if self._sp_phase is not None else 0.0,
         }
 
 
@@ -2174,6 +2218,7 @@ class MainWindow(QMainWindow):
             "harmonic_freq_shift_hz": hp["freq_shift_hz"],
             "duty_cycle_pct": pp["duty_cycle_pct"],
             "pulse_phase_offset_deg": pp["phase_offset_deg"],
+            "harmonic_phase_offset_deg": hp["phase_offset_deg"],
             "harmonic_n": hp["harmonic_n"],
             "osc_f_osc_hz": op["f_osc_hz"],
             "osc_P_pct":    op["P_pct"],
