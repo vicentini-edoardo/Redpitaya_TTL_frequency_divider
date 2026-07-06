@@ -7,9 +7,25 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
 
 import redpitaya_combined_gui_qt as gui  # noqa: E402
+
+
+class _FakeBackend(QObject):
+    sig_connected = Signal()
+    sig_disconnected = Signal(str)
+    sig_status = Signal(dict)
+    sig_mode_changed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.mode = "pulse"
+        self.window_calls = []
+
+    def set_window(self, window_us: int):
+        self.window_calls.append(window_us)
 
 
 class TestDarkWorkbenchLayout(unittest.TestCase):
@@ -55,6 +71,50 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
             value_label.fontMetrics().height(),
             value_label.contentsRect().height(),
         )
+
+
+class TestMeasurementWindowField(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.backend = _FakeBackend()
+        self.panel = gui.PulsePanel(self.backend, lambda _msg: None)
+        self.panel._live = True
+        self.panel._output_mode = "modulated"
+        self.panel._update_mode_controls()
+        self.panel.show()
+        self.addCleanup(self.panel.close)
+
+    def test_enter_commits_integer_milliseconds_as_microseconds(self):
+        self.panel._window_field.setText("250")
+        self.panel._window_field.returnPressed.emit()
+        self.assertEqual(self.backend.window_calls[-1], 250_000)
+
+    def test_focus_loss_commits_integer_milliseconds_as_microseconds(self):
+        self.panel._window_field.setFocus()
+        self.app.processEvents()
+        self.panel._window_field.setText("25")
+        self.panel._sp_offset.setFocus()
+        self.app.processEvents()
+        self.assertEqual(self.backend.window_calls[-1], 25_000)
+
+    def test_sub_one_millisecond_input_clamps_to_one_millisecond(self):
+        self.panel._window_field.setText("0")
+        self.panel._window_field.returnPressed.emit()
+        self.assertEqual(self.backend.window_calls[-1], 1_000)
+        self.assertEqual(self.panel._window_field.text(), "1")
+
+    def test_empty_input_reverts_to_previous_valid_value(self):
+        self.panel._set_window_field_ms(100)
+        self.panel._window_field.setFocus()
+        self.app.processEvents()
+        self.panel._window_field.setText("")
+        self.panel._sp_offset.setFocus()
+        self.app.processEvents()
+        self.assertEqual(self.panel._window_field.text(), "100")
+        self.assertEqual(self.backend.window_calls, [])
 
 
 if __name__ == "__main__":

@@ -32,9 +32,9 @@ from typing import Callable, Optional
 
 try:
     from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QFont, QFontMetrics, QIcon, QKeySequence
+    from PySide6.QtGui import QAction, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+        QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
         QSizePolicy, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
@@ -89,6 +89,14 @@ def _apply_app_icon(window: Optional[QWidget] = None) -> Optional[QIcon]:
     if window is not None:
         window.setWindowIcon(icon)
     return icon
+
+
+class _CommitLineEdit(QLineEdit):
+    focus_left = Signal()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.focus_left.emit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -812,6 +820,7 @@ class _NcoPanel(QWidget):
         self._tag = self.MODE.capitalize()
         self._harmonic_json = 1 if self.MODE == "harmonic" else 0
         self._sp_phase = None   # edge-lock phase-offset spin (pulse mode only)
+        self._window_ms = 100
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -993,19 +1002,22 @@ class _NcoPanel(QWidget):
 
         # Row 1: measurement window
         fields.addWidget(_dim_label("Meas. window:"), 1, 0)
-        self._cb_window = QComboBox()
-        self._cb_window.addItems(WINDOW_NAMES)
-        self._cb_window.setCurrentIndex(2)
-        self._cb_window.setFixedHeight(32)
-        self._cb_window.setFixedWidth(118)
-        self._cb_window.setStyleSheet(_spin_style())
-        self._cb_window.currentIndexChanged.connect(self._on_window_changed)
-        fields.addWidget(self._cb_window, 1, 1)
+        self._window_field = _CommitLineEdit(str(self._window_ms))
+        self._window_field.setValidator(QIntValidator(0, 1_000_000, self))
+        self._window_field.setFixedHeight(32)
+        self._window_field.setFixedWidth(86)
+        self._window_field.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._window_field.setFont(_mono_font(12, bold=True))
+        self._window_field.setStyleSheet(_le_style())
+        self._window_field.returnPressed.connect(self._commit_window_field)
+        self._window_field.focus_left.connect(self._commit_window_field)
+        fields.addWidget(self._window_field, 1, 1)
+        fields.addWidget(_dim_label("ms"), 1, 2)
 
         self._lbl_win_suggest = QLabel()
         self._lbl_win_suggest.setFont(_mono_font(9))
         self._lbl_win_suggest.setStyleSheet(f"color: {_AMBER}; background: transparent;")
-        fields.addWidget(self._lbl_win_suggest, 1, 2, 1, 2)
+        fields.addWidget(self._lbl_win_suggest, 1, 3)
 
         # Row 2: auto-apply + edge lock
         auto_row = QHBoxLayout()
@@ -1103,7 +1115,7 @@ class _NcoPanel(QWidget):
 
     def _update_mode_controls(self):
         enabled = (self._output_mode == "modulated")
-        for w in (self._sp_offset, self._secondary_widget, self._cb_window,
+        for w in (self._sp_offset, self._secondary_widget, self._window_field,
                   self._cb_auto, self._cb_lock, self._btn_apply):
             w.setEnabled(enabled)
         # The phase offset is only meaningful while the phase is anchored to the
@@ -1127,7 +1139,7 @@ class _NcoPanel(QWidget):
         self._live = True
         self._refresh_pending = True
         if self._be.mode == self.MODE:
-            self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
+            self._be.set_window(self._window_ms * 1000)
 
     @Slot(str)
     def _on_disconnected(self, _reason: str):
@@ -1139,7 +1151,7 @@ class _NcoPanel(QWidget):
     @Slot(str)
     def _on_mode_changed(self, mode: str):
         if mode == self.MODE and self._live:
-            self._be.set_window(WINDOW_OPTIONS_US[self._cb_window.currentIndex()])
+            self._be.set_window(self._window_ms * 1000)
 
     @Slot(dict)
     def _on_status(self, d: dict):
@@ -1147,17 +1159,8 @@ class _NcoPanel(QWidget):
             return  # JSON from the other helper; skip
 
         raw_us = d.get("meas_time_us")
-        if raw_us is not None:
-            us_val = int(raw_us)
-            try:
-                idx = WINDOW_OPTIONS_US.index(us_val)
-            except ValueError:
-                idx = min(range(len(WINDOW_OPTIONS_US)),
-                          key=lambda i: abs(WINDOW_OPTIONS_US[i] - us_val))
-            if idx != self._cb_window.currentIndex():
-                self._cb_window.blockSignals(True)
-                self._cb_window.setCurrentIndex(idx)
-                self._cb_window.blockSignals(False)
+        if raw_us is not None and not self._window_field.hasFocus():
+            self._set_window_field_ms(max(1, int(raw_us) // 1000))
 
         # Sync output mode from FPGA control register
         ctrl = int(d.get("control") or 0)
@@ -1218,17 +1221,30 @@ class _NcoPanel(QWidget):
         self._update_window_suggestion()
         self.sig_params_changed.emit()
 
-    def _on_window_changed(self, idx: int):
-        if self._live and self._be.mode == self.MODE:
-            self._be.set_window(WINDOW_OPTIONS_US[idx])
+    def _set_window_field_ms(self, window_ms: int):
+        self._window_ms = max(1, int(window_ms))
+        self._window_field.setText(str(self._window_ms))
+
+    def _commit_window_field(self):
+        text = self._window_field.text().strip()
+        if not text:
+            self._set_window_field_ms(self._window_ms)
+            self._update_window_suggestion()
+            return
+
+        window_ms = max(1, int(text))
+        changed = (window_ms != self._window_ms)
+        self._set_window_field_ms(window_ms)
+        if changed and self._live and self._be.mode == self.MODE:
+            self._be.set_window(self._window_ms * 1000)
         self._update_window_suggestion()
 
     def _update_window_suggestion(self):
         f_shift  = abs(self._sp_offset.value())
         sug      = suggest_window(f_shift)
-        current  = self._cb_window.currentIndex()
+        current_us = self._window_ms * 1000
         freq_str = fmt_freq(f_shift) if f_shift > 0 else "---"
-        if current == sug:
+        if current_us == WINDOW_OPTIONS_US[sug]:
             self._lbl_win_suggest.setText(f"✓ optimal for {freq_str}")
             self._lbl_win_suggest.setStyleSheet(f"color: {_GREEN}; background: transparent;")
         else:
