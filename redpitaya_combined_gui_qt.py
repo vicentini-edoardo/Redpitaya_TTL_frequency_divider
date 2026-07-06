@@ -66,6 +66,7 @@ from rp_math import (  # noqa: E402
 _APP_DIR = Path(__file__).resolve().parent
 _APP_ICON_PATH = _APP_DIR / "6713611.ico"
 _WINDOWS_APP_ID = "VicentiniEdoardo.RedPitayaTTLFrequencyDivider"
+_LEGACY_REPO_STATE = "rp_state.json"
 
 
 def _set_windows_app_id():
@@ -90,6 +91,16 @@ def _apply_app_icon(window: Optional[QWidget] = None) -> Optional[QIcon]:
     if window is not None:
         window.setWindowIcon(icon)
     return icon
+
+
+def _default_state_file() -> Path:
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return base / "RedPitayaTTLFrequencyDivider" / _LEGACY_REPO_STATE
 
 
 def _run_git_command(repo_dir: Path, cmd: list[str], run=subprocess.run) -> str:
@@ -124,10 +135,37 @@ def _list_remote_branches(repo_dir: Path, run=subprocess.run) -> list[str]:
     return _parse_remote_branches(_run_git_command(repo_dir, ["git", "branch", "-r"], run=run))
 
 
+def _cleanup_legacy_repo_state(repo_dir: Path, run=subprocess.run) -> str:
+    legacy_state = repo_dir / _LEGACY_REPO_STATE
+    if not legacy_state.exists():
+        return ""
+    status = _run_git_command(
+        repo_dir,
+        ["git", "status", "--porcelain", "--", _LEGACY_REPO_STATE],
+        run=run,
+    )
+    if not status:
+        return ""
+    lines = [line for line in status.splitlines() if line.strip()]
+    if lines and all(line.startswith("?? ") for line in lines):
+        legacy_state.unlink(missing_ok=True)
+        return "Removed legacy repo state file."
+    _run_git_command(
+        repo_dir,
+        ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", _LEGACY_REPO_STATE],
+        run=run,
+    )
+    return "Restored legacy repo state file."
+
+
 def _run_git_update(repo_dir: Path, remote_ref: str, run=subprocess.run) -> tuple[str, bool]:
     branch = _remote_branch_name(remote_ref)
     before_head = _run_git_command(repo_dir, ["git", "rev-parse", "HEAD"], run=run)
     messages = []
+
+    cleanup_out = _cleanup_legacy_repo_state(repo_dir, run=run)
+    if cleanup_out:
+        messages.append(cleanup_out)
 
     fetch_out = _run_git_command(repo_dir, ["git", "fetch", "origin"], run=run)
     if fetch_out:
@@ -1865,7 +1903,7 @@ class OscPanel(QWidget):
 class MainWindow(QMainWindow):
 
     sig_update_done = Signal(str, bool)
-    _STATE_FILE = Path(__file__).resolve().parent / "rp_state.json"
+    _STATE_FILE = _default_state_file()
 
     def __init__(self):
         super().__init__()
@@ -2339,6 +2377,7 @@ class MainWindow(QMainWindow):
             "updated_at": time.time(),
         }
         try:
+            self._STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._STATE_FILE.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(state, indent=2))
             os.replace(tmp, self._STATE_FILE)

@@ -2,8 +2,10 @@
 """Smoke tests for the PySide6 GUI layout."""
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -135,6 +137,9 @@ class TestGitUpdateHelpers(unittest.TestCase):
             ("git", "fetch", "origin"): [
                 SimpleNamespace(stdout="", stderr="", returncode=0),
             ],
+            ("git", "status", "--porcelain", "--", "rp_state.json"): [
+                SimpleNamespace(stdout="", stderr="", returncode=0),
+            ],
             ("git", "branch", "--show-current"): [
                 SimpleNamespace(stdout="feature\n", stderr="", returncode=0),
             ],
@@ -166,6 +171,7 @@ class TestGitUpdateHelpers(unittest.TestCase):
             calls,
             [
                 ("git", "rev-parse", "HEAD"),
+                ("git", "status", "--porcelain", "--", "rp_state.json"),
                 ("git", "fetch", "origin"),
                 ("git", "branch", "--show-current"),
                 ("git", "checkout", "main"),
@@ -174,6 +180,43 @@ class TestGitUpdateHelpers(unittest.TestCase):
                 ("git", "rev-parse", "HEAD"),
             ],
         )
+
+    def test_cleanup_legacy_repo_state_restores_tracked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp)
+            legacy_state = repo_dir / "rp_state.json"
+            legacy_state.write_text('{"dirty": true}\n')
+            responses = {
+                ("git", "status", "--porcelain", "--", "rp_state.json"): [
+                    SimpleNamespace(stdout=" M rp_state.json\n", stderr="", returncode=0),
+                ],
+                ("git", "restore", "--source=HEAD", "--staged", "--worktree", "--", "rp_state.json"): [
+                    SimpleNamespace(stdout="", stderr="", returncode=0),
+                ],
+            }
+            calls = []
+
+            def fake_run(cmd, **_kwargs):
+                key = tuple(cmd)
+                calls.append(key)
+                queue = responses.get(key)
+                if not queue:
+                    raise AssertionError(f"Unexpected command: {cmd}")
+                return queue.pop(0)
+
+            msg = gui._cleanup_legacy_repo_state(repo_dir, run=fake_run)
+
+            self.assertEqual(msg, "Restored legacy repo state file.")
+            self.assertEqual(
+                calls,
+                [
+                    ("git", "status", "--porcelain", "--", "rp_state.json"),
+                    ("git", "restore", "--source=HEAD", "--staged", "--worktree", "--", "rp_state.json"),
+                ],
+            )
+
+    def test_state_file_lives_outside_repo_root(self):
+        self.assertNotEqual(gui.MainWindow._STATE_FILE.parent, gui._APP_DIR)
 
 
 if __name__ == "__main__":
