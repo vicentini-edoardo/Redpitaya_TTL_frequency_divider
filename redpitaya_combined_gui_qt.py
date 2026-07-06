@@ -35,6 +35,7 @@ try:
     from PySide6.QtGui import QAction, QFont, QFontMetrics, QIcon, QIntValidator, QKeySequence
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
+        QInputDialog,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
         QSizePolicy, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
@@ -89,6 +90,76 @@ def _apply_app_icon(window: Optional[QWidget] = None) -> Optional[QIcon]:
     if window is not None:
         window.setWindowIcon(icon)
     return icon
+
+
+def _run_git_command(repo_dir: Path, cmd: list[str], run=subprocess.run) -> str:
+    result = run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=repo_dir,
+        timeout=30,
+    )
+    out = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(out or f"{' '.join(cmd)} failed with exit code {result.returncode}")
+    return out
+
+
+def _parse_remote_branches(output: str) -> list[str]:
+    branches = []
+    for raw in output.splitlines():
+        branch = raw.strip()
+        if not branch or "->" in branch or branch.endswith("/HEAD"):
+            continue
+        branches.append(branch)
+    return sorted(set(branches))
+
+
+def _remote_branch_name(remote_ref: str) -> str:
+    return remote_ref.split("/", 1)[1] if "/" in remote_ref else remote_ref
+
+
+def _list_remote_branches(repo_dir: Path, run=subprocess.run) -> list[str]:
+    return _parse_remote_branches(_run_git_command(repo_dir, ["git", "branch", "-r"], run=run))
+
+
+def _run_git_update(repo_dir: Path, remote_ref: str, run=subprocess.run) -> tuple[str, bool]:
+    branch = _remote_branch_name(remote_ref)
+    before_head = _run_git_command(repo_dir, ["git", "rev-parse", "HEAD"], run=run)
+    messages = []
+
+    fetch_out = _run_git_command(repo_dir, ["git", "fetch", "origin"], run=run)
+    if fetch_out:
+        messages.append(fetch_out)
+
+    current_branch = _run_git_command(repo_dir, ["git", "branch", "--show-current"], run=run)
+    if current_branch != branch:
+        try:
+            checkout_out = _run_git_command(repo_dir, ["git", "checkout", branch], run=run)
+        except RuntimeError:
+            checkout_out = _run_git_command(
+                repo_dir,
+                ["git", "checkout", "-b", branch, "--track", remote_ref],
+                run=run,
+            )
+        if checkout_out:
+            messages.append(checkout_out)
+
+    upstream_out = _run_git_command(
+        repo_dir,
+        ["git", "branch", "--set-upstream-to", remote_ref, branch],
+        run=run,
+    )
+    if upstream_out:
+        messages.append(upstream_out)
+
+    pull_out = _run_git_command(repo_dir, ["git", "pull", "--ff-only"], run=run)
+    if pull_out:
+        messages.append(pull_out)
+
+    after_head = _run_git_command(repo_dir, ["git", "rev-parse", "HEAD"], run=run)
+    return "\n".join(messages) or "Already up to date.", before_head != after_head
 
 
 class _CommitLineEdit(QLineEdit):
@@ -1793,7 +1864,7 @@ class OscPanel(QWidget):
 
 class MainWindow(QMainWindow):
 
-    sig_update_done = Signal(str)
+    sig_update_done = Signal(str, bool)
     _STATE_FILE = Path(__file__).resolve().parent / "rp_state.json"
 
     def __init__(self):
@@ -1900,27 +1971,49 @@ class MainWindow(QMainWindow):
         self._write_state_file()
 
     def _do_git_update(self):
-        self._btn_update.setEnabled(False)
-        self._lbl_update_status.setText("Pulling…")
-        self._lbl_update_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
-
         here = Path(__file__).resolve().parent
+        try:
+            branches = _list_remote_branches(here)
+        except Exception as exc:
+            self._on_update_done(f"ERROR: {exc}", False)
+            return
+        if not branches:
+            self._on_update_done("ERROR: No remote branches found", False)
+            return
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Select branch",
+            "Remote branch:",
+            branches,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        self._btn_update.setEnabled(False)
+        self._lbl_update_status.setText(f"Updating {choice}…")
+        self._lbl_update_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
 
         def _run():
             try:
-                result = subprocess.run(
-                    ["git", "pull"],
-                    capture_output=True, text=True, cwd=here, timeout=30,
-                )
-                out = (result.stdout + result.stderr).strip()
-                self.sig_update_done.emit(out or "Done (no output)")
+                msg, restart_needed = _run_git_update(here, choice)
+                self.sig_update_done.emit(msg, restart_needed)
             except Exception as exc:
-                self.sig_update_done.emit(f"ERROR: {exc}")
+                self.sig_update_done.emit(f"ERROR: {exc}", False)
 
         threading.Thread(target=_run, name="git-pull", daemon=True).start()
 
-    @Slot(str)
-    def _on_update_done(self, msg: str):
+    def _restart_app(self):
+        script = os.fspath(Path(__file__).resolve())
+        subprocess.Popen([sys.executable, script, *sys.argv[1:]], cwd=os.fspath(_APP_DIR))
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    @Slot(str, bool)
+    def _on_update_done(self, msg: str, restart_needed: bool):
         self._btn_update.setEnabled(True)
         ok = not msg.startswith("ERROR")
         color = _GREEN if ok else _RED
@@ -1928,6 +2021,9 @@ class MainWindow(QMainWindow):
         self._lbl_update_status.setText(short)
         self._lbl_update_status.setStyleSheet(f"color: {color}; background: transparent;")
         self._log(f"[Update] {msg}")
+        if ok and restart_needed:
+            self._log("[Update] Restarting to load the new version.")
+            QTimer.singleShot(0, self._restart_app)
 
     def _build_connection(self) -> QGroupBox:
         g = QFrame()

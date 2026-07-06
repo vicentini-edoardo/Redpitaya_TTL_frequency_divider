@@ -1,0 +1,16 @@
+{
+  "mode": "pulse",
+  "active_tab": 0,
+  "output_mode": "modulated",
+  "pulse_freq_shift_hz": 0.0,
+  "harmonic_freq_shift_hz": 0.0,
+  "duty_cycle_pct": 50.0,
+  "pulse_phase_offset_deg": 0.0,
+  "harmonic_phase_offset_deg": 0.0,
+  "harmonic_n": 1,
+  "osc_f_osc_hz": 10000.0,
+  "osc_P_pct": 20.0,
+  "osc_P0_pct": 0.0,
+  "osc_width_pct": 1.0,
+  "updated_at": 1783341484.9030662
+}

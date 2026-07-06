@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -115,6 +116,64 @@ class TestMeasurementWindowField(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.panel._window_field.text(), "100")
         self.assertEqual(self.backend.window_calls, [])
+
+
+class TestGitUpdateHelpers(unittest.TestCase):
+    def test_parse_remote_branches_filters_head_pointer(self):
+        output = "origin/HEAD -> origin/main\norigin/main\norigin/feature\n\n"
+        self.assertEqual(
+            gui._parse_remote_branches(output),
+            ["origin/feature", "origin/main"],
+        )
+
+    def test_run_git_update_switches_branch_and_reports_restart_needed(self):
+        responses = {
+            ("git", "rev-parse", "HEAD"): [
+                SimpleNamespace(stdout="old-head\n", stderr="", returncode=0),
+                SimpleNamespace(stdout="new-head\n", stderr="", returncode=0),
+            ],
+            ("git", "fetch", "origin"): [
+                SimpleNamespace(stdout="", stderr="", returncode=0),
+            ],
+            ("git", "branch", "--show-current"): [
+                SimpleNamespace(stdout="feature\n", stderr="", returncode=0),
+            ],
+            ("git", "checkout", "main"): [
+                SimpleNamespace(stdout="Switched to branch 'main'\n", stderr="", returncode=0),
+            ],
+            ("git", "branch", "--set-upstream-to", "origin/main", "main"): [
+                SimpleNamespace(stdout="branch 'main' set up to track 'origin/main'\n", stderr="", returncode=0),
+            ],
+            ("git", "pull", "--ff-only"): [
+                SimpleNamespace(stdout="Updating old-head..new-head\nFast-forward\n", stderr="", returncode=0),
+            ],
+        }
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            key = tuple(cmd)
+            calls.append(key)
+            queue = responses.get(key)
+            if not queue:
+                raise AssertionError(f"Unexpected command: {cmd}")
+            return queue.pop(0)
+
+        msg, restart_needed = gui._run_git_update(gui._APP_DIR, "origin/main", run=fake_run)
+
+        self.assertTrue(restart_needed)
+        self.assertIn("Fast-forward", msg)
+        self.assertEqual(
+            calls,
+            [
+                ("git", "rev-parse", "HEAD"),
+                ("git", "fetch", "origin"),
+                ("git", "branch", "--show-current"),
+                ("git", "checkout", "main"),
+                ("git", "branch", "--set-upstream-to", "origin/main", "main"),
+                ("git", "pull", "--ff-only"),
+                ("git", "rev-parse", "HEAD"),
+            ],
+        )
 
 
 if __name__ == "__main__":
