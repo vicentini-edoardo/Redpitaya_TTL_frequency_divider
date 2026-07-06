@@ -30,6 +30,7 @@ An independent free-running square wave is available on `DIO2_P`.
 | `tests/` | `unittest`/`pytest` suite for `rp_math`. |
 | `Vivado files/` | RTL source: `red_pitaya_top.sv`, `pulse_gen.sv`, `axi4lite_pulse_regs.sv`. |
 | `memory/` | Project notes (measured clock, fixed measurement bug). |
+| `graphify-out/` | Generated knowledge-graph pipeline output (`/graphify`); gitignored, not source-controlled. |
 
 ## Commands
 

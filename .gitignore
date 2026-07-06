@@ -69,3 +69,6 @@ Thumbs.db
 memory/
 .claude/
 PRODUCT.md
+
+# graphify knowledge-graph output
+graphify-out/
