@@ -119,6 +119,29 @@ class TestMeasurementWindowField(unittest.TestCase):
         self.assertEqual(self.panel._window_field.text(), "100")
         self.assertEqual(self.backend.window_calls, [])
 
+    def test_input_frequency_readout_refreshes_on_every_poll(self):
+        self.panel._on_connected()
+
+        first_hz = 1_000.0
+        second_hz = 2_000.0
+        self.backend.sig_status.emit({
+            "harmonic_mode": 0,
+            "control": 1,
+            "period_stable": True,
+            "phase_step_base": gui.hz_to_phase(first_hz),
+        })
+        self.app.processEvents()
+        self.assertEqual(self.panel._d_in._val.text(), gui.fmt_freq(first_hz))
+
+        self.backend.sig_status.emit({
+            "harmonic_mode": 0,
+            "control": 1,
+            "period_stable": True,
+            "phase_step_base": gui.hz_to_phase(second_hz),
+        })
+        self.app.processEvents()
+        self.assertEqual(self.panel._d_in._val.text(), gui.fmt_freq(second_hz))
+
 
 class TestGitUpdateHelpers(unittest.TestCase):
     def test_parse_remote_branches_filters_head_pointer(self):

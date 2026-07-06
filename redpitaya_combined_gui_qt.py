@@ -1287,20 +1287,20 @@ class _NcoPanel(QWidget):
         stable    = bool(d.get("period_stable"))
         step_base = int(d.get("phase_step_base") or 0)
 
-        if self._refresh_pending:
-            if step_base > 0:
-                # Derive period in clock cycles from phase_step_base (avoids integer truncation)
-                self._period_c = (1 << PHASE_BITS) // step_base
-                in_hz = phase_to_hz(step_base)
-                self._d_in.set_data(
-                    fmt_freq(in_hz),
-                    "stable" if stable else "acquiring …",
-                    _ACCENT if stable else _AMBER,
-                )
+        if step_base > 0:
+            # Derive period in clock cycles from phase_step_base (avoids integer truncation)
+            self._period_c = (1 << PHASE_BITS) // step_base
+            in_hz = phase_to_hz(step_base)
+            self._d_in.set_data(
+                fmt_freq(in_hz),
+                "stable" if stable else "acquiring …",
+                _ACCENT if stable else _AMBER,
+            )
+            if self._refresh_pending:
                 self._refresh_pending = False
                 self._log(f"Input: {fmt_freq(in_hz)} ({'stable' if stable else 'acquiring'})")
-            else:
-                self._d_in.set_data("---", "no input signal", _RED)
+        else:
+            self._d_in.set_data("---", "no input signal", _RED)
 
         if step_base > 0:
             step_live = int(d.get("phase_step") or step_base)
