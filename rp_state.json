@@ -1,0 +1,9 @@
+{
+  "mode": "pulse",
+  "output_mode": "modulated",
+  "pulse_freq_shift_hz": 0.0,
+  "harmonic_freq_shift_hz": 0.0,
+  "duty_cycle_pct": 50.0,
+  "harmonic_n": 1,
+  "updated_at": 1783955158.5828328
+}
