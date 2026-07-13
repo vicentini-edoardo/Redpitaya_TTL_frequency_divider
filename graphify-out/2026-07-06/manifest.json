@@ -1,0 +1,132 @@
+{
+  ".vscode/extensions.json": {
+    "mtime": 1775546873.2608309,
+    "ast_hash": "67ecd9a6d1564dc74062239001dffd46",
+    "semantic_hash": "67ecd9a6d1564dc74062239001dffd46"
+  },
+  "Vivado files/axi4lite_pulse_regs.sv": {
+    "mtime": 1783058430.0341759,
+    "ast_hash": "b619d5eeb807097227db1841012910e7",
+    "semantic_hash": "b619d5eeb807097227db1841012910e7"
+  },
+  "Vivado files/pulse_gen.sv": {
+    "mtime": 1783058430.034403,
+    "ast_hash": "853831d385354f54d706115c797b8cfd",
+    "semantic_hash": "853831d385354f54d706115c797b8cfd"
+  },
+  "Vivado files/red_pitaya_top.sv": {
+    "mtime": 1783058430.0347648,
+    "ast_hash": "4fe9eb0a5955b82331dd8f4c86af3647",
+    "semantic_hash": "4fe9eb0a5955b82331dd8f4c86af3647"
+  },
+  "hardware_tests/__init__.py": {
+    "mtime": 1782748519.724975,
+    "ast_hash": "783dcbe4c949ad4e4cdd4dcfe34a5254",
+    "semantic_hash": "783dcbe4c949ad4e4cdd4dcfe34a5254"
+  },
+  "hardware_tests/redpitaya_picosdk_verify.py": {
+    "mtime": 1783058430.0351717,
+    "ast_hash": "23d840860f4528671efb22c1b7cdccad",
+    "semantic_hash": "23d840860f4528671efb22c1b7cdccad"
+  },
+  "osc_delay_sim.py": {
+    "mtime": 1783058430.0355036,
+    "ast_hash": "53a7b1e3ae3e405adaf1749b21934e7f",
+    "semantic_hash": "53a7b1e3ae3e405adaf1749b21934e7f"
+  },
+  "redpitaya_combined_gui_qt.py": {
+    "mtime": 1783341782.2708156,
+    "ast_hash": "1f79dba0463420582a32e23739225ac2",
+    "semantic_hash": ""
+  },
+  "rp_ctl.c": {
+    "mtime": 1783094665.9549959,
+    "ast_hash": "4e981570a46292c161c0285128da8722",
+    "semantic_hash": "4e981570a46292c161c0285128da8722"
+  },
+  "rp_math.py": {
+    "mtime": 1783094665.9552264,
+    "ast_hash": "6de57408562c99ee927c1674e9a7d843",
+    "semantic_hash": "6de57408562c99ee927c1674e9a7d843"
+  },
+  "strobo_sim.py": {
+    "mtime": 1782722828.886659,
+    "ast_hash": "bd43428618de5ac17b96392a80aa2401",
+    "semantic_hash": "bd43428618de5ac17b96392a80aa2401"
+  },
+  "tests/test_gui_layout.py": {
+    "mtime": 1783341795.0337515,
+    "ast_hash": "ca91d363c328e1bb630a1aca09edf742",
+    "semantic_hash": ""
+  },
+  "tests/test_redpitaya_picosdk_verify.py": {
+    "mtime": 1783058430.0385928,
+    "ast_hash": "784f00b884e8f0e7d2e4a4ffbe31c04c",
+    "semantic_hash": "784f00b884e8f0e7d2e4a4ffbe31c04c"
+  },
+  "tests/test_rp_math.py": {
+    "mtime": 1783094665.9554546,
+    "ast_hash": "0ba07c519398fcd1c4345ff7af695bcb",
+    "semantic_hash": "0ba07c519398fcd1c4345ff7af695bcb"
+  },
+  "CLAUDE.md": {
+    "mtime": 1783333489.0921552,
+    "ast_hash": "a05fe397ae0ce02e4d082a66fd8377ce",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1783058430.0339258,
+    "ast_hash": "75d495432495aab34586568b06d7f9e4",
+    "semantic_hash": "75d495432495aab34586568b06d7f9e4"
+  },
+  "docs/redpitaya_picosdk_hardware_tests.md": {
+    "mtime": 1782823502.6490204,
+    "ast_hash": "3b599d90360e5e81e2229e7e5fb56ad3",
+    "semantic_hash": "3b599d90360e5e81e2229e7e5fb56ad3"
+  },
+  "docs/superpowers/plans/2026-06-05-dark-workbench-gui-redesign.md": {
+    "mtime": 1780661235.7804348,
+    "ast_hash": "ada2f4ba8baa1761555904d4ffc5879e",
+    "semantic_hash": "ada2f4ba8baa1761555904d4ffc5879e"
+  },
+  "docs/superpowers/specs/2026-06-05-dark-workbench-gui-redesign-design.md": {
+    "mtime": 1780661149.8842223,
+    "ast_hash": "57461db743a75942b83552aa5803357a",
+    "semantic_hash": "57461db743a75942b83552aa5803357a"
+  },
+  "requirements-picosdk.txt": {
+    "mtime": 1782823502.6498384,
+    "ast_hash": "7efa0e128b68e1569486a3786586febb",
+    "semantic_hash": "7efa0e128b68e1569486a3786586febb"
+  },
+  "requirements.txt": {
+    "mtime": 1776683219.35736,
+    "ast_hash": "3da964b64e936d69dcb691d0759b4a1e",
+    "semantic_hash": "3da964b64e936d69dcb691d0759b4a1e"
+  },
+  "GUI.png": {
+    "mtime": 1777460081.9502623,
+    "ast_hash": "2a1b41f95720918638b02043081032ea",
+    "semantic_hash": "2a1b41f95720918638b02043081032ea"
+  },
+  "docs/superpowers/specs/2026-07-06-measurement-window-edit-field-design.md": {
+    "mtime": 1783336753.2781136,
+    "ast_hash": "58d8d6971e1d611b666e56d3eca367ce",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/plans/2026-07-06-measurement-window-edit-field.md": {
+    "mtime": 1783340678.2729564,
+    "ast_hash": "725396730152854e4e5a1289c195c1f6",
+    "semantic_hash": ""
+  },
+  "rp_state.json": {
+    "mtime": 1783341763.999666,
+    "ast_hash": "14badac5d7662084a94636953e65e777",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/plans/2026-07-06-update-branch-selection.md": {
+    "mtime": 1783341398.5113225,
+    "ast_hash": "bfad16a7ce9123e5f563827be9905e0a",
+    "semantic_hash": ""
+  }
+}

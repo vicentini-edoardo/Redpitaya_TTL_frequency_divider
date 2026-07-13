@@ -1,0 +1,77 @@
+{
+  ".vscode/extensions.json": {
+    "mtime": 1775546873.2608309,
+    "ast_hash": "67ecd9a6d1564dc74062239001dffd46",
+    "semantic_hash": "67ecd9a6d1564dc74062239001dffd46"
+  },
+  "Vivado files/axi4lite_pulse_regs.sv": {
+    "mtime": 1783954308.684106,
+    "ast_hash": "2ceccc10a9391dfdb2f4d27cf36852b3",
+    "semantic_hash": ""
+  },
+  "Vivado files/pulse_gen.sv": {
+    "mtime": 1783954308.6844258,
+    "ast_hash": "2d65fe6caa4f1f2c30aa1a359bc02b17",
+    "semantic_hash": ""
+  },
+  "Vivado files/red_pitaya_top.sv": {
+    "mtime": 1783954308.684641,
+    "ast_hash": "7a8820fe7ec7655ce9286cf2a5413205",
+    "semantic_hash": ""
+  },
+  "redpitaya_combined_gui_qt.py": {
+    "mtime": 1783954308.6872458,
+    "ast_hash": "abf534901188c78c388f2e7e5435b5ad",
+    "semantic_hash": ""
+  },
+  "rp_ctl.c": {
+    "mtime": 1783954308.6877074,
+    "ast_hash": "167467f074e27f2f1d2ddcc752008137",
+    "semantic_hash": ""
+  },
+  "rp_math.py": {
+    "mtime": 1783954308.687903,
+    "ast_hash": "bbd4ffcd1001d8102c12e4c02f5a8168",
+    "semantic_hash": ""
+  },
+  "tests/test_gui_layout.py": {
+    "mtime": 1783954308.6887937,
+    "ast_hash": "f1932040401d2dfcc1033e920c76be25",
+    "semantic_hash": ""
+  },
+  "tests/test_rp_math.py": {
+    "mtime": 1783954308.6890116,
+    "ast_hash": "03108afe9dc9eb580ba7874e5fdb9c7d",
+    "semantic_hash": ""
+  },
+  "CLAUDE.md": {
+    "mtime": 1783954308.6825438,
+    "ast_hash": "b3b0bb268653831992b4e27654a24496",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1783954308.6828594,
+    "ast_hash": "e204cbeaa2c525d6a97a41dd934f109b",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/plans/2026-06-05-dark-workbench-gui-redesign.md": {
+    "mtime": 1780661235.7804348,
+    "ast_hash": "ada2f4ba8baa1761555904d4ffc5879e",
+    "semantic_hash": "ada2f4ba8baa1761555904d4ffc5879e"
+  },
+  "docs/superpowers/specs/2026-06-05-dark-workbench-gui-redesign-design.md": {
+    "mtime": 1780661149.8842223,
+    "ast_hash": "57461db743a75942b83552aa5803357a",
+    "semantic_hash": "57461db743a75942b83552aa5803357a"
+  },
+  "requirements.txt": {
+    "mtime": 1776683219.35736,
+    "ast_hash": "3da964b64e936d69dcb691d0759b4a1e",
+    "semantic_hash": "3da964b64e936d69dcb691d0759b4a1e"
+  },
+  "GUI.png": {
+    "mtime": 1777460081.9502623,
+    "ast_hash": "2a1b41f95720918638b02043081032ea",
+    "semantic_hash": "2a1b41f95720918638b02043081032ea"
+  }
+}
