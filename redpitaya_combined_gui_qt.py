@@ -59,6 +59,32 @@ from rp_math import (  # noqa: E402
 )
 
 
+def _git_remote_branches(repo: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "branch", "--remotes", "--format=%(refname:short)"],
+        capture_output=True, text=True, cwd=repo,
+    )
+    if result.returncode:
+        return []
+    return [ref.removeprefix("origin/") for ref in result.stdout.splitlines()
+            if ref.startswith("origin/") and ref != "origin/HEAD"]
+
+
+def _git_current_branch(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "branch", "--show-current"], capture_output=True, text=True, cwd=repo,
+    )
+    return result.stdout.strip() if not result.returncode else ""
+
+
+def _git_update_commands(branch: str) -> list[list[str]]:
+    return [
+        ["git", "fetch", "origin", "--prune"],
+        ["git", "checkout", branch],
+        ["git", "pull", "--ff-only"],
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SSH Backend — single session, mode-aware
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1347,7 +1373,9 @@ class MainWindow(QMainWindow):
         self._write_state_file()
 
     def _do_git_update(self):
+        branch = self._cb_update_branch.currentText()
         self._btn_update.setEnabled(False)
+        self._cb_update_branch.setEnabled(False)
         self._lbl_update_status.setText("Pulling…")
         self._lbl_update_status.setStyleSheet(f"color: {_ACCENT}; background: transparent;")
 
@@ -1355,12 +1383,14 @@ class MainWindow(QMainWindow):
 
         def _run():
             try:
-                result = subprocess.run(
-                    ["git", "pull"],
-                    capture_output=True, text=True, cwd=here, timeout=30,
-                )
-                out = (result.stdout + result.stderr).strip()
-                self.sig_update_done.emit(out or "Done (no output)")
+                outputs = []
+                for command in _git_update_commands(branch):
+                    result = subprocess.run(
+                        command, capture_output=True, text=True, cwd=here,
+                        timeout=30, check=True,
+                    )
+                    outputs.append((result.stdout + result.stderr).strip())
+                self.sig_update_done.emit("\n".join(filter(None, outputs)) or "Done (no output)")
             except Exception as exc:
                 self.sig_update_done.emit(f"ERROR: {exc}")
 
@@ -1369,6 +1399,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_update_done(self, msg: str):
         self._btn_update.setEnabled(True)
+        self._cb_update_branch.setEnabled(True)
         ok = not msg.startswith("ERROR")
         color = _GREEN if ok else _RED
         short = msg.split("\n")[0][:80]
@@ -1428,6 +1459,17 @@ class MainWindow(QMainWindow):
         sep2.setFrameShape(QFrame.VLine)
         sep2.setStyleSheet(f"color: {_BORDER};")
         top_row.addWidget(sep2)
+
+        self._cb_update_branch = QComboBox()
+        self._cb_update_branch.setObjectName("rpUpdateBranch")
+        self._cb_update_branch.setFixedHeight(30)
+        self._cb_update_branch.setStyleSheet(_le_style())
+        here = Path(__file__).resolve().parent
+        self._cb_update_branch.addItems(_git_remote_branches(here))
+        current_branch = _git_current_branch(here)
+        if (index := self._cb_update_branch.findText(current_branch)) >= 0:
+            self._cb_update_branch.setCurrentIndex(index)
+        top_row.addWidget(self._cb_update_branch)
 
         self._btn_update = QPushButton("Update")
         self._btn_update.setFixedHeight(30)

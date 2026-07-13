@@ -51,7 +51,8 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
         )
 
     def test_update_branch_selector_lists_remote_branches(self):
-        with patch.object(gui, "_git_remote_branches", return_value=["main", "feature"]):
+        with patch.object(gui, "_git_remote_branches", return_value=["main", "feature"]), \
+             patch.object(gui, "_git_current_branch", return_value="feature"):
             win = gui.MainWindow()
         self.addCleanup(win.close)
 
@@ -61,6 +62,7 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
             [selector.itemText(i) for i in range(selector.count())],
             ["main", "feature"],
         )
+        self.assertEqual(selector.currentText(), "feature")
 
     def test_git_update_commands_switch_and_fast_forward_selected_branch(self):
         self.assertEqual(
