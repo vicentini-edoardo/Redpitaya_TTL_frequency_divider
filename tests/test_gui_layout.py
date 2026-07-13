@@ -3,11 +3,12 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QWidget  # noqa: E402
 
 import redpitaya_combined_gui_qt as gui  # noqa: E402
 
@@ -47,6 +48,28 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
         self.assertLessEqual(
             value_label.fontMetrics().height(),
             value_label.contentsRect().height(),
+        )
+
+    def test_update_branch_selector_lists_remote_branches(self):
+        with patch.object(gui, "_git_remote_branches", return_value=["main", "feature"]):
+            win = gui.MainWindow()
+        self.addCleanup(win.close)
+
+        selector = win.findChild(QComboBox, "rpUpdateBranch")
+        self.assertIsNotNone(selector)
+        self.assertEqual(
+            [selector.itemText(i) for i in range(selector.count())],
+            ["main", "feature"],
+        )
+
+    def test_git_update_commands_switch_and_fast_forward_selected_branch(self):
+        self.assertEqual(
+            gui._git_update_commands("feature"),
+            [
+                ["git", "fetch", "origin", "--prune"],
+                ["git", "checkout", "feature"],
+                ["git", "pull", "--ff-only"],
+            ],
         )
 
 
