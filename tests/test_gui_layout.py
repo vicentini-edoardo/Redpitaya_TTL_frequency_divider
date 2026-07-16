@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke tests for the PySide6 GUI layout."""
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,102 @@ class TestDarkWorkbenchLayout(unittest.TestCase):
             value_label.fontMetrics().height(),
             value_label.contentsRect().height(),
         )
+
+
+class TestConfirmedStateContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_confirmed_state_uses_fpga_register_values(self):
+        trig_step = gui.trig_hz_to_phase_step(500.0)
+        shift_step = gui.hz_to_phase(-37.0)
+
+        state = gui._confirmed_state(
+            {
+                "control": gui.CTRL_ENABLE,
+                "harmonic_mode": 0,
+                "osc_mode": 0,
+                "period_stable": 1,
+                "trig_phase_step": trig_step,
+                "phase_step_offset": shift_step,
+                "phase_step_base": gui.hz_to_phase(1_000_000.0),
+                "phase_step": gui.hz_to_phase(999_963.0),
+                "osc_half_period": 0,
+            },
+            connected=True,
+            sequence=7,
+            now=1234.5,
+        )
+
+        self.assertEqual(state["schema_version"], 1)
+        self.assertTrue(state["connected"])
+        self.assertTrue(state["hardware_confirmed"])
+        self.assertEqual(state["sequence"], 7)
+        self.assertEqual(state["updated_at"], 1234.5)
+        self.assertEqual(state["mode"], "pulse")
+        self.assertEqual(state["output_mode"], "modulated")
+        self.assertTrue(state["period_stable"])
+        self.assertAlmostEqual(state["trigger_frequency_hz"], gui.phase_to_hz(trig_step))
+        self.assertAlmostEqual(state["frequency_shift_hz"], gui.phase_to_hz(shift_step))
+        self.assertAlmostEqual(state["expected_peak_hz"], abs(gui.phase_to_hz(shift_step)))
+
+    def test_osc_state_uses_confirmed_oscillation_period_for_expected_peak(self):
+        expected_hz = 123.0
+        half_period = round(gui.CLK_HZ / (2.0 * expected_hz))
+
+        state = gui._confirmed_state(
+            {
+                "control": gui.CTRL_ENABLE | gui.CTRL_OSC_MODE,
+                "harmonic_mode": 0,
+                "osc_mode": 1,
+                "period_stable": 1,
+                "trig_phase_step": gui.trig_hz_to_phase_step(500.0),
+                "phase_step_offset": gui.hz_to_phase(20.0),
+                "phase_step_base": gui.hz_to_phase(1_000_000.0),
+                "phase_step": gui.hz_to_phase(1_000_020.0),
+                "osc_half_period": half_period,
+            },
+            connected=True,
+            sequence=1,
+            now=1.0,
+        )
+
+        self.assertEqual(state["mode"], "osc")
+        self.assertAlmostEqual(
+            state["expected_peak_hz"], gui.CLK_HZ / (2.0 * half_period)
+        )
+
+    def test_disconnected_state_is_not_hardware_confirmed(self):
+        state = gui._confirmed_state(None, connected=False, sequence=2, now=5.0)
+
+        self.assertFalse(state["connected"])
+        self.assertFalse(state["hardware_confirmed"])
+        self.assertEqual(state["trigger_frequency_hz"], 0.0)
+        self.assertEqual(state["expected_peak_hz"], 0.0)
+
+    def test_main_window_publishes_status_acknowledgements(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "rp_state.json"
+            old_path = gui.MainWindow._STATE_FILE
+            gui.MainWindow._STATE_FILE = state_path
+            self.addCleanup(setattr, gui.MainWindow, "_STATE_FILE", old_path)
+            win = gui.MainWindow()
+            self.addCleanup(win.close)
+            win._be._live = True
+
+            win._be.sig_status.emit({
+                "control": gui.CTRL_ENABLE,
+                "harmonic_mode": 0,
+                "period_stable": 1,
+                "trig_phase_step": gui.trig_hz_to_phase_step(500.0),
+                "phase_step_offset": gui.hz_to_phase(37.0),
+            })
+            self.app.processEvents()
+
+            state = json.loads(state_path.read_text())
+            self.assertTrue(state["hardware_confirmed"])
+            self.assertAlmostEqual(state["expected_peak_hz"], 37.0, places=5)
 
 
 class TestMeasurementWindowField(unittest.TestCase):

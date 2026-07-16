@@ -103,6 +103,53 @@ def _default_state_file() -> Path:
     return base / "RedPitayaTTLFrequencyDivider" / _LEGACY_REPO_STATE
 
 
+def _confirmed_state(
+    status: Optional[dict], *, connected: bool, sequence: int, now: Optional[float] = None
+) -> dict:
+    """Build the cross-application state from FPGA register readback."""
+    d = status or {}
+    control = int(d.get("control") or 0)
+    trig_step = int(d.get("trig_phase_step") or 0)
+    shift_step = int(d.get("phase_step_offset") or 0)
+    base_step = int(d.get("phase_step_base") or 0)
+    live_step = int(d.get("phase_step") or 0)
+    half_period = int(d.get("osc_half_period") or 0)
+    osc_mode = bool(int(d.get("osc_mode") or 0))
+    harmonic_mode = bool(int(d.get("harmonic_mode") or 0))
+    mode = "osc" if osc_mode else ("harmonic" if harmonic_mode else "pulse")
+    output_mode = "on" if control & CTRL_FORCE_HIGH else (
+        "modulated" if control & CTRL_ENABLE else "off"
+    )
+    shift_hz = phase_to_hz(shift_step)
+    expected_hz = (
+        CLK_HZ / (2.0 * half_period) if osc_mode and half_period > 0 else abs(shift_hz)
+    )
+    confirmed = bool(connected and status)
+    return {
+        "schema_version": 1,
+        "source": "redpitaya_ttl_frequency_divider",
+        "connected": bool(connected),
+        "hardware_confirmed": confirmed,
+        "sequence": int(sequence),
+        "updated_at": time.time() if now is None else float(now),
+        "mode": mode,
+        "output_mode": output_mode,
+        "period_stable": bool(d.get("period_stable")) if confirmed else False,
+        "trigger_frequency_hz": trig_phase_step_to_hz(trig_step),
+        "frequency_shift_hz": shift_hz,
+        "expected_peak_hz": expected_hz,
+        "input_frequency_hz": phase_to_hz(base_step),
+        "output_frequency_hz": phase_to_hz(live_step),
+        "control": control,
+        "harmonic_n": int(d.get("mult_n") or 1),
+        "trig_phase_step": trig_step,
+        "phase_step_offset": shift_step,
+        "phase_step_base": base_step,
+        "phase_step": live_step,
+        "osc_half_period": half_period,
+    }
+
+
 def _run_git_command(repo_dir: Path, cmd: list[str], run=subprocess.run) -> str:
     result = run(
         cmd,
@@ -1912,12 +1959,15 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1040, 900)
         _apply_app_icon(self)
 
+        self._state_sequence = 0
+        self._last_status: Optional[dict] = None
         self._be = SshBackend(self)
         self._be.sig_connected.connect(self._on_connected)
         self._be.sig_disconnected.connect(self._on_disconnected)
         self._be.sig_log.connect(self._log)
         self._be.sig_error.connect(self._on_error)
         self._be.sig_mode_changed.connect(self._on_mode_changed)
+        self._be.sig_status.connect(self._on_state_status)
 
         self._poll = QTimer(self)
         self._poll.setInterval(700)
@@ -1992,9 +2042,6 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._harmonic_panel, "Harmonic Generator")
         self._tabs.addTab(self._osc_panel,      "Osc. Delay")
         self._tabs.currentChanged.connect(self._on_tab_changed)
-        self._pulse_panel.sig_params_changed.connect(self._write_state_file)
-        self._harmonic_panel.sig_params_changed.connect(self._write_state_file)
-        self._osc_panel.sig_params_changed.connect(self._write_state_file)
         root.addWidget(self._tabs, 1)
 
         shared = QWidget()
@@ -2290,6 +2337,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_connected(self):
+        self._last_status = None
+        self._state_sequence += 1
+        self._write_state_file()
         self._btn_conn.setText("Disconnect")
         self._btn_conn.setEnabled(True)
         self._lbl_status.setText("Connected")
@@ -2303,6 +2353,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_disconnected(self, reason: str):
+        self._last_status = None
+        self._state_sequence += 1
+        self._write_state_file()
         self._poll.stop()
         self._btn_conn.setText("Connect")
         self._btn_conn.setEnabled(True)
@@ -2328,7 +2381,6 @@ class MainWindow(QMainWindow):
         """Switch the poll helper when the user changes tabs."""
         mode = "harmonic" if idx == 1 else "pulse"  # osc (idx=2) uses pulse helper
         self._be.set_active_mode(mode)
-        self._write_state_file()
 
     # ── Ctrl+Return routes to whichever tab is active ─────────────────────────
 
@@ -2354,28 +2406,18 @@ class MainWindow(QMainWindow):
 
     # ── error / log ────────────────────────────────────────────────────────────
 
+    @Slot(dict)
+    def _on_state_status(self, status: dict):
+        self._last_status = dict(status)
+        self._state_sequence += 1
+        self._write_state_file()
+
     def _write_state_file(self):
-        pp  = self._pulse_panel.get_params()
-        hp  = self._harmonic_panel.get_params()
-        op  = self._osc_panel.get_params()
-        idx = self._tabs.currentIndex()
-        active_mode = self._be.mode
-        state = {
-            "mode": active_mode,
-            "active_tab": idx,
-            "output_mode": pp["output_mode"] if active_mode == "pulse" else hp["output_mode"],
-            "pulse_freq_shift_hz": pp["freq_shift_hz"],
-            "harmonic_freq_shift_hz": hp["freq_shift_hz"],
-            "duty_cycle_pct": pp["duty_cycle_pct"],
-            "pulse_phase_offset_deg": pp["phase_offset_deg"],
-            "harmonic_phase_offset_deg": hp["phase_offset_deg"],
-            "harmonic_n": hp["harmonic_n"],
-            "osc_f_osc_hz": op["f_osc_hz"],
-            "osc_P_pct":    op["P_pct"],
-            "osc_P0_pct":   op["P0_pct"],
-            "osc_width_pct": op["width_pct"],
-            "updated_at": time.time(),
-        }
+        state = _confirmed_state(
+            self._last_status,
+            connected=self._be.live,
+            sequence=self._state_sequence,
+        )
         try:
             self._STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._STATE_FILE.with_suffix(".json.tmp")
