@@ -74,6 +74,22 @@ Click **Upload & Compile** on either tab to upload `rp_ctl.c`, compile it on the
 board, and flash the bitfile — this is needed once per board or after a firmware update.
 Switching between tabs changes the active mode instantly with no re-flashing.
 
+### Andor state integration
+
+The GUI publishes FPGA-confirmed state atomically after every successful register
+write or status poll. It also publishes an explicitly unconfirmed state while
+connecting or disconnected. The state includes the actual DIO2 trigger frequency,
+frequency shift, expected FFT peak, output mode, stability flags, and source registers.
+
+The live file is outside the repository:
+
+- macOS: `~/Library/Application Support/RedPitayaTTLFrequencyDivider/rp_state.json`
+- Windows: `%APPDATA%\RedPitayaTTLFrequencyDivider\rp_state.json`
+- Linux: `$XDG_STATE_HOME/RedPitayaTTLFrequencyDivider/rp_state.json` or
+  `~/.local/state/RedPitayaTTLFrequencyDivider/rp_state.json`
+
+The repository-root `rp_state.json` is legacy and is not updated by the GUI.
+
 ---
 
 ## Running the tests

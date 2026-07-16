@@ -91,12 +91,15 @@ class TestConfirmedStateContract(unittest.TestCase):
                 "control": gui.CTRL_ENABLE,
                 "harmonic_mode": 0,
                 "osc_mode": 0,
+                "edge_lock": 1,
                 "period_stable": 1,
                 "trig_phase_step": trig_step,
                 "phase_step_offset": shift_step,
                 "phase_step_base": gui.hz_to_phase(1_000_000.0),
                 "phase_step": gui.hz_to_phase(999_963.0),
+                "width": 62,
                 "osc_half_period": 0,
+                "osc_phase_preload": 123,
             },
             connected=True,
             sequence=7,
@@ -114,6 +117,12 @@ class TestConfirmedStateContract(unittest.TestCase):
         self.assertAlmostEqual(state["trigger_frequency_hz"], gui.phase_to_hz(trig_step))
         self.assertAlmostEqual(state["frequency_shift_hz"], gui.phase_to_hz(shift_step))
         self.assertAlmostEqual(state["expected_peak_hz"], abs(gui.phase_to_hz(shift_step)))
+        self.assertAlmostEqual(state["pulse_freq_shift_hz"], gui.phase_to_hz(shift_step))
+        self.assertIsNone(state["harmonic_freq_shift_hz"])
+        self.assertTrue(state["edge_lock"])
+        self.assertEqual(state["osc_phase_preload"], 123)
+        period_cycles = (1 << gui.PHASE_BITS) // gui.hz_to_phase(1_000_000.0)
+        self.assertAlmostEqual(state["duty_cycle_pct"], 100.0 * 62 / period_cycles)
 
     def test_osc_state_uses_confirmed_oscillation_period_for_expected_peak(self):
         expected_hz = 123.0

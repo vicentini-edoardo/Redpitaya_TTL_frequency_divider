@@ -113,6 +113,7 @@ def _confirmed_state(
     shift_step = int(d.get("phase_step_offset") or 0)
     base_step = int(d.get("phase_step_base") or 0)
     live_step = int(d.get("phase_step") or 0)
+    width_cycles = int(d.get("width") or 0)
     half_period = int(d.get("osc_half_period") or 0)
     osc_mode = bool(int(d.get("osc_mode") or 0))
     harmonic_mode = bool(int(d.get("harmonic_mode") or 0))
@@ -123,6 +124,12 @@ def _confirmed_state(
     shift_hz = phase_to_hz(shift_step)
     expected_hz = (
         CLK_HZ / (2.0 * half_period) if osc_mode and half_period > 0 else abs(shift_hz)
+    )
+    period_cycles = (1 << PHASE_BITS) // base_step if base_step > 0 else 0
+    duty_pct = (
+        50.0 if harmonic_mode else (
+            100.0 * width_cycles / period_cycles if period_cycles > 0 else 0.0
+        )
     )
     confirmed = bool(connected and status)
     return {
@@ -137,16 +144,22 @@ def _confirmed_state(
         "period_stable": bool(d.get("period_stable")) if confirmed else False,
         "trigger_frequency_hz": trig_phase_step_to_hz(trig_step),
         "frequency_shift_hz": shift_hz,
+        "pulse_freq_shift_hz": None if harmonic_mode else shift_hz,
+        "harmonic_freq_shift_hz": shift_hz if harmonic_mode else None,
         "expected_peak_hz": expected_hz,
         "input_frequency_hz": phase_to_hz(base_step),
         "output_frequency_hz": phase_to_hz(live_step),
         "control": control,
+        "edge_lock": bool(int(d.get("edge_lock") or 0)),
         "harmonic_n": int(d.get("mult_n") or 1),
+        "width_cycles": width_cycles,
+        "duty_cycle_pct": duty_pct,
         "trig_phase_step": trig_step,
         "phase_step_offset": shift_step,
         "phase_step_base": base_step,
         "phase_step": live_step,
         "osc_half_period": half_period,
+        "osc_phase_preload": int(d.get("osc_phase_preload") or 0),
     }
 
 
