@@ -70,5 +70,8 @@ memory/
 .claude/
 PRODUCT.md
 
+# Local Git worktrees
+.worktrees/
+
 # graphify knowledge-graph output
 graphify-out/
