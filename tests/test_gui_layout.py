@@ -257,13 +257,31 @@ class TestGitUpdateHelpers(unittest.TestCase):
             ["origin/feature", "origin/main"],
         )
 
+    def test_fetch_remote_branches_fetches_before_listing(self):
+        responses = {
+            ("git", "fetch", "--prune", "origin"): [
+                SimpleNamespace(stdout="", stderr="", returncode=0),
+            ],
+            ("git", "branch", "-r"): [
+                SimpleNamespace(stdout="origin/HEAD -> origin/main\norigin/main\n", stderr="", returncode=0),
+            ],
+        }
+        calls = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(tuple(cmd))
+            return responses[tuple(cmd)].pop(0)
+
+        self.assertEqual(gui._fetch_remote_branches(Path("/repo"), run=fake_run), ["origin/main"])
+        self.assertEqual(calls, [("git", "fetch", "--prune", "origin"), ("git", "branch", "-r")])
+
     def test_run_git_update_switches_branch_and_reports_restart_needed(self):
         responses = {
             ("git", "rev-parse", "HEAD"): [
                 SimpleNamespace(stdout="old-head\n", stderr="", returncode=0),
                 SimpleNamespace(stdout="new-head\n", stderr="", returncode=0),
             ],
-            ("git", "fetch", "origin"): [
+            ("git", "fetch", "--prune", "origin"): [
                 SimpleNamespace(stdout="", stderr="", returncode=0),
             ],
             ("git", "status", "--porcelain", "--", "rp_state.json"): [
@@ -281,6 +299,9 @@ class TestGitUpdateHelpers(unittest.TestCase):
             ("git", "pull", "--ff-only"): [
                 SimpleNamespace(stdout="Updating old-head..new-head\nFast-forward\n", stderr="", returncode=0),
             ],
+            ("git", "log", "old-head..new-head", "--pretty=format:• %s", "--no-merges"): [
+                SimpleNamespace(stdout="• Fix updater\n", stderr="", returncode=0),
+            ],
         }
         calls = []
 
@@ -295,18 +316,19 @@ class TestGitUpdateHelpers(unittest.TestCase):
         msg, restart_needed = gui._run_git_update(gui._APP_DIR, "origin/main", run=fake_run)
 
         self.assertTrue(restart_needed)
-        self.assertIn("Fast-forward", msg)
+        self.assertEqual(msg, "• Fix updater")
         self.assertEqual(
             calls,
             [
                 ("git", "rev-parse", "HEAD"),
                 ("git", "status", "--porcelain", "--", "rp_state.json"),
-                ("git", "fetch", "origin"),
+                ("git", "fetch", "--prune", "origin"),
                 ("git", "branch", "--show-current"),
                 ("git", "checkout", "main"),
                 ("git", "branch", "--set-upstream-to", "origin/main", "main"),
                 ("git", "pull", "--ff-only"),
                 ("git", "rev-parse", "HEAD"),
+                ("git", "log", "old-head..new-head", "--pretty=format:• %s", "--no-merges"),
             ],
         )
 

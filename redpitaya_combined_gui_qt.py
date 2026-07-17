@@ -37,7 +37,7 @@ try:
         QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
         QInputDialog,
         QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-        QSizePolicy, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+        QMessageBox, QSizePolicy, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
 except ImportError as exc:
     raise SystemExit(
@@ -195,6 +195,11 @@ def _list_remote_branches(repo_dir: Path, run=subprocess.run) -> list[str]:
     return _parse_remote_branches(_run_git_command(repo_dir, ["git", "branch", "-r"], run=run))
 
 
+def _fetch_remote_branches(repo_dir: Path, run=subprocess.run) -> list[str]:
+    _run_git_command(repo_dir, ["git", "fetch", "--prune", "origin"], run=run)
+    return _list_remote_branches(repo_dir, run=run)
+
+
 def _cleanup_legacy_repo_state(repo_dir: Path, run=subprocess.run) -> str:
     legacy_state = repo_dir / _LEGACY_REPO_STATE
     if not legacy_state.exists():
@@ -221,43 +226,35 @@ def _cleanup_legacy_repo_state(repo_dir: Path, run=subprocess.run) -> str:
 def _run_git_update(repo_dir: Path, remote_ref: str, run=subprocess.run) -> tuple[str, bool]:
     branch = _remote_branch_name(remote_ref)
     before_head = _run_git_command(repo_dir, ["git", "rev-parse", "HEAD"], run=run)
-    messages = []
-
     cleanup_out = _cleanup_legacy_repo_state(repo_dir, run=run)
-    if cleanup_out:
-        messages.append(cleanup_out)
-
-    fetch_out = _run_git_command(repo_dir, ["git", "fetch", "origin"], run=run)
-    if fetch_out:
-        messages.append(fetch_out)
+    _run_git_command(repo_dir, ["git", "fetch", "--prune", "origin"], run=run)
 
     current_branch = _run_git_command(repo_dir, ["git", "branch", "--show-current"], run=run)
     if current_branch != branch:
         try:
-            checkout_out = _run_git_command(repo_dir, ["git", "checkout", branch], run=run)
+            _run_git_command(repo_dir, ["git", "checkout", branch], run=run)
         except RuntimeError:
-            checkout_out = _run_git_command(
+            _run_git_command(
                 repo_dir,
                 ["git", "checkout", "-b", branch, "--track", remote_ref],
                 run=run,
             )
-        if checkout_out:
-            messages.append(checkout_out)
-
-    upstream_out = _run_git_command(
+    _run_git_command(
         repo_dir,
         ["git", "branch", "--set-upstream-to", remote_ref, branch],
         run=run,
     )
-    if upstream_out:
-        messages.append(upstream_out)
-
-    pull_out = _run_git_command(repo_dir, ["git", "pull", "--ff-only"], run=run)
-    if pull_out:
-        messages.append(pull_out)
+    _run_git_command(repo_dir, ["git", "pull", "--ff-only"], run=run)
 
     after_head = _run_git_command(repo_dir, ["git", "rev-parse", "HEAD"], run=run)
-    return "\n".join(messages) or "Already up to date.", before_head != after_head
+    if before_head == after_head:
+        return cleanup_out or "Already up to date.", False
+    changelog = _run_git_command(
+        repo_dir,
+        ["git", "log", f"{before_head}..{after_head}", "--pretty=format:• %s", "--no-merges"],
+        run=run,
+    )
+    return changelog or "Updated.", True
 
 
 class _CommitLineEdit(QLineEdit):
@@ -2071,7 +2068,7 @@ class MainWindow(QMainWindow):
     def _do_git_update(self):
         here = Path(__file__).resolve().parent
         try:
-            branches = _list_remote_branches(here)
+            branches = _fetch_remote_branches(here)
         except Exception as exc:
             self._on_update_done(f"ERROR: {exc}", False)
             return
@@ -2120,8 +2117,15 @@ class MainWindow(QMainWindow):
         self._lbl_update_status.setStyleSheet(f"color: {color}; background: transparent;")
         self._log(f"[Update] {msg}")
         if ok and restart_needed:
-            self._log("[Update] Restarting to load the new version.")
-            QTimer.singleShot(0, self._restart_app)
+            box = QMessageBox(self)
+            box.setWindowTitle("Update")
+            box.setText("What's new:")
+            box.setInformativeText(f"{msg}\n\nRestart now?")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            box.button(QMessageBox.StandardButton.Yes).setText("Restart now")
+            box.button(QMessageBox.StandardButton.No).setText("Later")
+            if box.exec() == QMessageBox.StandardButton.Yes:
+                self._restart_app()
 
     def _build_connection(self) -> QGroupBox:
         g = QFrame()
