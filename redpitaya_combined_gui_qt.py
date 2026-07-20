@@ -58,7 +58,7 @@ from rp_math import (  # noqa: E402
     PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
-    f_shift_from_f_osc, osc_half_period_cycles, osc_phase_preload as osc_preload_word,
+    strobe_step_word, dwell_s_to_cycles,
     phase_offset_to_preload, preload_to_phase_offset,
     harmonic_phase_offset_to_preload, harmonic_preload_to_phase_offset,
 )
@@ -114,7 +114,7 @@ def _confirmed_state(
     base_step = int(d.get("phase_step_base") or 0)
     live_step = int(d.get("phase_step") or 0)
     width_cycles = int(d.get("width") or 0)
-    half_period = int(d.get("osc_half_period") or 0)
+    dwell = int(d.get("dwell_cycles") or 0)
     osc_mode = bool(int(d.get("osc_mode") or 0))
     harmonic_mode = bool(int(d.get("harmonic_mode") or 0))
     mode = "osc" if osc_mode else ("harmonic" if harmonic_mode else "pulse")
@@ -122,9 +122,9 @@ def _confirmed_state(
         "modulated" if control & CTRL_ENABLE else "off"
     )
     shift_hz = phase_to_hz(shift_step)
-    expected_hz = (
-        CLK_HZ / (2.0 * half_period) if osc_mode and half_period > 0 else abs(shift_hz)
-    )
+    # osc (strobe) mode holds a constant phase per point — no beat peak; the
+    # shift register carries the per-step phase increment, not a frequency.
+    expected_hz = 0.0 if osc_mode else abs(shift_hz)
     period_cycles = (1 << PHASE_BITS) // base_step if base_step > 0 else 0
     duty_pct = (
         50.0 if harmonic_mode else (
@@ -158,8 +158,11 @@ def _confirmed_state(
         "phase_step_offset": shift_step,
         "phase_step_base": base_step,
         "phase_step": live_step,
-        "osc_half_period": half_period,
+        "dwell_cycles": dwell,
         "osc_phase_preload": int(d.get("osc_phase_preload") or 0),
+        "n_steps": int(d.get("n_steps") or 0),
+        "step_index": int(d.get("step_index") or 0),
+        "strobe_done": bool(int(d.get("strobe_done") or 0)),
     }
 
 
@@ -406,13 +409,14 @@ class SshBackend(QObject):
         if self._live:
             self._enqueue(self.P_USER, self._do_reset, self.sig_status.emit)
 
-    def apply_osc(self, width_cycles: int, half_period: int, preload: int, offset_word: int):
-        """Set osc registers then write to enable (osc_mode + enable bits)."""
+    def apply_osc(self, width_cycles: int, dwell_cycles: int, preload: int,
+                  step_word: int, n_steps: int):
+        """Set strobe registers then write to arm (osc_mode + enable bits)."""
         if self._live:
             ctrl = CTRL_ENABLE | CTRL_OSC_MODE
             self._enqueue(self.P_USER,
-                          lambda: self._do_apply_osc(width_cycles, half_period,
-                                                     preload, offset_word, ctrl),
+                          lambda: self._do_apply_osc(width_cycles, dwell_cycles,
+                                                     preload, step_word, n_steps, ctrl),
                           self.sig_status.emit)
 
     def disable_osc(self):
@@ -535,20 +539,20 @@ class SshBackend(QObject):
     def _do_read(self) -> dict:
         return json.loads(self._exec(f"{self._active_cmd()} read"))
 
-    def _do_apply_osc(self, wc: int, half_period: int, preload: int,
-                      offset: int, ctrl: int) -> dict:
+    def _do_apply_osc(self, wc: int, dwell: int, preload: int,
+                      step_word: int, n_steps: int, ctrl: int) -> dict:
         self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} osc {half_period} {preload}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} osc {dwell} {preload} {n_steps}"
         )
         # Clear the osc bit first: the FPGA latches the preload and re-arms
-        # the sweep on the RISING edge of osc_mode, so a re-apply while osc
+        # the scan on the RISING edge of osc_mode, so a re-apply while osc
         # is already running needs an explicit off→on toggle. The output and
         # the frequency measurement keep running throughout.
         self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
         )
         return json.loads(self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {offset} {ctrl}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {step_word} {ctrl}"
         ))
 
     def _do_apply_pulse_locked(self, width: int, offset: int, preload: int,
@@ -1640,18 +1644,19 @@ class HarmonicPanel(_NcoPanel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OscPanel — oscillating delay mode
-#   phase sweeps P0-P → P0+P → P0-P at rate f_osc
-#   f_shift = 4 * f_osc * P  (derived internally)
+# OscPanel — stepped strobe scan
+#   The output pulse is held at a constant phase φ_k = start + k·step of the
+#   input period for a dwell time, then advances; after n_steps points the
+#   scan is done and the last phase is held until re-armed.
 #
 #   The FPGA re-anchors the NCO to the input on every rising edge
-#   (edge-locked osc mode), so P0 and P are true phases referenced to the
-#   input edge and the sweep does not drift with measurement error.
+#   (edge-locked osc mode), so every sampled phase is referenced to the
+#   input edge and does not drift with measurement error.
 #   Requires a bitstream built from the current pulse_gen.sv.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OscPanel(QWidget):
-    """Oscillating delay: stroboscopic phase-scan via alternating NCO sign."""
+    """Stepped strobe: single-shot phase scan over a fraction of the period."""
 
     sig_params_changed = Signal()
 
@@ -1687,11 +1692,11 @@ class OscPanel(QWidget):
 
         # ── Status tiles ────────────────────────────────────────────────────
         self._d_in   = BigDisplay("Input Frequency",  "measured input period", _ACCENT)
-        self._d_osc  = BigDisplay("Osc. Rate",        "f_osc = f_shift / (4·P)", _GREEN)
-        self._d_amp  = BigDisplay("Phase Amplitude",  "P (% of T_in)",           _AMBER)
-        self._d_fsh  = BigDisplay("NCO Shift",        "derived f_shift",          _AMBER)
+        self._d_prog = BigDisplay("Progress",         "step k / N",            _GREEN)
+        self._d_scan = BigDisplay("Scan Range",       "start → end (% of T_in)", _AMBER)
+        self._d_time = BigDisplay("Total Time",       "N × dwell",             _AMBER)
 
-        for d in (self._d_in, self._d_osc, self._d_amp, self._d_fsh):
+        for d in (self._d_in, self._d_prog, self._d_scan, self._d_time):
             d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             d.setMinimumHeight(80)
 
@@ -1701,17 +1706,17 @@ class OscPanel(QWidget):
         grid = QGridLayout(readouts)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(_SP_MD)
-        grid.addWidget(self._d_in,  0, 0)
-        grid.addWidget(self._d_osc, 0, 1)
-        grid.addWidget(self._d_amp, 1, 0)
-        grid.addWidget(self._d_fsh, 1, 1)
+        grid.addWidget(self._d_in,   0, 0)
+        grid.addWidget(self._d_prog, 0, 1)
+        grid.addWidget(self._d_scan, 1, 0)
+        grid.addWidget(self._d_time, 1, 1)
         for i in range(2):
             grid.setRowStretch(i, 1)
             grid.setColumnStretch(i, 1)
         root.addWidget(readouts, 1)
 
         # ── Controls ────────────────────────────────────────────────────────
-        controls = _make_group("Oscillating Delay Controls")
+        controls = _make_group("Strobe Scan Controls")
         controls.setMinimumHeight(220)
         cl = QHBoxLayout(controls)
         cl.setContentsMargins(_SP_LG, 12, _SP_LG, _SP_LG)
@@ -1737,11 +1742,11 @@ class OscPanel(QWidget):
             s.setStyleSheet(_spin_style())
             return s
 
-        # Row 0: f_osc
-        fields.addWidget(_dim_label("f_osc:"), 0, 0)
-        self._sp_fosc = _spin(0.001, 1e6, 3, 100.0, " Hz", 10_000.0)
-        self._sp_fosc.valueChanged.connect(self._param_changed)
-        fields.addWidget(self._sp_fosc, 0, 1)
+        # Row 0: start phase
+        fields.addWidget(_dim_label("Start:"), 0, 0)
+        self._sp_start = _spin(-100.0, 100.0, 3, 1.0, " %", 0.0)
+        self._sp_start.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_start, 0, 1)
 
         # Row 0 col 2-3: Width %
         fields.addWidget(_dim_label("Width:", 80), 0, 2)
@@ -1749,34 +1754,46 @@ class OscPanel(QWidget):
         self._sp_width.valueChanged.connect(self._param_changed)
         fields.addWidget(self._sp_width, 0, 3)
 
-        # Row 1: P (amplitude)
-        fields.addWidget(_dim_label("Phase P:"), 1, 0)
-        self._sp_P = _spin(0.1, 49.9, 2, 1.0, " %", 20.0)
-        self._sp_P.valueChanged.connect(self._param_changed)
-        fields.addWidget(self._sp_P, 1, 1)
+        # Row 1: step size
+        fields.addWidget(_dim_label("Step:"), 1, 0)
+        self._sp_step = _spin(0.001, 100.0, 3, 0.1, " %", 1.0)
+        self._sp_step.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_step, 1, 1)
 
-        # Row 1 col 2-3: P0 (centre)
-        fields.addWidget(_dim_label("Centre P0:", 80), 1, 2)
-        self._sp_P0 = _spin(-49.9, 49.9, 2, 1.0, " %", 0.0, 120)
-        self._sp_P0.valueChanged.connect(self._param_changed)
-        fields.addWidget(self._sp_P0, 1, 3)
+        # Row 1 col 2-3: number of steps
+        fields.addWidget(_dim_label("N steps:", 80), 1, 2)
+        self._sp_nsteps = QSpinBox()
+        self._sp_nsteps.setRange(1, 1_000_000)
+        self._sp_nsteps.setValue(10)
+        self._sp_nsteps.setFixedHeight(34)
+        self._sp_nsteps.setMinimumWidth(120)
+        self._sp_nsteps.setFont(_mono_font(12, bold=True))
+        self._sp_nsteps.setStyleSheet(_spin_style())
+        self._sp_nsteps.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_nsteps, 1, 3)
 
-        # Row 2: auto-apply
+        # Row 2: dwell per point
+        fields.addWidget(_dim_label("Dwell:"), 2, 0)
+        self._sp_dwell = _spin(0.01, 34_000.0, 2, 10.0, " ms", 100.0)
+        self._sp_dwell.valueChanged.connect(self._param_changed)
+        fields.addWidget(self._sp_dwell, 2, 1)
+
+        # Row 3: auto-apply
         auto_row = QHBoxLayout()
         self._cb_auto = QCheckBox("Auto-Apply")
-        self._cb_auto.setChecked(True)
+        self._cb_auto.setChecked(False)
         self._cb_auto.setFont(_mono_font(10))
         self._cb_auto.setStyleSheet(_checkbox_style())
         auto_row.addWidget(self._cb_auto)
         auto_row.addStretch()
-        fields.addLayout(auto_row, 2, 0, 1, 4)
+        fields.addLayout(auto_row, 3, 0, 1, 4)
 
-        # Row 3: derived detail label
+        # Row 4: derived detail label
         self._lbl_detail = QLabel()
         self._lbl_detail.setFont(_mono_font(9))
         self._lbl_detail.setWordWrap(True)
         self._lbl_detail.setStyleSheet(f"color: {_MUTED}; background: transparent;")
-        fields.addWidget(self._lbl_detail, 3, 0, 1, 4)
+        fields.addWidget(self._lbl_detail, 4, 0, 1, 4)
         fields.setColumnStretch(1, 1)
 
         left_col.addLayout(fields)
@@ -1786,7 +1803,7 @@ class OscPanel(QWidget):
         actions = QVBoxLayout()
         actions.setSpacing(8)
 
-        self._btn_apply = QPushButton("Apply now\nCtrl+Return")
+        self._btn_apply = QPushButton("Start / Re-arm\nCtrl+Return")
         self._btn_apply.setFixedWidth(190)
         self._btn_apply.setMinimumHeight(60)
         self._btn_apply.setFont(_mono_font(12, bold=True))
@@ -1795,7 +1812,7 @@ class OscPanel(QWidget):
         self._btn_apply.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         actions.addWidget(self._btn_apply)
 
-        self._btn_stop = QPushButton("Stop osc")
+        self._btn_stop = QPushButton("Stop scan")
         self._btn_stop.setFixedWidth(190)
         self._btn_stop.setFixedHeight(34)
         self._btn_stop.setStyleSheet(_btn_style(_RED))
@@ -1818,29 +1835,28 @@ class OscPanel(QWidget):
     # ── helpers ────────────────────────────────────────────────────────────────
 
     def _set_controls_enabled(self, enabled: bool):
-        for w in (self._sp_fosc, self._sp_P, self._sp_P0, self._sp_width,
-                  self._cb_auto, self._btn_apply, self._btn_stop):
+        for w in (self._sp_start, self._sp_step, self._sp_nsteps, self._sp_dwell,
+                  self._sp_width, self._cb_auto, self._btn_apply, self._btn_stop):
             w.setEnabled(enabled)
 
-    def _current_f_shift(self) -> float:
-        return f_shift_from_f_osc(self._sp_fosc.value(), self._sp_P.value() / 100.0)
-
     def _update_detail(self):
-        f_osc = self._sp_fosc.value()
-        P_frac = self._sp_P.value() / 100.0
-        P0_frac = self._sp_P0.value() / 100.0
-        f_shift = f_shift_from_f_osc(f_osc, P_frac)
-        half_p = osc_half_period_cycles(P_frac, f_shift) if f_shift > 0 else 0
-        osc_T_ms = (2 * half_p / CLK_HZ * 1e3) if half_p > 0 else 0.0
+        start_pct = self._sp_start.value()
+        step_pct = self._sp_step.value()
+        n = self._sp_nsteps.value()
+        dwell_ms = self._sp_dwell.value()
+        end_pct = start_pct + (n - 1) * step_pct
+        total_s = n * dwell_ms / 1e3
+        dwell_c = dwell_s_to_cycles(dwell_ms / 1e3)
         self._lbl_detail.setText(
-            f"f_shift = {f_shift:.4f} Hz    "
-            f"half_period = {half_p} clks    "
-            f"T_osc = {osc_T_ms:.3f} ms    "
-            f"scan range: ({P0_frac*100-P_frac*100:.1f}% … {P0_frac*100+P_frac*100:.1f}%) of T_in"
+            f"dwell = {dwell_c} clks    "
+            f"scan: {start_pct:.3f}% → {end_pct:.3f}% of T_in in {n} steps    "
+            f"total = {fmt_dur(total_s)}"
         )
-        self._d_osc.set_data(fmt_freq(f_osc), f"T_osc = {osc_T_ms:.3f} ms", _GREEN)
-        self._d_amp.set_data(f"±{self._sp_P.value():.2f} %", f"centre P0 = {self._sp_P0.value():.2f}%", _AMBER)
-        self._d_fsh.set_data(fmt_freq(f_shift), "NCO f_shift", _AMBER)
+        self._d_scan.set_data(
+            f"{start_pct:.2f} → {end_pct:.2f} %",
+            f"step {step_pct:.3f}% of T_in", _AMBER,
+        )
+        self._d_time.set_data(fmt_dur(total_s), f"{n} × {dwell_ms:.2f} ms", _AMBER)
 
     # ── backend slots ──────────────────────────────────────────────────────────
 
@@ -1872,9 +1888,22 @@ class OscPanel(QWidget):
                 _ACCENT if stable else _AMBER,
             )
 
-        # Reflect hardware osc_mode state
+        # Reflect hardware osc_mode state + scan progress
         ctrl = int(d.get("control") or 0)
         self._osc_active = bool((ctrl >> 4) & 1)
+        if self._osc_active:
+            k = int(d.get("step_index") or 0)
+            n = int(d.get("n_steps") or 0)
+            done = bool(int(d.get("strobe_done") or 0))
+            running = bool(d.get("freerun_active"))
+            if done:
+                self._d_prog.set_data(f"{n} / {n}", "DONE — holding last phase", _GREEN)
+            elif running:
+                self._d_prog.set_data(f"{k + 1} / {n}", "scanning", _AMBER)
+            else:
+                self._d_prog.set_data(f"0 / {n}", "armed — measuring input", _AMBER)
+        else:
+            self._d_prog.set_data("---", "scan not armed", _MUTED)
 
     # ── parameter controls ─────────────────────────────────────────────────────
 
@@ -1892,47 +1921,65 @@ class OscPanel(QWidget):
     def _do_apply(self):
         if not self._live:
             return
-        f_osc  = self._sp_fosc.value()
-        P_frac = self._sp_P.value() / 100.0
-        P0_frac = self._sp_P0.value() / 100.0
-        width_pct = self._sp_width.value()
+        start_frac = self._sp_start.value() / 100.0
+        step_frac  = self._sp_step.value() / 100.0
+        n_steps    = self._sp_nsteps.value()
+        dwell_ms   = self._sp_dwell.value()
+        width_pct  = self._sp_width.value()
 
-        f_shift    = f_shift_from_f_osc(f_osc, P_frac)
-        half_p     = osc_half_period_cycles(P_frac, f_shift)
-        preload    = osc_preload_word(P0_frac, P_frac)
-        offset_w   = hz_to_phase(f_shift)
-        period     = self._period_c if self._period_c > 0 else 1000
-        wc         = duty_to_cycles(width_pct / 100.0, period)
+        preload   = phase_offset_to_preload(start_frac)
+        step_word = strobe_step_word(step_frac)
+        dwell_c   = dwell_s_to_cycles(dwell_ms / 1e3)
+        period    = self._period_c if self._period_c > 0 else 1000
+        wc        = duty_to_cycles(width_pct / 100.0, period)
 
         # Sanity-check against the measured input, when available.
         if self._period_c > 0:
-            f_in = CLK_HZ / self._period_c
-            if f_shift >= f_in:
+            min_step = 2.0 / self._period_c
+            if step_frac < min_step:
                 self._log(
-                    f"ERROR: derived f_shift {fmt_freq(f_shift)} >= measured "
-                    f"f_in {fmt_freq(f_in)} (f_shift = 4·f_osc·P) — reduce "
-                    "f_osc or P. Not applied."
+                    f"WARNING: step = {step_frac*100:.4f}% is below the NCO/edge "
+                    f"resolution ({min_step*100:.4f}% of T_in at this f_in); "
+                    "adjacent points will be indistinguishable."
                 )
-                return
-            min_p = 2.0 / self._period_c
-            if P_frac < min_p:
+            t_in_s = self._period_c / CLK_HZ
+            if dwell_ms / 1e3 < 3 * t_in_s:
                 self._log(
-                    f"WARNING: P = {P_frac*100:.3f}% is below the NCO step "
-                    f"({min_p*100:.3f}% of T_in at this f_in); the delay sweep "
-                    "will be unresolvable."
+                    f"WARNING: dwell {dwell_ms:.2f} ms < 3 input periods "
+                    f"({3 * t_in_s * 1e3:.2f} ms) — too few pulses per point."
                 )
+            # A level at exactly phase 0 (pulse coincident with the input
+            # edge) can lose its pulses: the edge re-anchor snap preempts the
+            # NCO carry every period when the measured f_in is slightly low.
+            tick = 1.0 / self._period_c
+            bad = [k for k in range(n_steps)
+                   if min((start_frac + k * step_frac) % 1.0,
+                          1.0 - (start_frac + k * step_frac) % 1.0) < tick]
+            if bad:
+                self._log(
+                    f"WARNING: point(s) {bad} land within one NCO tick of "
+                    "phase 0 — pulses may vanish there; offset the start "
+                    "phase slightly."
+                )
+        end_pct = (start_frac + (n_steps - 1) * step_frac) * 100.0
+        if end_pct > 100.0:
+            self._log(
+                f"WARNING: scan end {end_pct:.2f}% exceeds 100% of T_in — the "
+                "phase wraps around into the next period."
+            )
 
-        self._be.apply_osc(wc, half_p, preload, offset_w)
+        self._be.apply_osc(wc, dwell_c, preload, step_word, n_steps)
         self._log(
-            f"Apply  f_osc={fmt_freq(f_osc)}  P={P_frac*100:.2f}%  P0={P0_frac*100:.2f}%  "
-            f"f_shift={f_shift:.4f} Hz  half_period={half_p}  preload={preload}"
+            f"Arm  start={start_frac*100:.3f}%  step={step_frac*100:.3f}%  "
+            f"n={n_steps}  dwell={dwell_ms:.2f} ms ({dwell_c} clks)  "
+            f"preload={preload}  step_word={step_word}"
         )
 
     def _do_stop(self):
         if not self._live:
             return
         self._be.disable_osc()
-        self._log("Osc mode disabled.")
+        self._log("Strobe scan disabled.")
 
     def _do_upload(self):
         here    = Path(__file__).resolve().parent
@@ -1946,10 +1993,11 @@ class OscPanel(QWidget):
 
     def get_params(self) -> dict:
         return {
-            "f_osc_hz":    self._sp_fosc.value(),
-            "P_pct":       self._sp_P.value(),
-            "P0_pct":      self._sp_P0.value(),
-            "width_pct":   self._sp_width.value(),
+            "start_pct":  self._sp_start.value(),
+            "step_pct":   self._sp_step.value(),
+            "n_steps":    self._sp_nsteps.value(),
+            "dwell_ms":   self._sp_dwell.value(),
+            "width_pct":  self._sp_width.value(),
         }
 
 
@@ -2050,7 +2098,7 @@ class MainWindow(QMainWindow):
 
         self._tabs.addTab(self._pulse_panel,    "Pulse / Freq-Shift")
         self._tabs.addTab(self._harmonic_panel, "Harmonic Generator")
-        self._tabs.addTab(self._osc_panel,      "Osc. Delay")
+        self._tabs.addTab(self._osc_panel,      "Strobe Scan")
         self._tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self._tabs, 1)
 

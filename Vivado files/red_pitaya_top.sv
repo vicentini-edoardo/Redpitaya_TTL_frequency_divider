@@ -95,8 +95,11 @@ logic        force_high;
 logic        harmonic_mode;
 logic        osc_mode;
 logic        edge_lock;
-logic [31:0] osc_half_period;
+logic [31:0] dwell_cycles;
 logic [47:0] osc_phase_preload;
+logic [31:0] n_steps;
+logic [31:0] step_index;
+logic        strobe_done;
 logic [31:0] width_n;
 logic [31:0] meas_time_us;
 logic        pulse_busy;
@@ -209,8 +212,9 @@ pulse_gen pulse_gen_i
   .width_n            (width_n),
   .meas_time_us       (meas_time_us),
   .phase_step_offset  (phase_step_offset),
-  .osc_half_period    (osc_half_period),
+  .dwell_cycles       (dwell_cycles),
   .osc_phase_preload  (osc_phase_preload),
+  .n_steps            (n_steps),
 
   .trig_phase_step    (trig_phase_step),
 
@@ -228,7 +232,10 @@ pulse_gen pulse_gen_i
 
   .freerun_active     (freerun_active),
   .phase_step_base    (phase_step_base),
-  .phase_step         (phase_step)
+  .phase_step         (phase_step),
+
+  .step_index         (step_index),
+  .strobe_done        (strobe_done)
 );
 
 axi4lite_pulse_regs regs_i
@@ -268,8 +275,9 @@ axi4lite_pulse_regs regs_i
   .width_n             (width_n),
   .meas_time_us        (meas_time_us),
   .phase_step_offset   (phase_step_offset),
-  .osc_half_period     (osc_half_period),
+  .dwell_cycles        (dwell_cycles),
   .osc_phase_preload   (osc_phase_preload),
+  .n_steps             (n_steps),
 
   .pulse_busy          (pulse_busy),
   .meas_span           (meas_span),
@@ -279,7 +287,9 @@ axi4lite_pulse_regs regs_i
   .timeout_flag        (timeout_flag),
   .freerun_active      (freerun_active),
   .phase_step_base     (phase_step_base),
-  .phase_step          (phase_step)
+  .phase_step          (phase_step),
+  .step_index          (step_index),
+  .strobe_done         (strobe_done)
 );
 
 assign m_axi_gp0_bid   = m_axi_gp0_awid;

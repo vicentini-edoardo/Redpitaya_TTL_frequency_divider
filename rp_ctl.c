@@ -23,7 +23,7 @@
  *                           harmonic: mult_n (bits [2:0], clamped to [1..5])
  *   0x0C  trig_phase_step_hi  bits [47:32] of DIO2 48-bit NCO step
  *   0x10  status            bit 0 = busy, bit 1 = period_valid, bit 2 = period_stable,
- *                           bit 3 = timeout, bit 4 = freerun_active
+ *                           bit 3 = timeout, bit 4 = freerun_active, bit 5 = strobe_done
  *   0x14  meas_span         clock cycles between first and last rising edge of last window
  *   0x18  edge_cnt          rising-edge count from last measurement window
  *   0x1C  phase_step_offset_lo  bits [31:0]  of signed 48-bit NCO offset
@@ -33,12 +33,21 @@
  *   0x2C  phase_step_lo         bits [31:0]  of live phase_step (read-only)
  *   0x30  phase_step_hi         bits [47:32] of live phase_step (in [15:0])
  *   0x34  meas_time_us      measurement window in microseconds (min 1000)
+ *   0x38  dwell_cycles      clock ticks per strobe point (osc mode)
+ *   0x3C  osc_phase_preload_lo  bits [31:0]  of 48-bit start-phase preload
+ *   0x40  osc_phase_preload_hi  bits [47:32] of 48-bit start-phase preload
+ *   0x44  n_steps           strobe points per scan (osc mode, >=1)
+ *   0x48  step_index        current strobe point, 0-based (read-only)
+ *
+ * In osc mode phase_step_offset (0x1C/0x20) is the per-step target
+ * increment: two's-complement of round(step_frac * 2^48).
  *
  * JSON output fields (same for both modes):
  *   control, harmonic_mode, osc_mode, edge_lock, force_high, width, mult_n,
- *   trig_phase_step, status, period_stable, freerun_active, meas_time_us,
- *   meas_span, edge_cnt,
- *   phase_step_offset, phase_step_base, phase_step
+ *   trig_phase_step, status, period_stable, freerun_active, strobe_done,
+ *   meas_time_us, meas_span, edge_cnt,
+ *   phase_step_offset, phase_step_base, phase_step,
+ *   dwell_cycles, osc_phase_preload, n_steps, step_index
  *
  * Frequency conversions (use phase_step_base for accuracy):
  *   input_hz  = 124999999.0 * phase_step_base / 2^48
@@ -69,15 +78,17 @@
 #define REG_PHASE_STEP_LO         0x2C
 #define REG_PHASE_STEP_HI         0x30
 #define REG_MEAS_TIME_US          0x34
-#define REG_OSC_HALF_PERIOD       0x38
+#define REG_DWELL_CYCLES          0x38
 #define REG_OSC_PHASE_PRELOAD_LO  0x3C
 #define REG_OSC_PHASE_PRELOAD_HI  0x40
+#define REG_N_STEPS               0x44
+#define REG_STEP_INDEX            0x48
 
 #define CTRL_ENABLE       0x01u
 #define CTRL_SOFT_RESET   0x02u
 #define CTRL_FORCE_HIGH   0x04u
 #define CTRL_HARMONIC     0x08u
-#define CTRL_OSC_MODE     0x10u   /* bit 4 — oscillating delay mode */
+#define CTRL_OSC_MODE     0x10u   /* bit 4 — stepped strobe scan */
 #define CTRL_EDGE_LOCK    0x20u   /* bit 5 — anchor NCO phase to input edges */
 
 /* Bits the caller may pass; harmonic_mode is managed internally */
@@ -106,11 +117,12 @@ static void usage(const char *prog) {
         "  %s <base_addr> trig <phase_step>\n"
         "      DIO2 square wave: phase_step = round(f_hz * 2^48 / 124999999). 0=off.\n"
         "      e.g. 2251800=1Hz  225179983=100Hz  2251799832=1000Hz\n"
-        "  %s <base_addr> osc <half_period_cycles> <phase_preload_uint64>\n"
-        "      Set oscillating delay registers (write to osc_half_period and osc_phase_preload).\n"
-        "      Use write command with bit4=1 in control to enable osc_mode.\n"
+        "  %s <base_addr> osc <dwell_cycles> <phase_preload_uint64> <n_steps>\n"
+        "      Set stepped-strobe registers (dwell_cycles, start-phase preload, n_steps).\n"
+        "      Step size goes in phase_step_offset via the write command; re-arm the\n"
+        "      scan by toggling bit4 off then on (write with bit4=1 in control).\n"
         "  %s <base_addr> preload <phase_preload_uint64>\n"
-        "      Set osc_phase_preload only (edge-lock phase offset); leaves osc_half_period.\n"
+        "      Set osc_phase_preload only (edge-lock phase offset); leaves dwell_cycles.\n"
         "      Re-arm edge_lock (bit5 off→on via write) to apply the new phase.\n"
         "  %s <base_addr> soft_reset\n",
         prog, prog, arg3, prog, prog, prog, prog, prog, prog);
@@ -164,19 +176,23 @@ static void print_json(volatile uint8_t *base) {
     const uint32_t status            = rd32(base, REG_STATUS);
     const uint32_t period_stable     = (status >> 2) & 0x1u;
     const uint32_t freerun_active    = (status >> 4) & 0x1u;
+    const uint32_t strobe_done       = (status >> 5) & 0x1u;
     const uint32_t meas_time_us      = rd32(base, REG_MEAS_TIME_US);
     const int64_t  step_offset       = rd48(base, REG_PHASE_STEP_OFFSET_LO, REG_PHASE_STEP_OFFSET_HI);
     const int64_t  step_base         = rd48(base, REG_PHASE_STEP_BASE_LO,   REG_PHASE_STEP_BASE_HI);
     const int64_t  step_live         = rd48(base, REG_PHASE_STEP_LO,        REG_PHASE_STEP_HI);
-    const uint32_t osc_half_period   = rd32(base, REG_OSC_HALF_PERIOD);
+    const uint32_t dwell_cycles      = rd32(base, REG_DWELL_CYCLES);
     const uint64_t osc_phase_preload = rd48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI);
+    const uint32_t n_steps           = rd32(base, REG_N_STEPS);
+    const uint32_t step_index        = rd32(base, REG_STEP_INDEX);
 
     printf("{\"control\":%u,\"harmonic_mode\":%u,\"osc_mode\":%u,\"edge_lock\":%u,\"force_high\":%u,"
            "\"width\":%u,\"mult_n\":%u,\"trig_phase_step\":%llu,"
-           "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"meas_time_us\":%u,"
-           "\"meas_span\":%u,\"edge_cnt\":%u,"
+           "\"status\":%u,\"period_stable\":%u,\"freerun_active\":%u,\"strobe_done\":%u,"
+           "\"meas_time_us\":%u,\"meas_span\":%u,\"edge_cnt\":%u,"
            "\"phase_step_offset\":%lld,\"phase_step_base\":%lld,\"phase_step\":%lld,"
-           "\"osc_half_period\":%u,\"osc_phase_preload\":%llu}\n",
+           "\"dwell_cycles\":%u,\"osc_phase_preload\":%llu,"
+           "\"n_steps\":%u,\"step_index\":%u}\n",
            control,
            harmonic_mode,
            osc_mode,
@@ -188,14 +204,17 @@ static void print_json(volatile uint8_t *base) {
            status,
            period_stable,
            freerun_active,
+           strobe_done,
            meas_time_us,
            rd32(base, REG_MEAS_SPAN),
            rd32(base, REG_EDGE_CNT),
            (long long)step_offset,
            (long long)step_base,
            (long long)step_live,
-           osc_half_period,
-           (unsigned long long)osc_phase_preload);
+           dwell_cycles,
+           (unsigned long long)osc_phase_preload,
+           n_steps,
+           step_index);
 }
 
 int main(int argc, char **argv) {
@@ -301,17 +320,20 @@ int main(int argc, char **argv) {
         print_json(base);
 
     } else if (strcmp(argv[2], "osc") == 0) {
-        if (argc != 5) {
+        if (argc != 6) {
             usage(argv[0]);
             munmap(map, (size_t)page_size);
             close(fd);
             return 1;
         }
-        uint32_t half_period   = (uint32_t)strtoul(argv[3], NULL, 0);
+        uint32_t dwell         = (uint32_t)strtoul(argv[3], NULL, 0);
         uint64_t phase_preload = (uint64_t)strtoull(argv[4], NULL, 0);
+        uint32_t n_steps       = (uint32_t)strtoul(argv[5], NULL, 0);
+        if (n_steps < 1u) n_steps = 1u;
         /* Write preload high word first for atomic FPGA latch */
         wr48u(base, REG_OSC_PHASE_PRELOAD_LO, REG_OSC_PHASE_PRELOAD_HI, phase_preload);
-        wr32(base, REG_OSC_HALF_PERIOD, half_period);
+        wr32(base, REG_DWELL_CYCLES, dwell);
+        wr32(base, REG_N_STEPS, n_steps);
         print_json(base);
 
     } else if (strcmp(argv[2], "preload") == 0) {
@@ -322,7 +344,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         /* Edge-lock phase offset: set only osc_phase_preload, leaving
-         * osc_half_period untouched (it is ignored unless osc_mode is on).
+         * dwell_cycles untouched (it is ignored unless osc_mode is on).
          * phase_acc reloads the preload on the RISING edge of edge_lock, so
          * the caller must re-arm (drop bit5, then write with bit5=1) to apply. */
         uint64_t phase_preload = (uint64_t)strtoull(argv[3], NULL, 0);

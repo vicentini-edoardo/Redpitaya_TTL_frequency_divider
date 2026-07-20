@@ -179,15 +179,17 @@ Base address: `0x40600000`
 | `0x00` | `control` | See bits below |
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0 = off) |
 | `0x08` | `width_n` / `mult_n` | Pulse width in clock cycles (pulse) or harmonic order 1..5 (harmonic) |
-| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
+| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active, bit 5=strobe_done |
 | `0x14` | `meas_span` | Clock cycles between first and last rising edge of last window |
 | `0x18` | `edge_cnt` | Rising-edge count from last window; f_in = CLK_HZ·(edge_cnt−1)/meas_span |
-| `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset |
+| `0x1C/0x20` | `phase_step_offset` | Signed 48-bit NCO frequency offset; in osc mode: per-step target increment (two's-complement of round(step_frac·2^48)) |
 | `0x24/0x28` | `phase_step_base` | Computed base step (read-only) |
 | `0x2C/0x30` | `phase_step` | Live `[N·]base + offset` (read-only) |
 | `0x34` | `meas_time_us` | Measurement window in µs (min 1000) |
-| `0x38` | `osc_half_period` | Clock ticks per half-oscillation (osc mode) |
-| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload (osc mode) |
+| `0x38` | `dwell_cycles` | Clock ticks per strobe point (osc mode; 32-bit → max ≈ 34.4 s/point) |
+| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload = start phase (osc/edge_lock) |
+| `0x44` | `n_steps` | Strobe points per scan (osc mode, ≥1) |
+| `0x48` | `step_index` | Current strobe point, 0-based (read-only) |
 
 ### control register bits
 
@@ -197,7 +199,7 @@ Base address: `0x40600000`
 | 1 | soft_reset | Self-clearing reset; clears the NCO and restarts measurement |
 | 2 | force_high | Override output HIGH regardless of NCO state (LASER ON) |
 | 3 | harmonic_mode | 0 = pulse mode, 1 = harmonic mode (set by binary name) |
-| 4 | osc_mode | Oscillating delay mode (phase sweep P0±P, pulse mode only) |
+| 4 | osc_mode | Stepped strobe scan: hold phase start+k·step for dwell_cycles, k=0..n_steps−1, then hold last phase (pulse mode only; re-arm by toggling the bit) |
 | 5 | edge_lock | Anchor NCO phase to input rising edges: f_out − [N·]f_in is exactly f_shift, beat coherent indefinitely |
 
 ---

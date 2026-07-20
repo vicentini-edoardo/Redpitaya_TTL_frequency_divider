@@ -20,7 +20,9 @@ from hardware_tests.redpitaya_picosdk_verify import (  # noqa: E402
     square_wave,
     write_debug_bundle,
 )
-from rp_math import DEFAULT_BASE, hz_to_phase, osc_phase_preload  # noqa: E402
+from rp_math import (  # noqa: E402
+    DEFAULT_BASE, hz_to_phase, phase_offset_to_preload, strobe_step_word,
+)
 
 
 class TestWaveformAnalysis(unittest.TestCase):
@@ -72,86 +74,75 @@ class TestWaveformAnalysis(unittest.TestCase):
         self.assertEqual(result.status, CheckStatus.FAIL)
         self.assertTrue(any("frequency" in msg for msg in result.messages))
 
-    def test_osc_delay_sinusoidal_fit_recovers_parameters(self):
-        # Ideal sinusoidal delay oscillation: fit should recover P0, P, f_osc.
-        import math as _math
-        f_in = 10_000.0
-        duration_s = 1.0
-        f_osc = 5.0
-        p0 = 0.25
-        p = 0.05
+    @staticmethod
+    def _staircase_edges(f_in, start, step, n_steps, dwell_s, duration_s,
+                         t_begin=0.0):
+        """Synthetic input/output edge trains for a stepped strobe scan.
+
+        t_begin < 0 models a capture that starts mid-scan (the scan began
+        |t_begin| seconds before the capture window).
+        """
         T_in = 1.0 / f_in
         input_edges = [k * T_in for k in range(int(duration_s * f_in))]
-        output_edges = [
-            t + (p0 + p * _math.cos(2 * _math.pi * f_osc * t)) * T_in
-            for t in input_edges
-        ]
+        output_edges = []
+        for t in input_edges:
+            k = max(0, min(int((t - t_begin) // dwell_s), n_steps - 1))
+            output_edges.append(t + ((start + k * step) % 1.0) * T_in)
+        return input_edges, output_edges
+
+    def test_strobe_scan_recovers_staircase(self):
+        f_in = 10_000.0
+        start, step, n_steps, dwell_s = 0.20, 0.05, 6, 0.15
+        input_edges, output_edges = self._staircase_edges(
+            f_in, start, step, n_steps, dwell_s, duration_s=1.0)
 
         result = analyze_osc_delay(
             input_rising_s=input_edges,
             output_rising_s=output_edges,
-            expectation=OscExpectation(f_osc_hz=f_osc, p_frac=p, p0_frac=p0),
+            expectation=OscExpectation(start_frac=start, step_frac=step,
+                                       n_steps=n_steps, dwell_s=dwell_s),
         )
 
         self.assertEqual(result.status, CheckStatus.PASS, result.messages)
-        self.assertAlmostEqual(result.metrics["delay_phase_center"], p0, delta=0.01)
-        self.assertAlmostEqual(result.metrics["delay_phase_amplitude"], p, delta=0.005)
-        self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.5)
-        self.assertEqual(result.metrics["delay_fit_nonlinear"], 1)
+        self.assertEqual(result.metrics["levels_observed"], n_steps)
+        self.assertLess(result.metrics["max_level_residual"], 0.005)
 
-    def test_osc_delay_triangle_wave_passes_within_amplitude_tolerance(self):
-        # Hardware generates a triangle-wave delay (phase_step_offset alternates
-        # sign). The sinusoidal fit underestimates the amplitude by 8/π² ≈ 0.81,
-        # but the error (< 0.01 for P=0.05) stays within osc_phase_abs_tol=0.025.
-        import math as _math
+    def test_strobe_scan_accepts_partial_capture(self):
+        # Capture covers only the middle of a long scan: a contiguous subset
+        # of levels must still pass.
         f_in = 10_000.0
-        duration_s = 1.0
-        f_osc = 5.0
-        p0 = 0.25
-        p = 0.05
-        T_in = 1.0 / f_in
-        input_edges = [k * T_in for k in range(int(duration_s * f_in))]
-        output_edges = [
-            t + (p0 + p * (2.0 * abs(2.0 * ((t * f_osc) % 1.0) - 1.0) - 1.0)) * T_in
-            for t in input_edges
-        ]
+        start, step, n_steps, dwell_s = 0.20, 0.05, 10, 0.25
+        input_edges, output_edges = self._staircase_edges(
+            f_in, start, step, n_steps, dwell_s, duration_s=1.0, t_begin=-0.6)
 
         result = analyze_osc_delay(
             input_rising_s=input_edges,
             output_rising_s=output_edges,
-            expectation=OscExpectation(f_osc_hz=f_osc, p_frac=p, p0_frac=p0),
+            expectation=OscExpectation(start_frac=start, step_frac=step,
+                                       n_steps=n_steps, dwell_s=dwell_s),
         )
 
         self.assertEqual(result.status, CheckStatus.PASS, result.messages)
-        self.assertAlmostEqual(result.metrics["delay_phase_center"], p0, delta=0.01)
-        self.assertAlmostEqual(result.metrics["delay_osc_hz"], f_osc, delta=0.5)
-        # Amplitude biased to ~0.81×P; must pass the hardware check (tol 0.025)
-        self.assertLess(abs(result.metrics["delay_phase_amplitude"] - p), 0.025)
+        self.assertGreaterEqual(result.metrics["levels_observed"], 3)
+        self.assertLess(result.metrics["levels_observed"], n_steps)
 
-    def test_osc_delay_fails_when_oscillation_rate_wrong(self):
-        # f_osc is 10× higher than commanded: the fit must detect the mismatch.
-        import math as _math
+    def test_strobe_scan_fails_when_phase_off_grid(self):
+        # Output held at a phase halfway between expected levels: the residual
+        # check must flag it.
         f_in = 10_000.0
-        duration_s = 1.0
-        f_osc_actual = 50.0
-        f_osc_expected = 5.0
-        p0 = 0.25
-        p = 0.05
         T_in = 1.0 / f_in
-        input_edges = [k * T_in for k in range(int(duration_s * f_in))]
-        output_edges = [
-            t + (p0 + p * _math.cos(2 * _math.pi * f_osc_actual * t)) * T_in
-            for t in input_edges
-        ]
+        input_edges = [k * T_in for k in range(10_000)]
+        output_edges = [t + 0.25 * T_in for t in input_edges]
 
         result = analyze_osc_delay(
             input_rising_s=input_edges,
             output_rising_s=output_edges,
-            expectation=OscExpectation(f_osc_hz=f_osc_expected, p_frac=p, p0_frac=p0),
+            expectation=OscExpectation(start_frac=0.20, step_frac=0.10,
+                                       n_steps=4, dwell_s=0.15),
         )
 
         self.assertEqual(result.status, CheckStatus.FAIL)
-        self.assertTrue(any("oscillation rate" in m for m in result.messages))
+        self.assertTrue(any("residual" in m for m in result.messages))
 
     def test_identity_passes_when_undersampled_with_nco_jitter(self):
         # Regression for the false "output frequency differs" FAIL on the
@@ -378,16 +369,18 @@ class TestCommandBuilder(unittest.TestCase):
 
     def test_builds_osc_sequence_like_gui(self):
         b = RedPitayaCommandBuilder(DEFAULT_BASE)
+        preload = phase_offset_to_preload(0.20)
+        step_word = strobe_step_word(0.05)
 
-        commands = b.osc_apply(width_cycles=12, half_period_cycles=1000,
-                               preload=osc_phase_preload(0.25, 0.05),
-                               shift_hz=20.0)
+        commands = b.osc_apply(width_cycles=12, dwell_cycles=25_000_000,
+                               preload=preload, step_word=step_word, n_steps=6)
 
-        self.assertEqual(commands[0][:3], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "osc"])
-        # osc bit cleared before the write so its rising edge re-arms the sweep
+        self.assertEqual(commands[0], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "osc",
+                                       "25000000", str(preload), "6"])
+        # osc bit cleared before the write so its rising edge re-arms the scan
         self.assertEqual(commands[1], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "control", "1"])
         self.assertEqual(commands[2], ["/root/rp_pulse_ctl", hex(DEFAULT_BASE), "write",
-                                       "12", str(hz_to_phase(20.0)), "17"])
+                                       "12", str(step_word), "17"])
 
 
 class TestDebugBundle(unittest.TestCase):

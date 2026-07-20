@@ -19,7 +19,7 @@ DEFAULT_BASE  = 0x40600000
 # control register bits
 CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
 CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
-CTRL_OSC_MODE   = 0x10   # bit 4 — oscillating delay mode
+CTRL_OSC_MODE   = 0x10   # bit 4 — stepped strobe scan
 CTRL_EDGE_LOCK  = 0x20   # bit 5 — anchor NCO phase to input edges
 # bit 3 (harmonic_mode) is enforced by the respective C helper
 
@@ -112,29 +112,26 @@ def fmt_dur(s: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Oscillating delay mode helpers
+# Stepped strobe mode helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def f_shift_from_f_osc(f_osc_hz: float, P_frac: float) -> float:
-    """NCO frequency shift derived from oscillation rate and phase amplitude."""
-    return 4.0 * f_osc_hz * P_frac
+def strobe_step_word(step_frac: float) -> int:
+    """Signed per-step increment for osc_target (phase_step_offset register).
+
+    Delay φ maps to target word (1 − φ)·2^48, so advancing the delay by
+    ``step_frac`` of the input period means *subtracting* round(step_frac·2^48)
+    from the target — the FPGA adds this word mod 2^48 at each dwell boundary.
+    Start phase itself comes from :func:`phase_offset_to_preload`.
+    """
+    return -int(round((step_frac % 1.0) * 2**PHASE_BITS))
 
 
-def f_osc_from_params(f_shift_hz: float, P_frac: float) -> float:
-    """Oscillation frequency from NCO f_shift and phase amplitude."""
-    return f_shift_hz / (4.0 * P_frac) if P_frac > 0 else 0.0
+def dwell_s_to_cycles(dwell_s: float) -> int:
+    """Dwell time per strobe point → 32-bit clock-tick count.
 
-
-def osc_half_period_cycles(P_frac: float, f_shift_hz: float) -> int:
-    """Clock ticks per half-oscillation (sweeps 2·P of phase at f_shift rate)."""
-    if f_shift_hz <= 0:
-        return 0
-    return round(2 * P_frac * CLK_HZ / f_shift_hz)
-
-
-def osc_phase_preload(P0_frac: float, P_frac: float) -> int:
-    """48-bit accumulator preload so the first output pulse has delay = P0 − P."""
-    return int((1.0 - (P0_frac - P_frac)) % 1.0 * 2**PHASE_BITS)
+    Clamped to [1, 2^32 − 1]: ceiling ≈ 34.4 s/point at 125 MHz.
+    """
+    return max(1, min(2**32 - 1, int(round(dwell_s * CLK_HZ))))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -33,11 +33,11 @@ from rp_math import (
     CTRL_OSC_MODE,
     DEFAULT_BASE,
     duty_to_cycles,
-    f_shift_from_f_osc,
+    dwell_s_to_cycles,
     hz_to_phase,
-    osc_half_period_cycles,
-    osc_phase_preload,
+    phase_offset_to_preload,
     phase_to_hz,
+    strobe_step_word,
     trig_hz_to_phase_step,
 )
 
@@ -63,7 +63,6 @@ class AnalysisConfig:
     freq_abs_tol_hz: float = 2.0
     duty_abs_tol: float = 0.05
     osc_phase_abs_tol: float = 0.025
-    osc_freq_rel_tol: float = 0.10
     # Strict frequency-match check (pulse mode, multiplier 1 only): the measured
     # output frequency must equal the FPGA-commanded frequency
     # (phase_to_hz(phase_step)). freq_match_abs_tol_hz is the statistical
@@ -90,9 +89,12 @@ class ConstantExpectation:
 
 @dataclass(frozen=True)
 class OscExpectation:
-    f_osc_hz: float
-    p_frac: float
-    p0_frac: float
+    """Stepped strobe scan: n_steps levels start_frac + k·step_frac, each held
+    for dwell_s seconds."""
+    start_frac: float
+    step_frac: float
+    n_steps: int
+    dwell_s: float
 
 
 Expectation = Union[PulseExpectation, ConstantExpectation, OscExpectation]
@@ -130,9 +132,10 @@ class HardwareTest:
     shift_hz: float = 0.0
     duty_frac: float = 0.50
     harmonic_n: int = 1
-    f_osc_hz: float = 0.0
-    p_frac: float = 0.0
-    p0_frac: float = 0.0
+    start_frac: float = 0.0
+    step_frac: float = 0.0
+    n_steps: int = 1
+    dwell_s: float = 0.0
     osc_sample_rate_hz: float = 0.0
 
 
@@ -169,16 +172,19 @@ class RedPitayaCommandBuilder:
     def osc_apply(
         self,
         width_cycles: int,
-        half_period_cycles: int,
+        dwell_cycles: int,
         preload: int,
-        shift_hz: float,
+        step_word: int,
+        n_steps: int,
     ) -> list[list[str]]:
         # Clear the osc bit before the write: the FPGA latches the preload and
-        # re-arms the sweep on the rising edge of osc_mode (matches the GUI).
+        # re-arms the scan on the rising edge of osc_mode (matches the GUI).
         return [
-            ["/root/rp_pulse_ctl", self.base, "osc", str(half_period_cycles), str(preload)],
+            ["/root/rp_pulse_ctl", self.base, "osc",
+             str(dwell_cycles), str(preload), str(n_steps)],
             ["/root/rp_pulse_ctl", self.base, "control", str(CTRL_ENABLE)],
-            self.pulse_write(width_cycles, shift_hz, CTRL_ENABLE | CTRL_OSC_MODE),
+            ["/root/rp_pulse_ctl", self.base, "write",
+             str(width_cycles), str(step_word), str(CTRL_ENABLE | CTRL_OSC_MODE)],
         ]
 
     def trig(self, freq_hz: float) -> list[str]:
@@ -601,29 +607,26 @@ def analyze_osc_delay(
     expectation: OscExpectation,
     cfg: AnalysisConfig | None = None,
 ) -> CheckResult:
-    """Verify oscillating-delay mode with a sinusoidal least-squares fit.
+    """Verify the stepped strobe scan (staircase delay).
 
-    Uses the coherent period estimator for T_in, wraps each detected output
-    edge into a fractional delay within [0, 1), rejects gross outliers, then
-    fits δ(t) = P·cos(2π·f_osc·t + φ) + offset via a frequency-grid linear
-    LS search followed by scipy.optimize.curve_fit nonlinear refinement.
-
-    The hardware generates a triangle-wave delay oscillation; a sinusoidal fit
-    underestimates the amplitude by factor 8/π² ≈ 0.81, which is within the
-    default osc_phase_abs_tol of 0.025 for P ≤ 0.15.
+    Wraps each detected output edge into a fractional delay within [0, 1)
+    against the last preceding input edge, assigns each sample to the nearest
+    expected level start + k·step (mod 1), and checks that:
+      - residuals from the assigned level stay within osc_phase_abs_tol,
+      - at least 3 expected levels (or all of them for short scans) are
+        observed, forming a contiguous ascending run — the capture window may
+        cover only part of a long single-shot scan,
+      - the assigned level index is non-decreasing over time (staircase order;
+        one transition sample per boundary is tolerated).
 
     Capture recommendation: use 25 MS/s (set osc_sample_rate_hz on the test)
-    so 80 ns output pulses are detected at ~100 % rate; 5 MHz gives only ~23 %
-    detection, which corrupts the phase time-series via timing quantisation.
+    so short output pulses are detected reliably.
     """
-    import numpy as np
-    from scipy.optimize import curve_fit
-
     cfg = cfg or AnalysisConfig()
     n_in, n_out = len(input_rising_s), len(output_rising_s)
     if n_in < cfg.min_edges or n_out < cfg.min_edges:
         return CheckResult("osc_delay", CheckStatus.FAIL,
-                           ["too few edges for oscillating-delay analysis"],
+                           ["too few edges for strobe-scan analysis"],
                            {"input_edges": n_in, "output_edges": n_out})
 
     # Accurate T_in from coherent estimator; fall back to median.
@@ -649,104 +652,58 @@ def analyze_osc_delay(
             times.append(out_t)
 
     n_matched = len(phases)
-    p0_exp = expectation.p0_frac
-    deltas_all = [_wrap_signed_unit(ph - p0_exp) for ph in phases]
-
-    # Outlier rejection: discard phases more than 4× the expected amplitude
-    # from the expected centre.  The 0.1 floor handles very small P values.
-    reject_lim = max(4.0 * expectation.p_frac, 4.0 * cfg.osc_phase_abs_tol, 0.1)
-    mask = [abs(d) <= reject_lim for d in deltas_all]
-    t_arr = np.array([t for t, m in zip(times, mask) if m])
-    d_arr = np.array([d for d, m in zip(deltas_all, mask) if m])
-    n_inlier = len(d_arr)
+    n = max(1, int(expectation.n_steps))
+    levels = [(expectation.start_frac + k * expectation.step_frac) % 1.0
+              for k in range(n)]
 
     base_metrics: dict[str, float | int] = {
         "input_period_s": T_in,
         "matched_edges": n_matched,
-        "inlier_edges": n_inlier,
-        "expected_delay_phase_center": p0_exp,
-        "expected_delay_phase_amplitude": expectation.p_frac,
-        "expected_delay_osc_hz": expectation.f_osc_hz,
+        "expected_start_frac": expectation.start_frac,
+        "expected_step_frac": expectation.step_frac,
+        "expected_n_steps": n,
+        "expected_dwell_s": expectation.dwell_s,
     }
-    if n_inlier < 16:
+    if n_matched < 16:
         return CheckResult("osc_delay", CheckStatus.FAIL,
-                           ["too few inlier edges after outlier rejection"],
+                           ["too few matched edges for strobe-scan analysis"],
                            base_metrics)
 
-    t0 = float(t_arr[0])
-    t_rel = t_arr - t0
-    f_lo = max(0.01, expectation.f_osc_hz * 0.1)
-    f_hi = expectation.f_osc_hz * 10.0
+    assigned: list[int] = []
+    residuals: list[float] = []
+    for ph in phases:
+        errs = [abs(_wrap_signed_unit(ph - lv)) for lv in levels]
+        k = min(range(n), key=errs.__getitem__)
+        assigned.append(k)
+        residuals.append(errs[k])
 
-    # Grid search: evaluate linear LS at candidate frequencies and keep the
-    # winner as the initial guess for nonlinear refinement.  Step ≤ 0.5 Hz
-    # keeps the grid tight enough for any ±10 % tolerance check.
-    n_grid = max(50, int(math.ceil((f_hi - f_lo) / 0.5)) + 1)
-    f_grid = np.linspace(f_lo, f_hi, n_grid).tolist()
-    if expectation.f_osc_hz not in f_grid:
-        f_grid.append(expectation.f_osc_hz)
-
-    best_rss = float("inf")
-    best_f = expectation.f_osc_hz
-    best_A = best_B = best_C = 0.0
-    for f_cand in f_grid:
-        omega_c = 2.0 * np.pi * f_cand
-        X_c = np.column_stack([np.cos(omega_c * t_rel),
-                                np.sin(omega_c * t_rel),
-                                np.ones(n_inlier)])
-        co, _, _, _ = np.linalg.lstsq(X_c, d_arr, rcond=None)
-        rss_c = float(np.sum((d_arr - X_c @ co) ** 2))
-        if rss_c < best_rss:
-            best_rss, best_f = rss_c, f_cand
-            best_A, best_B, best_C = co
-
-    amp_init = math.sqrt(best_A ** 2 + best_B ** 2)
-    phi_init = math.atan2(-best_B, best_A) if amp_init > 0 else 0.0
-
-    # Nonlinear refinement: allow f_osc to move within [f_lo, f_hi].
-    def _sinusoid(t: Any, amp: float, f_hz: float, phi: float, offset: float) -> Any:
-        return amp * np.cos(2.0 * np.pi * f_hz * t + phi) + offset
-
-    amp_fit, f_osc_fit, phi_fit, offset_fit = amp_init, best_f, phi_init, best_C
-    fit_nonlinear = False
-    try:
-        popt, _ = curve_fit(
-            _sinusoid, t_rel, d_arr,
-            p0=[max(amp_init, 1e-4), best_f, phi_init, best_C],
-            bounds=([0.0, f_lo, -math.pi, -0.5], [0.5, f_hi, math.pi, 0.5]),
-            maxfev=5000,
-        )
-        amp_fit, f_osc_fit, phi_fit, offset_fit = popt
-        fit_nonlinear = True
-    except Exception:
-        pass  # keep grid winner as fall-back
-
-    fitted = _sinusoid(t_rel, amp_fit, f_osc_fit, phi_fit, offset_fit)
-    rms = float(np.sqrt(np.mean((d_arr - fitted) ** 2)))
-    center_fit = (p0_exp + float(offset_fit)) % 1.0
+    max_residual = max(residuals)
+    seen = sorted(set(assigned))
+    # Level order over time: count backward jumps, ignoring single transition
+    # samples at boundaries (the new target is picked up at the next edge).
+    backward = sum(1 for a, b in zip(assigned, assigned[1:]) if b < a)
 
     metrics: dict[str, float | int] = {
         **base_metrics,
-        "delay_phase_center": center_fit,
-        "delay_phase_amplitude": float(amp_fit),
-        "delay_osc_hz": float(f_osc_fit),
-        "delay_fit_residual_rms": rms,
-        "delay_fit_nonlinear": int(fit_nonlinear),
+        "levels_observed": len(seen),
+        "max_level_residual": max_residual,
+        "backward_level_jumps": backward,
     }
 
     messages: list[str] = []
-    if abs(amp_fit - expectation.p_frac) > cfg.osc_phase_abs_tol:
+    if max_residual > cfg.osc_phase_abs_tol:
         messages.append(
-            f"delay amplitude {amp_fit:.5f} differs from expected {expectation.p_frac:.5f}")
-    center_err = abs(_wrap_signed_unit(center_fit - p0_exp))
-    if center_err > cfg.osc_phase_abs_tol:
+            f"delay residual {max_residual:.5f} from nearest expected level "
+            f"exceeds tolerance {cfg.osc_phase_abs_tol:.5f}")
+    min_levels = min(3, n)
+    if len(seen) < min_levels:
         messages.append(
-            f"delay center {center_fit:.5f} differs from expected {p0_exp:.5f}")
-    rate_tol = max(0.5, expectation.f_osc_hz * cfg.osc_freq_rel_tol)
-    metrics["delay_osc_tolerance_hz"] = rate_tol
-    if abs(f_osc_fit - expectation.f_osc_hz) > rate_tol:
+            f"only {len(seen)} of {n} expected levels observed (need >= {min_levels})")
+    if seen != list(range(seen[0], seen[0] + len(seen))):
+        messages.append(f"observed levels {seen} are not a contiguous run")
+    if backward > len(seen):
         messages.append(
-            f"delay oscillation rate {f_osc_fit:.5f} Hz differs from expected {expectation.f_osc_hz:.5f} Hz")
+            f"{backward} backward level jumps — staircase order violated")
 
     return CheckResult("osc_delay", CheckStatus.FAIL if messages else CheckStatus.PASS,
                        messages, metrics)
@@ -947,13 +904,16 @@ def build_default_suite(include_dio2: bool = False, dio2_hz: float = 1_000.0) ->
         HardwareTest("harmonic_2x", "harmonic", PulseExpectation(2, 0.0, 0.50), capture_seconds=0.10, harmonic_n=2),
         HardwareTest("harmonic_3x_plus_10hz", "harmonic", PulseExpectation(3, 10.0, 0.50), capture_seconds=0.20, shift_hz=10.0, harmonic_n=3),
         HardwareTest(
-            "osc_delay_5hz_p5pct_p0_25pct",
+            "strobe_6x5pct_from_20pct",
             "osc",
-            OscExpectation(f_osc_hz=5.0, p_frac=0.05, p0_frac=0.25),
+            OscExpectation(start_frac=0.20, step_frac=0.05, n_steps=6, dwell_s=0.30),
+            # Single-shot scan spans 1.8 s; settle (0.25 s) + 1 s capture sees a
+            # contiguous run of levels — the analysis accepts a partial scan.
             capture_seconds=1.00,
-            f_osc_hz=5.0,
-            p_frac=0.05,
-            p0_frac=0.25,
+            start_frac=0.20,
+            step_frac=0.05,
+            n_steps=6,
+            dwell_s=0.30,
             duty_frac=0.02,
             # 25 MS/s gives 40 ns/sample: 80 ns output pulses are ~2 samples
             # wide → ~100 % detection vs ~23 % at 5 MS/s.
@@ -993,11 +953,12 @@ def configure_test(
     if test.mode == "harmonic":
         return rp.run(builder.harmonic_write(test.harmonic_n, test.shift_hz))
     if test.mode == "osc":
-        shift_hz = f_shift_from_f_osc(test.f_osc_hz, test.p_frac)
-        half_period = osc_half_period_cycles(test.p_frac, shift_hz)
-        preload = osc_phase_preload(test.p0_frac, test.p_frac)
+        dwell_cycles = dwell_s_to_cycles(test.dwell_s)
+        preload = phase_offset_to_preload(test.start_frac)
+        step_word = strobe_step_word(test.step_frac)
         status: dict[str, Any] = {}
-        for command in builder.osc_apply(width_cycles, half_period, preload, shift_hz):
+        for command in builder.osc_apply(width_cycles, dwell_cycles, preload,
+                                         step_word, test.n_steps):
             status = rp.run(command)
         return status
     if test.mode == "dio2":

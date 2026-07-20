@@ -98,7 +98,7 @@ class TestConfirmedStateContract(unittest.TestCase):
                 "phase_step_base": gui.hz_to_phase(1_000_000.0),
                 "phase_step": gui.hz_to_phase(999_963.0),
                 "width": 62,
-                "osc_half_period": 0,
+                "dwell_cycles": 0,
                 "osc_phase_preload": 123,
             },
             connected=True,
@@ -124,9 +124,8 @@ class TestConfirmedStateContract(unittest.TestCase):
         period_cycles = (1 << gui.PHASE_BITS) // gui.hz_to_phase(1_000_000.0)
         self.assertAlmostEqual(state["duty_cycle_pct"], 100.0 * 62 / period_cycles)
 
-    def test_osc_state_uses_confirmed_oscillation_period_for_expected_peak(self):
-        expected_hz = 123.0
-        half_period = round(gui.CLK_HZ / (2.0 * expected_hz))
+    def test_osc_state_reports_strobe_scan_fields(self):
+        dwell_cycles = round(0.1 * gui.CLK_HZ)
 
         state = gui._confirmed_state(
             {
@@ -135,10 +134,13 @@ class TestConfirmedStateContract(unittest.TestCase):
                 "osc_mode": 1,
                 "period_stable": 1,
                 "trig_phase_step": gui.trig_hz_to_phase_step(500.0),
-                "phase_step_offset": gui.hz_to_phase(20.0),
+                "phase_step_offset": gui.strobe_step_word(0.05),
                 "phase_step_base": gui.hz_to_phase(1_000_000.0),
-                "phase_step": gui.hz_to_phase(1_000_020.0),
-                "osc_half_period": half_period,
+                "phase_step": gui.hz_to_phase(1_000_000.0),
+                "dwell_cycles": dwell_cycles,
+                "n_steps": 10,
+                "step_index": 3,
+                "strobe_done": 0,
             },
             connected=True,
             sequence=1,
@@ -146,9 +148,12 @@ class TestConfirmedStateContract(unittest.TestCase):
         )
 
         self.assertEqual(state["mode"], "osc")
-        self.assertAlmostEqual(
-            state["expected_peak_hz"], gui.CLK_HZ / (2.0 * half_period)
-        )
+        # constant phase per point: no beat peak in osc mode
+        self.assertEqual(state["expected_peak_hz"], 0.0)
+        self.assertEqual(state["dwell_cycles"], dwell_cycles)
+        self.assertEqual(state["n_steps"], 10)
+        self.assertEqual(state["step_index"], 3)
+        self.assertFalse(state["strobe_done"])
 
     def test_disconnected_state_is_not_hardware_confirmed(self):
         state = gui._confirmed_state(None, connected=False, sequence=2, now=5.0)

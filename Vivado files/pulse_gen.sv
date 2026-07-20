@@ -50,18 +50,25 @@
 //       each output pulse inherits the timing of one input edge (source
 //       jitter + one-clock synchronizer quantization).
 //
-//     Oscillating delay mode (osc_mode = 1, pulse mode only):
-//       The sign of phase_step_offset alternates every osc_half_period
-//       ticks, so the output pulse delay relative to the input sweeps a
-//       triangle wave P0-P → P0+P → P0-P at rate f_shift / (4·P).
-//       A separate register (osc_target) integrates only the ±offset part
-//       of the step; on every synchronized input rising edge phase_acc is
-//       re-anchored to osc_target. Each pulse therefore fires
+//     Stepped strobe mode (osc_mode = 1, pulse mode only):
+//       Single-shot stepped delay scan for stroboscopic sampling of a
+//       fraction of the input period. The output pulse is held at a
+//       constant phase relative to the input edge for dwell_cycles clock
+//       ticks, then the phase advances by one step; after n_steps points
+//       strobe_done asserts and the last phase is held until re-armed.
+//       Phase hold uses the edge-lock mechanism with a zero effective
+//       offset: osc_target stays constant and phase_acc snaps to it on
+//       every accepted input rising edge, so each pulse fires
 //       (2^48 - osc_target) / phase_step_base clock ticks after the
-//       physical input edge: the reciprocal-counter quantization error
-//       (up to f_clk / (2·window_cycles) Hz) cannot accumulate into a
-//       phase drift, and P0 / P are true phases referenced to the input
-//       edge instead of the arbitrary instant freerun started.
+//       physical input edge. A step is a single mod-2^48 add of
+//       phase_step_offset to osc_target (software passes the
+//       two's-complement of round(step_frac * 2^48), since delay phi maps
+//       to target word (1 - phi) * 2^48). phase_acc is not stepped
+//       directly — it picks up the new target at the next anchor edge, so
+//       every emitted phase stays strictly edge-referenced.
+//       Start phase comes from osc_phase_preload; dwell counting starts
+//       at the first accepted edge after lock (osc_run). Re-arm by
+//       toggling osc_mode 0 → 1 (preload latches on the rising edge).
 //       (The 2-FF trigger synchronizer plus output register add a fixed
 //       ~4-clock latency — a constant, calibratable delay offset.)
 //
@@ -86,8 +93,9 @@ module pulse_gen
 
   input  logic signed [47:0] phase_step_offset,
 
-  input  logic [31:0] osc_half_period,    // clock ticks per half-oscillation
-  input  logic [47:0] osc_phase_preload,  // accumulator preload for delay = P0 - P
+  input  logic [31:0] dwell_cycles,       // clock ticks per strobe point
+  input  logic [47:0] osc_phase_preload,  // accumulator preload = start phase
+  input  logic [31:0] n_steps,            // strobe points per scan (>=1)
 
   input  logic [47:0] trig_phase_step,   // DIO2 free-running square wave: 48-bit NCO step (0=off)
 
@@ -105,7 +113,10 @@ module pulse_gen
 
   output logic        freerun_active,
   output logic signed [47:0] phase_step_base,
-  output logic signed [47:0] phase_step
+  output logic signed [47:0] phase_step,
+
+  output logic [31:0] step_index,      // current strobe point (0-based)
+  output logic        strobe_done      // scan complete, last phase held
 );
 
   // Actual measured clock: 124,999,999 Hz.
@@ -355,7 +366,8 @@ module pulse_gen
   // Pulse mode:    phase_step = phase_step_base + phase_step_offset
   // Harmonic mode: phase_step = mult_n * phase_step_base + phase_step_offset
   //   mult_n = width_n[2:0] clamped to [1..5]
-  // Osc mode:      phase_step_offset sign alternates every osc_half_period ticks
+  // Osc mode:      zero effective offset (constant phase between steps);
+  //                phase_step_offset is instead the per-step target increment
   // ----------------------------------------------------------------
   logic [2:0] mult_n_raw;
   logic [2:0] mult_n_safe;
@@ -368,12 +380,8 @@ module pulse_gen
       (51'(phase_step_base[47:0])) * (51'(mult_n_safe)) :
       51'(phase_step_base[47:0]);
 
-  // osc_sign=0: subtract offset (f_out < f_in → phase delay grows toward P0+P)
-  // osc_sign=1: add offset    (f_out > f_in → phase delay shrinks toward P0-P)
-  logic osc_sign;
   logic signed [47:0] phase_step_eff;
-  assign phase_step_eff = osc_mode ? (osc_sign ? phase_step_offset : -phase_step_offset)
-                                   : phase_step_offset;
+  assign phase_step_eff = osc_mode ? 48'sd0 : phase_step_offset;
   assign phase_step = $signed(mult_step[47:0]) + phase_step_eff;
 
   logic [47:0] phase_acc;
@@ -386,7 +394,7 @@ module pulse_gen
   //
   // Edge-locked operation (lock_en = osc_mode | edge_lock):
   //   osc_target integrates only the phase_step_offset part of the step
-  //   (with alternating sign in osc mode — the triangle sweep). On every
+  //   (zero in osc mode — constant phase between strobe steps). On every
   //   accepted input rising edge (anchor_rise) phase_acc is re-anchored
   //   to osc_target, so the output phase is referenced to the physical
   //   input edge and the measured-vs-actual f_in mismatch is cleared
@@ -400,16 +408,16 @@ module pulse_gen
   // On lock enable the accumulator and target are preloaded and the NCO
   // is held (osc_run = 0) until the first input rising edge, so the
   // phase trajectory starts anchored to the input (osc mode: first pulse
-  // at delay P0 - P). Without the hold, the pulses emitted between the
-  // (arbitrary) preload instant and the first edge would sit at a random
-  // phase.
+  // at the start phase). Without the hold, the pulses emitted between
+  // the (arbitrary) preload instant and the first edge would sit at a
+  // random phase.
   //
-  // Osc mode additionally alternates the offset sign every
-  // osc_half_period ticks, sweeping output phase P0-P → P0+P → P0-P at
-  // rate f_shift / (4·P).
+  // Osc mode steps osc_target by phase_step_offset every dwell_cycles
+  // ticks; after n_steps points strobe_done latches and the last phase
+  // is held until osc_mode is toggled 0 → 1 (re-arm).
   // ----------------------------------------------------------------
   logic        lock_en;
-  logic [31:0] osc_counter;
+  logic [31:0] dwell_cnt;
   logic        lock_en_prev;
   logic        osc_mode_prev;
   logic        osc_run;          // 0 = preloaded, waiting for anchoring edge
@@ -423,8 +431,9 @@ module pulse_gen
     if (!rstn) begin
       freerun_active <= 1'b0;
       phase_acc      <= 48'd0;
-      osc_counter    <= 32'd0;
-      osc_sign       <= 1'b0;
+      dwell_cnt      <= 32'd0;
+      step_index     <= 32'd0;
+      strobe_done    <= 1'b0;
       lock_en_prev   <= 1'b0;
       osc_mode_prev  <= 1'b0;
       osc_run        <= 1'b0;
@@ -435,8 +444,9 @@ module pulse_gen
       if (soft_reset || !enable) begin
         freerun_active <= 1'b0;
         phase_acc      <= 48'd0;
-        osc_counter    <= 32'd0;
-        osc_sign       <= 1'b0;
+        dwell_cnt      <= 32'd0;
+        step_index     <= 32'd0;
+        strobe_done    <= 1'b0;
         osc_run        <= 1'b0;
         osc_target     <= 48'd0;
       end else if (!freerun_active) begin
@@ -445,8 +455,9 @@ module pulse_gen
           if (lock_en) begin
             phase_acc   <= osc_phase_preload;
             osc_target  <= osc_phase_preload;
-            osc_counter <= 32'd0;
-            osc_sign    <= 1'b0;
+            dwell_cnt   <= 32'd0;
+            step_index  <= 32'd0;
+            strobe_done <= 1'b0;
             osc_run     <= 1'b0;
           end
         end
@@ -454,19 +465,21 @@ module pulse_gen
         // freerun active
         if ((lock_en && !lock_en_prev) || (osc_mode && !osc_mode_prev)) begin
           // entering a locked mode (or switching edge_lock → osc):
-          // preload accumulator, reset oscillation, re-arm
+          // preload accumulator, reset the scan, re-arm
           phase_acc   <= osc_phase_preload;
           osc_target  <= osc_phase_preload;
-          osc_counter <= 32'd0;
-          osc_sign    <= 1'b0;
+          dwell_cnt   <= 32'd0;
+          step_index  <= 32'd0;
+          strobe_done <= 1'b0;
           osc_run     <= 1'b0;
         end else if (lock_en && !osc_run) begin
           // armed: hold the preload until the first accepted input rising
           // edge so the phase trajectory starts anchored to the input
           phase_acc   <= osc_phase_preload;
           osc_target  <= osc_phase_preload;
-          osc_counter <= 32'd0;
-          osc_sign    <= 1'b0;
+          dwell_cnt   <= 32'd0;
+          step_index  <= 32'd0;
+          strobe_done <= 1'b0;
           if (anchor_rise)
             osc_run <= 1'b1;
         end else begin
@@ -475,23 +488,29 @@ module pulse_gen
           phase_acc <= (lock_en && anchor_rise) ? osc_target_next
                                                 : acc_sum[47:0];
           if (lock_en) begin
-            osc_target <= osc_target_next;
             if (osc_mode) begin
-              if (osc_half_period > 32'd0 &&
-                  osc_counter >= osc_half_period - 32'd1) begin
-                osc_counter <= 32'd0;
-                osc_sign    <= ~osc_sign;
-              end else begin
-                osc_counter <= osc_counter + 32'd1;
+              // stepped strobe: hold phase for dwell_cycles, then step
+              if (!strobe_done && dwell_cycles != 32'd0 &&
+                  dwell_cnt >= dwell_cycles - 32'd1) begin
+                dwell_cnt <= 32'd0;
+                if (step_index + 32'd1 >= n_steps) begin
+                  strobe_done <= 1'b1;   // hold last phase until re-arm
+                end else begin
+                  step_index <= step_index + 32'd1;
+                  osc_target <= osc_target + phase_step_offset[47:0];
+                end
+              end else if (!strobe_done) begin
+                dwell_cnt <= dwell_cnt + 32'd1;
               end
             end else begin
-              // plain edge_lock: constant offset sign, no triangle
-              osc_counter <= 32'd0;
-              osc_sign    <= 1'b0;
+              // plain edge_lock: target integrates the offset each clock
+              osc_target <= osc_target_next;
+              dwell_cnt  <= 32'd0;
             end
           end else begin
-            osc_counter <= 32'd0;
-            osc_sign    <= 1'b0;
+            dwell_cnt   <= 32'd0;
+            step_index  <= 32'd0;
+            strobe_done <= 1'b0;
             osc_run     <= 1'b0;
             osc_target  <= 48'd0;
           end

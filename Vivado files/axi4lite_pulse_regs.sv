@@ -7,14 +7,14 @@
 // Register map (byte offset / 32-bit word):
 //   0x00 RW  control:  [0] enable, [1] soft_reset (self-clearing, reads 0),
 //                      [2] force_high (output forced to 1), [3] harmonic_mode,
-//                      [4] osc_mode (oscillating delay),
+//                      [4] osc_mode (stepped strobe scan),
 //                      [5] edge_lock (anchor NCO phase to input edges)
 //   0x04 RW  trig_phase_step_lo: bits [31:0] of DIO2 48-bit NCO step (0=off)
 //   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
 //                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
 //   0x0C RW  trig_phase_step_hi: bits [47:32] of DIO2 48-bit NCO step
 //   0x10 RO  status:   [0] busy, [1] period_valid, [2] period_stable, [3] timeout,
-//                      [4] freerun_active
+//                      [4] freerun_active, [5] strobe_done
 //                      (bit order matches the rdata concat below: see 5'd4 read)
 //   0x14 RO  meas_span       (clock cycles between first and last rising edge of last window)
 //   0x18 RO  edge_cnt_out    (rising-edge count from last window; f_in = CLK_HZ * (val-1) / meas_span)
@@ -25,9 +25,14 @@
 //   0x2C RO  phase_step_lo          bits [31:0]  of live phase_step
 //   0x30 RO  phase_step_hi          bits [47:32] of live phase_step (in [15:0])
 //   0x34 RW  meas_time_us: [31:0] measurement window duration in microseconds
-//   0x38 RW  osc_half_period: [31:0] clock ticks per half-oscillation
+//   0x38 RW  dwell_cycles: [31:0] clock ticks per strobe point (osc mode)
 //   0x3C RW  osc_phase_preload_lo: bits [31:0]  of 48-bit accumulator preload
 //   0x40 RW  osc_phase_preload_hi: bits [47:32] of 48-bit accumulator preload (in [15:0])
+//   0x44 RW  n_steps:    [31:0] strobe points per scan (osc mode, >=1)
+//   0x48 RO  step_index: [31:0] current strobe point (0-based)
+//
+//   In osc mode phase_step_offset (0x1C/0x20) is repurposed as the per-step
+//   target increment: two's-complement of round(step_frac * 2^48).
 //
 // AXI4-Lite write handshake:
 //   aw_seen / w_seen track independent acceptance of AW and W channels.
@@ -82,8 +87,9 @@ module axi4lite_pulse_regs
   output logic [31:0] width_n,           // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
   output logic [31:0] meas_time_us,
   output logic signed [47:0] phase_step_offset,
-  output logic [31:0] osc_half_period,
+  output logic [31:0] dwell_cycles,
   output logic [47:0] osc_phase_preload,
+  output logic [31:0] n_steps,
 
   // Status inputs <- pulse_gen
   input  logic        pulse_busy,
@@ -94,7 +100,9 @@ module axi4lite_pulse_regs
   input  logic        timeout_flag,
   input  logic        freerun_active,
   input  logic signed [47:0] phase_step_base,
-  input  logic signed [47:0] phase_step
+  input  logic signed [47:0] phase_step,
+  input  logic [31:0] step_index,
+  input  logic        strobe_done
 );
 
   logic [31:0] reg_control;
@@ -104,9 +112,10 @@ module axi4lite_pulse_regs
   logic [31:0] reg_meas_time_us;
   logic [31:0] reg_phase_step_offset_lo;
   logic [15:0] reg_phase_step_offset_hi;
-  logic [31:0] reg_osc_half_period;
+  logic [31:0] reg_dwell_cycles;
   logic [31:0] reg_osc_phase_preload_lo;
   logic [15:0] reg_osc_phase_preload_hi;
+  logic [31:0] reg_n_steps;
 
   // Committed 48-bit values presented to pulse_gen (updated atomically one
   // cycle after the LO word of the pair is written).
@@ -140,8 +149,9 @@ module axi4lite_pulse_regs
   assign width_n           = reg_width_n;
   assign meas_time_us      = reg_meas_time_us;
   assign phase_step_offset = $signed(phase_step_offset_q);
-  assign osc_half_period   = reg_osc_half_period;
+  assign dwell_cycles      = reg_dwell_cycles;
   assign osc_phase_preload = osc_phase_preload_q;
+  assign n_steps           = reg_n_steps;
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
@@ -152,9 +162,10 @@ module axi4lite_pulse_regs
       reg_meas_time_us          <= 32'd100_000;  // Default: 100 ms
       reg_phase_step_offset_lo  <= 32'h00000000;
       reg_phase_step_offset_hi  <= 16'h0000;
-      reg_osc_half_period       <= 32'd0;
+      reg_dwell_cycles          <= 32'd0;
       reg_osc_phase_preload_lo  <= 32'h00000000;
       reg_osc_phase_preload_hi  <= 16'h0000;
+      reg_n_steps               <= 32'd1;
 
       trig_phase_step_q         <= 48'd0;
       phase_step_offset_q       <= 48'd0;
@@ -260,11 +271,11 @@ module axi4lite_pulse_regs
             if (wstrb_latched[3]) reg_meas_time_us[31:24] <= wdata_latched[31:24];
           end
 
-          5'd14: begin  // 0x38 osc_half_period
-            if (wstrb_latched[0]) reg_osc_half_period[ 7: 0] <= wdata_latched[ 7: 0];
-            if (wstrb_latched[1]) reg_osc_half_period[15: 8] <= wdata_latched[15: 8];
-            if (wstrb_latched[2]) reg_osc_half_period[23:16] <= wdata_latched[23:16];
-            if (wstrb_latched[3]) reg_osc_half_period[31:24] <= wdata_latched[31:24];
+          5'd14: begin  // 0x38 dwell_cycles
+            if (wstrb_latched[0]) reg_dwell_cycles[ 7: 0] <= wdata_latched[ 7: 0];
+            if (wstrb_latched[1]) reg_dwell_cycles[15: 8] <= wdata_latched[15: 8];
+            if (wstrb_latched[2]) reg_dwell_cycles[23:16] <= wdata_latched[23:16];
+            if (wstrb_latched[3]) reg_dwell_cycles[31:24] <= wdata_latched[31:24];
           end
 
           5'd15: begin  // 0x3C osc_phase_preload_lo
@@ -279,6 +290,15 @@ module axi4lite_pulse_regs
             if (wstrb_latched[0]) reg_osc_phase_preload_hi[ 7:0] <= wdata_latched[ 7:0];
             if (wstrb_latched[1]) reg_osc_phase_preload_hi[15:8] <= wdata_latched[15:8];
           end
+
+          5'd17: begin  // 0x44 n_steps
+            if (wstrb_latched[0]) reg_n_steps[ 7: 0] <= wdata_latched[ 7: 0];
+            if (wstrb_latched[1]) reg_n_steps[15: 8] <= wdata_latched[15: 8];
+            if (wstrb_latched[2]) reg_n_steps[23:16] <= wdata_latched[23:16];
+            if (wstrb_latched[3]) reg_n_steps[31:24] <= wdata_latched[31:24];
+          end
+
+          // 5'd18 (step_index): read-only
 
           default: begin end
         endcase
@@ -298,7 +318,7 @@ module axi4lite_pulse_regs
           5'd1:  s_axi_rdata <= reg_trig_phase_step_lo;
           5'd2:  s_axi_rdata <= reg_width_n;
           5'd3:  s_axi_rdata <= {16'd0, reg_trig_phase_step_hi};
-          5'd4:  s_axi_rdata <= {27'd0, freerun_active, timeout_flag,
+          5'd4:  s_axi_rdata <= {26'd0, strobe_done, freerun_active, timeout_flag,
                                          period_stable, period_valid, pulse_busy};
           5'd5:  s_axi_rdata <= meas_span;
           5'd6:  s_axi_rdata <= edge_cnt_out;
@@ -309,9 +329,11 @@ module axi4lite_pulse_regs
           5'd11: s_axi_rdata <= phase_step[31:0];
           5'd12: s_axi_rdata <= {16'd0, phase_step[47:32]};
           5'd13: s_axi_rdata <= reg_meas_time_us;
-          5'd14: s_axi_rdata <= reg_osc_half_period;
+          5'd14: s_axi_rdata <= reg_dwell_cycles;
           5'd15: s_axi_rdata <= reg_osc_phase_preload_lo;
           5'd16: s_axi_rdata <= {16'd0, reg_osc_phase_preload_hi};
+          5'd17: s_axi_rdata <= reg_n_steps;
+          5'd18: s_axi_rdata <= step_index;
           default: s_axi_rdata <= 32'h00000000;
         endcase
         s_axi_rvalid <= 1'b1;
