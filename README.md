@@ -204,10 +204,12 @@ Base address: `0x40600000`
 | 7:6 | edge_lock_response | `00` Hard snap; `01` Fast (1/16); `10` Balanced (1/64, default); `11` Smooth (1/256) |
 
 With edge lock enabled, Hard snaps to each anchor. Pulse and Harmonic Fast,
-Balanced, and Smooth modes instead consume the shortest signed phase error
-gradually; each correction is capped below the nominal positive step so phase
-remains monotonic. Pulse carry uses the corrected sum. Stepped strobe mode
-always hard-anchors, regardless of the response setting.
+Balanced, and Smooth values are nominal maximum correction fractions of one
+input cycle per input period, not settling fractions. Those modes consume the
+shortest signed phase error gradually; each correction is capped below the
+nominal positive step so phase remains monotonic. Pulse carry uses the
+corrected sum. Stepped strobe mode always hard-anchors, regardless of the
+response setting.
 Harmonic output follows corrected `phase_acc[47]` continuously, so gradual
 correction does not directly snap the square-wave output.
 

@@ -112,15 +112,17 @@ which the C helper sets/clears based on its invocation name.
 | `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode, bit 5=edge_lock, bits 7:6=edge-lock response |
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0=off) |
 | `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
-| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
+| `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active, bit 5=strobe_done |
 | `0x14` | `meas_span` | clock cycles between first and last rising edge of last window |
 | `0x18` | `edge_cnt` | rising-edge count from last window; f_in = CLK_HZ·(edge_cnt−1)/meas_span |
 | `0x1C/0x20` | `phase_step_offset` | signed 48-bit NCO frequency offset |
 | `0x24/0x28` | `phase_step_base` | computed base step (read-only) |
 | `0x2C/0x30` | `phase_step` | live `[N·]base + offset` (read-only) |
 | `0x34` | `meas_time_us` | measurement window in µs (min 1000) |
-| `0x38` | `osc_half_period` | clock ticks per half-oscillation (osc mode) |
-| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload (osc mode) |
+| `0x38` | `dwell_cycles` | clock ticks per strobe point (osc mode) |
+| `0x3C/0x40` | `osc_phase_preload` | 48-bit accumulator preload (osc/edge_lock) |
+| `0x44` | `n_steps` | strobe points per scan (osc mode, ≥1) |
+| `0x48` | `step_index` | current strobe point, 0-based (read-only) |
 
 48-bit register pairs latch atomically into the datapath one cycle after the
 **low** word is written (the helper writes high first, then low). `write` no
@@ -131,10 +133,12 @@ The authoritative `status` bit order is the rdata concatenation in
 
 Edge-lock response bits `[7:6]` map exactly to `00` Hard snap, `01` Fast
 (1/16), `10` Balanced (1/64, default), and `11` Smooth (1/256). Hard snaps
-at accepted anchors. In Pulse and Harmonic gradual modes, the NCO consumes the
-shortest signed phase error without snapping; correction is capped below the
-nominal positive step to keep phase monotonic, and Pulse carry uses the
-corrected sum. Stepped strobe mode always hard-anchors.
+at accepted anchors; the gradual figures are nominal maximum correction
+fractions of one input cycle per input period, not settling fractions. In
+Pulse and Harmonic gradual modes, the NCO consumes the shortest signed phase
+error without snapping; correction is capped below the nominal positive step
+to keep phase monotonic, and Pulse carry uses the corrected sum. Stepped strobe
+mode always hard-anchors.
 Harmonic output follows corrected `phase_acc[47]` continuously, so gradual
 correction does not directly snap the square-wave output.
 
@@ -149,7 +153,7 @@ One binary, two symlink names; mode detected from `argv[0]`:
 
 Subcommands (both modes): `read`, `write`, `control <value>`, `window <us>`,
 `trig <phase_step>`, `preload <word>`, `soft_reset`. (`preload` sets only
-`osc_phase_preload` — the edge-lock phase offset — leaving `osc_half_period`; the
+`osc_phase_preload` — the edge-lock phase offset — leaving `dwell_cycles`; the
 GUI re-arms `edge_lock` off→on so the new phase latches.) Every subcommand prints one JSON object on stdout
 that the GUI treats as the source of truth. 48-bit NCO values are split across two AXI
 words; the helper writes the high word first for atomic latching.
