@@ -584,15 +584,16 @@ module pulse_gen
   // ----------------------------------------------------------------
   // Output generation
   //
-  // Harmonic mode: phase_acc[47] gives exact 50% duty square wave.
+  // Harmonic mode: phase_acc[47] gives exact 50% duty square wave after
+  //                locked acquisition; the held preload is not exposed.
   // Pulse mode:    NCO carry-out triggers width_n-cycle pulse; gradual
   //                edge-lock responses use the corrected continuous sum.
   // ----------------------------------------------------------------
   logic [31:0] width_cnt;
   logic        nco_tick;
 
-  // In locked modes no pulses are emitted until the first input edge has
-  // anchored the phase trajectory (osc_run).
+  // In locked modes both carry pulses and harmonic output stay low until the
+  // first input edge has anchored the phase trajectory (osc_run).
   assign nco_tick = (gradual_lock ? corrected_acc_sum[48] : acc_sum[48]) &
                     freerun_active & (~lock_en | osc_run);
   assign busy     = freerun_active;
@@ -602,7 +603,7 @@ module pulse_gen
       pulse_out <= 1'b0;
       width_cnt <= 32'd0;
     end else if (harmonic_mode) begin
-      pulse_out <= phase_acc[47];
+      pulse_out <= (lock_en && !osc_run) ? 1'b0 : phase_acc[47];
       width_cnt <= 32'd0;
     end else begin
       // Pulse mode: width counter on NCO carry-out
