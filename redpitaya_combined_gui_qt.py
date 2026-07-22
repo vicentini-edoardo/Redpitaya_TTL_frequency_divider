@@ -36,7 +36,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame,
         QInputDialog,
-        QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
+        QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
         QMessageBox, QSizePolicy, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
 except ImportError as exc:
@@ -54,7 +54,9 @@ except ImportError:
 # can be unit-tested in isolation (see tests/test_rp_math.py).
 from rp_math import (  # noqa: E402
     CLK_HZ, PHASE_BITS, DEFAULT_BASE, CTRL_ENABLE, CTRL_FORCE_HIGH, CTRL_OSC_MODE,
-    CTRL_EDGE_LOCK,
+    CTRL_EDGE_LOCK, CTRL_EDGE_RESPONSE_MASK, CTRL_EDGE_RESPONSE_BALANCED,
+    CTRL_EDGE_RESPONSE_FAST, CTRL_EDGE_RESPONSE_SMOOTH,
+    DEFAULT_EDGE_LOCK_RESPONSE, EDGE_LOCK_RESPONSES,
     PHASE_RES_HZ, MAX_SHIFT_HZ, WINDOW_OPTIONS_US, WINDOW_NAMES,
     hz_to_phase, phase_to_hz, duty_to_cycles, fmt_freq, fmt_signed_freq,
     suggest_window, trig_hz_to_phase_step, trig_phase_step_to_hz, fmt_dur,
@@ -341,14 +343,16 @@ class SshBackend(QObject):
             self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
 
     def apply_pulse(self, width_cycles: int, offset_word: int,
-                    edge_lock: bool = False, preload: Optional[int] = None):
+                    edge_lock: bool = False, preload: Optional[int] = None,
+                    edge_response: int = DEFAULT_EDGE_LOCK_RESPONSE):
         """Pulse-mode modulated write (enable=1, harmonic_mode=0 via helper).
 
         When ``edge_lock`` is on and ``preload`` is given, the phase-offset
         preload is written and the lock is re-armed so the new phase takes
         effect (see ``_do_apply_pulse_locked``)."""
         if self._live:
-            ctrl = CTRL_ENABLE | (CTRL_EDGE_LOCK if edge_lock else 0)
+            ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
+            ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_pulse_locked(
@@ -360,14 +364,16 @@ class SshBackend(QObject):
                               self.sig_status.emit)
 
     def apply_harmonic(self, mult_n: int, offset_word: int,
-                       edge_lock: bool = False, preload: Optional[int] = None):
+                       edge_lock: bool = False, preload: Optional[int] = None,
+                       edge_response: int = DEFAULT_EDGE_LOCK_RESPONSE):
         """Harmonic-mode modulated write (enable=1, harmonic_mode=1 via helper).
 
         When ``edge_lock`` is on and ``preload`` is given, the phase-offset
         preload is written and the lock is re-armed so the new phase takes
         effect (see ``_do_apply_harmonic_locked``)."""
         if self._live:
-            ctrl = CTRL_ENABLE | (CTRL_EDGE_LOCK if edge_lock else 0)
+            ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
+            ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_harmonic_locked(
@@ -567,7 +573,7 @@ class SshBackend(QObject):
         # frequency measurement keep running; pulses resume on the next input
         # edge that re-anchors the phase.
         self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} control {ctrl & ~CTRL_EDGE_LOCK}"
         )
         return json.loads(self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} write {width} {offset} {ctrl}"
@@ -588,7 +594,7 @@ class SshBackend(QObject):
         # edge_lock, so re-arm it (drop bit5, then the modulated write) to apply
         # a new phase while the lock is already engaged.
         self._exec(
-            f"/root/rp_harmonic_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+            f"/root/rp_harmonic_ctl 0x{self._base:08X} control {ctrl & ~CTRL_EDGE_LOCK}"
         )
         return json.loads(self._exec(
             f"/root/rp_harmonic_ctl 0x{self._base:08X} write {mult_n} {offset} {ctrl}"
@@ -1211,6 +1217,21 @@ class _NcoPanel(QWidget):
         )
         self._cb_lock.toggled.connect(self._on_lock_toggled)
         auto_row.addWidget(self._cb_lock)
+        auto_row.addSpacing(12)
+        auto_row.addWidget(_dim_label("Response:"))
+        self._edge_response = QComboBox()
+        for label, control_bits in EDGE_LOCK_RESPONSES:
+            self._edge_response.addItem(label, control_bits)
+        self._edge_response.setCurrentIndex(
+            self._edge_response.findData(DEFAULT_EDGE_LOCK_RESPONSE)
+        )
+        self._edge_response.setToolTip(
+            "Hard snaps at the next accepted edge. Fast, Balanced, and Smooth "
+            "apply progressively smaller continuous phase corrections."
+        )
+        self._edge_response.setStyleSheet(_spin_style())
+        self._edge_response.currentIndexChanged.connect(self._param_changed)
+        auto_row.addWidget(self._edge_response)
         self._build_lock_extras(auto_row)
         auto_row.addStretch()
         fields.addLayout(auto_row, 2, 0, 1, 4)
@@ -1268,11 +1289,12 @@ class _NcoPanel(QWidget):
         self._update_mode_controls()
         self.sig_params_changed.emit()
         if self._live:
+            response = self._edge_response_bits()
             if mode == "off":
-                self._be_set_control(0x00)
+                self._be_set_control(response)
                 self._log("Laser OFF  (output = constant 0)")
             elif mode == "on":
-                self._be_set_control(CTRL_FORCE_HIGH)
+                self._be_set_control(CTRL_FORCE_HIGH | response)
                 self._log("Laser ON   (output = constant 1)")
             else:
                 self._do_apply()
@@ -1286,7 +1308,7 @@ class _NcoPanel(QWidget):
     def _update_mode_controls(self):
         enabled = (self._output_mode == "modulated")
         for w in (self._sp_offset, self._secondary_widget, self._window_field,
-                  self._cb_auto, self._cb_lock, self._btn_apply):
+                  self._cb_auto, self._cb_lock, self._edge_response, self._btn_apply):
             w.setEnabled(enabled)
         # The phase offset is only meaningful while the phase is anchored to the
         # input, so it follows both modulated-mode and the edge-lock checkbox.
@@ -1301,6 +1323,9 @@ class _NcoPanel(QWidget):
         self.sig_params_changed.emit()
         if self._live and self._output_mode == "modulated":
             self._do_apply()
+
+    def _edge_response_bits(self) -> int:
+        return int(self._edge_response.currentData()) & CTRL_EDGE_RESPONSE_MASK
 
     # ── backend signal handlers ────────────────────────────────────────────────
 
@@ -1334,6 +1359,11 @@ class _NcoPanel(QWidget):
 
         # Sync output mode from FPGA control register
         ctrl = int(d.get("control") or 0)
+        response_index = self._edge_response.findData(ctrl & CTRL_EDGE_RESPONSE_MASK)
+        if response_index >= 0 and response_index != self._edge_response.currentIndex():
+            self._edge_response.blockSignals(True)
+            self._edge_response.setCurrentIndex(response_index)
+            self._edge_response.blockSignals(False)
         if (ctrl >> 2) & 1:
             fpga_mode = "on"
         elif ctrl & 1:
@@ -1371,7 +1401,7 @@ class _NcoPanel(QWidget):
             locked    = bool(int(d.get("edge_lock") or 0))
             sub       = f"shift {fmt_signed_freq(delta)}"
             if locked:
-                sub += " · edge-locked"
+                sub += f" · edge-locked · {self._edge_response.currentText().lower()}"
                 # Show the device's live phase offset (mode-specific mapping).
                 if self._sp_phase is not None:
                     ph = self._preload_to_phase_turns(int(d.get("osc_phase_preload") or 0)) * 360.0
@@ -1525,7 +1555,10 @@ class PulsePanel(_NcoPanel):
         lock        = self._cb_lock.isChecked()
         phase_deg   = self._sp_phase.value() if self._sp_phase is not None else 0.0
         preload     = self._phase_turns_to_preload(phase_deg / 360.0) if lock else None
-        self._be.apply_pulse(wc, offset_word, edge_lock=lock, preload=preload)
+        self._be.apply_pulse(
+            wc, offset_word, edge_lock=lock, preload=preload,
+            edge_response=self._edge_response_bits(),
+        )
         self._log(
             f"Apply  width={self._sp_width.value():.2f}%  "
             f"shift={actual_hz:+.6f} Hz  offset={offset_word:+d}"
@@ -1538,6 +1571,7 @@ class PulsePanel(_NcoPanel):
             "duty_cycle_pct": self._sp_width.value(),
             "output_mode": self._output_mode,
             "edge_lock": self._cb_lock.isChecked(),
+            "edge_lock_response": self._edge_response.currentText().lower(),
             "phase_offset_deg": self._sp_phase.value() if self._sp_phase is not None else 0.0,
         }
 
@@ -1626,7 +1660,10 @@ class HarmonicPanel(_NcoPanel):
         lock        = self._cb_lock.isChecked()
         phase_deg   = self._sp_phase.value() if self._sp_phase is not None else 0.0
         preload     = self._phase_turns_to_preload(phase_deg / 360.0) if lock else None
-        self._be.apply_harmonic(n, offset_word, edge_lock=lock, preload=preload)
+        self._be.apply_harmonic(
+            n, offset_word, edge_lock=lock, preload=preload,
+            edge_response=self._edge_response_bits(),
+        )
         self._log(
             f"Apply  N={n}  shift={actual_hz:+.6f} Hz  "
             f"offset={offset_word:+d}"
@@ -1639,6 +1676,7 @@ class HarmonicPanel(_NcoPanel):
             "harmonic_n": self._sp_n.value(),
             "output_mode": self._output_mode,
             "edge_lock": self._cb_lock.isChecked(),
+            "edge_lock_response": self._edge_response.currentText().lower(),
             "phase_offset_deg": self._sp_phase.value() if self._sp_phase is not None else 0.0,
         }
 

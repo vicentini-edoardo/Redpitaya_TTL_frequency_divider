@@ -12,7 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import QObject, Signal  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
+from PySide6.QtTest import QSignalSpy  # noqa: E402
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QWidget  # noqa: E402
 
 import redpitaya_combined_gui_qt as gui  # noqa: E402
 
@@ -27,9 +28,24 @@ class _FakeBackend(QObject):
         super().__init__()
         self.mode = "pulse"
         self.window_calls = []
+        self.pulse_calls = []
+        self.harmonic_calls = []
+        self.control_calls = []
 
     def set_window(self, window_us: int):
         self.window_calls.append(window_us)
+
+    def apply_pulse(self, *args, **kwargs):
+        self.pulse_calls.append((args, kwargs))
+
+    def apply_harmonic(self, *args, **kwargs):
+        self.harmonic_calls.append((args, kwargs))
+
+    def set_control_pulse(self, control: int):
+        self.control_calls.append(control)
+
+    def set_control_harmonic(self, control: int):
+        self.control_calls.append(control)
 
 
 class TestDarkWorkbenchLayout(unittest.TestCase):
@@ -252,6 +268,66 @@ class TestMeasurementWindowField(unittest.TestCase):
         })
         self.app.processEvents()
         self.assertEqual(self.panel._d_in._val.text(), gui.fmt_freq(second_hz))
+
+
+class TestEdgeLockResponseSelector(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.backend = _FakeBackend()
+        self.panel = gui.PulsePanel(self.backend, lambda _msg: None)
+        self.panel._live = True
+        self.panel._period_c = 128
+        self.addCleanup(self.panel.close)
+
+    def test_defaults_to_balanced_and_is_only_enabled_while_modulated(self):
+        self.assertIsInstance(self.panel._edge_response, QComboBox)
+        self.assertEqual(
+            self.panel._edge_response.currentData(),
+            gui.CTRL_EDGE_RESPONSE_BALANCED,
+        )
+        self.panel._output_mode = "off"
+        self.panel._update_mode_controls()
+        self.assertFalse(self.panel._edge_response.isEnabled())
+        self.panel._output_mode = "modulated"
+        self.panel._update_mode_controls()
+        self.assertTrue(self.panel._edge_response.isEnabled())
+
+    def test_apply_forwards_selected_response(self):
+        self.panel._edge_response.setCurrentIndex(
+            self.panel._edge_response.findData(gui.CTRL_EDGE_RESPONSE_FAST)
+        )
+        self.panel._do_apply()
+        self.assertEqual(
+            self.backend.pulse_calls[-1][1]["edge_response"],
+            gui.CTRL_EDGE_RESPONSE_FAST,
+        )
+
+    def test_off_and_on_control_writes_preserve_selected_response(self):
+        self.panel._set_output_mode("off")
+        self.assertEqual(
+            self.backend.control_calls[-1], gui.CTRL_EDGE_RESPONSE_BALANCED
+        )
+        self.panel._set_output_mode("on")
+        self.assertEqual(
+            self.backend.control_calls[-1],
+            gui.CTRL_FORCE_HIGH | gui.CTRL_EDGE_RESPONSE_BALANCED,
+        )
+
+    def test_status_readback_syncs_selector_from_raw_control(self):
+        changed = QSignalSpy(self.panel._edge_response.currentIndexChanged)
+        self.panel._on_status({
+            "harmonic_mode": 0,
+            "control": gui.CTRL_ENABLE | gui.CTRL_EDGE_RESPONSE_SMOOTH,
+            "phase_step_base": 0,
+        })
+        self.assertEqual(
+            self.panel._edge_response.currentData(),
+            gui.CTRL_EDGE_RESPONSE_SMOOTH,
+        )
+        self.assertEqual(changed.count(), 0)
 
 
 class TestGitUpdateHelpers(unittest.TestCase):
