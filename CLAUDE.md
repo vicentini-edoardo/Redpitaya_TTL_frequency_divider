@@ -135,6 +135,8 @@ at accepted anchors. In Pulse and Harmonic gradual modes, the NCO consumes the
 shortest signed phase error without snapping; correction is capped below the
 nominal positive step to keep phase monotonic, and Pulse carry uses the
 corrected sum. Stepped strobe mode always hard-anchors.
+Harmonic output follows corrected `phase_acc[47]` continuously, so gradual
+correction does not directly snap the square-wave output.
 
 ### Board-side helper (`rp_ctl.c`)
 

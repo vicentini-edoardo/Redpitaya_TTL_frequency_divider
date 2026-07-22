@@ -208,6 +208,8 @@ Balanced, and Smooth modes instead consume the shortest signed phase error
 gradually; each correction is capped below the nominal positive step so phase
 remains monotonic. Pulse carry uses the corrected sum. Stepped strobe mode
 always hard-anchors, regardless of the response setting.
+Harmonic output follows corrected `phase_acc[47]` continuously, so gradual
+correction does not directly snap the square-wave output.
 
 ---
 
