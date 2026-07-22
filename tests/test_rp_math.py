@@ -38,10 +38,10 @@ class TestEdgeLockResponseBits(unittest.TestCase):
         )
         self.assertEqual(DEFAULT_EDGE_LOCK_RESPONSE, CTRL_EDGE_RESPONSE_BALANCED)
         self.assertEqual(EDGE_LOCK_RESPONSES, (
-            CTRL_EDGE_RESPONSE_HARD,
-            CTRL_EDGE_RESPONSE_FAST,
-            CTRL_EDGE_RESPONSE_BALANCED,
-            CTRL_EDGE_RESPONSE_SMOOTH,
+            ("Hard", 0x00),
+            ("Fast", 0x40),
+            ("Balanced", 0x80),
+            ("Smooth", 0xC0),
         ))
 
 
