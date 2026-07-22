@@ -32,10 +32,6 @@ Usage:
 from __future__ import annotations
 
 import sys
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
 
 # ── Hardware constants ─────────────────────────────────────────────────────────
 CLK_HZ     = 124_999_999
@@ -90,6 +86,8 @@ def simulate_strobe_nco(
     instead: effective offset = +f_shift every tick, no stepping
     (that RTL path is untouched by the strobe rework).
     """
+    import numpy as np
+
     step_base = (measured_step_base(f_in_hz, window_cycles)
                  if window_cycles else hz_to_phase_step(f_in_hz))
     step_word = strobe_step_word(step_frac)
@@ -168,6 +166,123 @@ def simulate_strobe_nco(
         "done":        done,
     }
 
+
+# ── Bounded edge-lock response simulation ─────────────────────────────────────
+
+EDGE_LOCK_RESPONSE_SHIFTS = {
+    "hard": None,
+    "fast": 4,
+    "balanced": 6,
+    "smooth": 8,
+}
+
+
+def _shortest_signed_modular_error(target: int, phase: int) -> int:
+    """Signed 48-bit distance from phase to target."""
+    error = (target - phase) % PHASE_WRAP
+    return error - PHASE_WRAP if error >= PHASE_WRAP // 2 else error
+
+
+def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
+                                phase_jump_clocks: int = 32,
+                                jump_anchor: int = 8,
+                                anchor_count: int = 80) -> dict:
+    """Model one persistent delayed input edge and the selected lock response."""
+    if response not in EDGE_LOCK_RESPONSE_SHIFTS:
+        raise ValueError(f"unknown edge-lock response: {response}")
+    if period_clocks <= 0 or anchor_count <= 0:
+        raise ValueError("period_clocks and anchor_count must be positive")
+
+    shift = EDGE_LOCK_RESPONSE_SHIFTS[response]
+    step_base = PHASE_WRAP // period_clocks
+    correction_limit = 0 if shift is None else step_base >> shift
+    anchor_ticks = [anchor * period_clocks +
+                    (phase_jump_clocks if anchor >= jump_anchor else 0)
+                    for anchor in range(anchor_count)]
+    anchor_at_tick = {tick: anchor for anchor, tick in enumerate(anchor_ticks)}
+
+    phase = 0
+    continuous_phase = 0
+    pending_residual = 0
+    adjustments = [0] * anchor_count
+    reference_displacements = [(-phase_jump_clocks * step_base
+                                if anchor >= jump_anchor else 0)
+                               for anchor in range(anchor_count)]
+    corrections = []
+    increments = []
+    unwrapped_phase = []
+    pulse_ticks = []
+    converged_anchor = None
+
+    for tick in range(anchor_ticks[-1] + period_clocks):
+        anchor = anchor_at_tick.get(tick)
+        if anchor is not None:
+            pending_residual = _shortest_signed_modular_error(0, phase)
+            if shift is None:
+                adjustments[anchor] = pending_residual
+                phase = (phase + pending_residual) % PHASE_WRAP
+                pending_residual = 0
+            elif anchor >= jump_anchor and pending_residual == 0 and \
+                    converged_anchor is None:
+                converged_anchor = anchor
+
+        correction = 0
+        if shift is not None and pending_residual:
+            correction = max(-correction_limit,
+                             min(correction_limit, pending_residual))
+            pending_residual -= correction
+
+        increment = step_base + correction
+        if phase + increment >= PHASE_WRAP:
+            pulse_ticks.append(tick)
+        phase = (phase + increment) % PHASE_WRAP
+        continuous_phase += increment
+        corrections.append(correction)
+        increments.append(increment)
+        unwrapped_phase.append(continuous_phase)
+
+    return {
+        "response": response,
+        "step_base": step_base,
+        "correction_limit": correction_limit,
+        "anchor_adjustments": adjustments,
+        "reference_displacements": reference_displacements,
+        "corrections": corrections,
+        "increments": increments,
+        "unwrapped_phase": unwrapped_phase,
+        "continuous_wraps": continuous_phase // PHASE_WRAP,
+        "pulse_ticks": pulse_ticks,
+        "converged_anchor": converged_anchor,
+    }
+
+
+def check_edge_lock_responses() -> bool:
+    """Check hard snap plus bounded gradual response behavior."""
+    results = {name: simulate_edge_lock_response(name)
+               for name in EDGE_LOCK_RESPONSE_SHIFTS}
+    hard = results["hard"]
+    hard_ok = (hard["anchor_adjustments"][8] != 0 and
+               all(adjustment == 0 for adjustment in hard["anchor_adjustments"][9:]) and
+               all(displacement == hard["reference_displacements"][8]
+                   for displacement in hard["reference_displacements"][8:]))
+    gradual_ok = all(
+        all(abs(correction) <= result["correction_limit"]
+            for correction in result["corrections"]) and
+        all(increment > 0 for increment in result["increments"]) and
+        len(result["pulse_ticks"]) == result["continuous_wraps"] and
+        len(result["pulse_ticks"]) == len(set(result["pulse_ticks"]))
+        for name, result in results.items() if name != "hard")
+    converged = [results[name]["converged_anchor"]
+                 for name in ("fast", "balanced", "smooth")]
+    order_ok = (all(anchor is not None for anchor in converged) and
+                converged[0] < converged[1] < converged[2])
+    ok = hard_ok and gradual_ok and order_ok
+    print("\nBounded edge-lock response check")
+    print(f"  hard={'OK' if hard_ok else 'FAIL'}  "
+          f"converged fast/balanced/smooth={converged}")
+    print(f"  → {'PASS' if ok else 'FAIL'}")
+    return ok
+
 # ── Verification ───────────────────────────────────────────────────────────────
 
 def verify_strobe(res, start_frac, step_frac, n_steps, dwell_cycles):
@@ -215,6 +330,10 @@ def verify_strobe(res, start_frac, step_frac, n_steps, dwell_cycles):
 # ── Plot ───────────────────────────────────────────────────────────────────────
 
 def plot_results(res, start_frac, step_frac, n_steps, outpath, title=""):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     t_ms = res["pulse_ticks"] / CLK_HZ * 1e3
     fig, axes = plt.subplots(2, 1, figsize=(13, 8))
     fig.suptitle(title, fontsize=11)
@@ -275,6 +394,8 @@ def run_scenario(label, f_in, start, step, n_steps, dwell_ms,
 def check_hold_after_done(f_in=1_000_000, start=0.1, step=0.02, n_steps=5,
                           dwell_ms=0.5, enable_frac=0.44):
     """After the last step the output must hold the final phase indefinitely."""
+    import numpy as np
+
     print(f"\n{'='*60}")
     print("Hold-after-done check")
     dwell_cycles = round(dwell_ms * 1e-3 * CLK_HZ)
@@ -302,6 +423,8 @@ def check_edge_lock_shift(f_in, f_shift, duration_s=0.05,
     the beat f_out - f_in must equal f_shift exactly when edge-locked,
     whereas open-loop it equals f_shift + (measurement error).
     """
+    import numpy as np
+
     print(f"\n{'='*60}")
     print(f"Edge-lock shift check: f_in={f_in:.0f} Hz  f_shift={f_shift:.1f} Hz  "
           f"duration={duration_s*1e3:.0f} ms")
@@ -371,6 +494,9 @@ if __name__ == "__main__":
 
     # 8. edge_lock control bit unchanged (constant frequency shift)
     _track(check_edge_lock_shift(999_983, 1000.0))
+
+    # 9. bounded edge-lock response profiles
+    _track(check_edge_lock_responses())
 
     print(f"\n{'='*60}")
     print(f"Overall: {'PASS' if all_ok else 'FAIL'}")
