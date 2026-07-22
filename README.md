@@ -200,7 +200,14 @@ Base address: `0x40600000`
 | 2 | force_high | Override output HIGH regardless of NCO state (LASER ON) |
 | 3 | harmonic_mode | 0 = pulse mode, 1 = harmonic mode (set by binary name) |
 | 4 | osc_mode | Stepped strobe scan: hold phase start+k·step for dwell_cycles, k=0..n_steps−1, then hold last phase (pulse mode only; re-arm by toggling the bit) |
-| 5 | edge_lock | Anchor NCO phase to input rising edges: f_out − [N·]f_in is exactly f_shift, beat coherent indefinitely |
+| 5 | edge_lock | Lock NCO phase to input rising edges: f_out − [N·]f_in is exactly f_shift, beat coherent indefinitely |
+| 7:6 | edge_lock_response | `00` Hard snap; `01` Fast (1/16); `10` Balanced (1/64, default); `11` Smooth (1/256) |
+
+With edge lock enabled, Hard snaps to each anchor. Pulse and Harmonic Fast,
+Balanced, and Smooth modes instead consume the shortest signed phase error
+gradually; each correction is capped below the nominal positive step so phase
+remains monotonic. Pulse carry uses the corrected sum. Stepped strobe mode
+always hard-anchors, regardless of the response setting.
 
 ---
 

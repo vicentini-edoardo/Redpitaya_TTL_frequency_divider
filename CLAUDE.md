@@ -109,7 +109,7 @@ which the C helper sets/clears based on its invocation name.
 
 | Offset | Register | Notes |
 |--------|----------|-------|
-| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode, bit 5=edge_lock |
+| `0x00` | `control` | bit 0=enable, bit 1=soft_reset (self-clearing), bit 2=force_high, bit 3=harmonic_mode, bit 4=osc_mode, bit 5=edge_lock, bits 7:6=edge-lock response |
 | `0x04/0x0C` | `trig_phase_step` | DIO2 48-bit NCO phase step (0=off) |
 | `0x08` | `width_n` / `mult_n` | pulse width cycles (pulse) or harmonic order 1..5 (harmonic) |
 | `0x10` | `status` | bit 0=busy, bit 1=period_valid, bit 2=period_stable, bit 3=timeout, bit 4=freerun_active |
@@ -128,6 +128,13 @@ longer drops `enable`, so parameter updates do not restart the measurement.
 
 The authoritative `status` bit order is the rdata concatenation in
 `axi4lite_pulse_regs.sv` (the `4'd4` read case), **not** any prose comment.
+
+Edge-lock response bits `[7:6]` map exactly to `00` Hard snap, `01` Fast
+(1/16), `10` Balanced (1/64, default), and `11` Smooth (1/256). Hard snaps
+at accepted anchors. In Pulse and Harmonic gradual modes, the NCO consumes the
+shortest signed phase error without snapping; correction is capped below the
+nominal positive step to keep phase monotonic, and Pulse carry uses the
+corrected sum. Stepped strobe mode always hard-anchors.
 
 ### Board-side helper (`rp_ctl.c`)
 
