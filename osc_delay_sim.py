@@ -186,54 +186,83 @@ def _shortest_signed_modular_error(target: int, phase: int) -> int:
 def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
                                 phase_jump_clocks: int = 32,
                                 jump_anchor: int = 8,
-                                anchor_count: int = 80) -> dict:
+                                anchor_count: int = 80,
+                                harmonic_n: int = 1,
+                                phase_step_offset: int = 0,
+                                preload: int = 0) -> dict:
     """Model one persistent delayed input edge and the selected lock response."""
     if response not in EDGE_LOCK_RESPONSE_SHIFTS:
         raise ValueError(f"unknown edge-lock response: {response}")
-    if period_clocks <= 0 or anchor_count <= 0:
-        raise ValueError("period_clocks and anchor_count must be positive")
+    if period_clocks <= 0 or anchor_count <= 0 or harmonic_n <= 0:
+        raise ValueError("period_clocks, anchor_count, and harmonic_n must be positive")
 
     shift = EDGE_LOCK_RESPONSE_SHIFTS[response]
     step_base = PHASE_WRAP // period_clocks
-    quantization_band = PHASE_WRAP - period_clocks * step_base
-    correction_limit = 0 if shift is None else step_base >> shift
+    phase_step = harmonic_n * step_base + phase_step_offset
+    if phase_step <= 0:
+        raise ValueError("nominal phase_step must be positive")
+    quantization_band = harmonic_n * (PHASE_WRAP - period_clocks * step_base)
+    correction_limit = (0 if shift is None or phase_step <= 1 else
+                        min(step_base >> shift, phase_step - 1))
     anchor_ticks = [(anchor + 1) * period_clocks - 1 +
                     (phase_jump_clocks if anchor >= jump_anchor else 0)
                     for anchor in range(anchor_count)]
     anchor_at_tick = {tick: anchor for anchor, tick in enumerate(anchor_ticks)}
 
-    phase = 0
-    continuous_phase = 0
+    phase = preload % PHASE_WRAP
+    target = phase
+    continuous_phase = phase
     pending_residual = 0
     adjustments = [0] * anchor_count
-    reference_displacements = [(-phase_jump_clocks * step_base
+    reference_displacements = [(-phase_jump_clocks * harmonic_n * step_base
                                 if anchor >= jump_anchor else 0)
                                for anchor in range(anchor_count)]
     corrections = []
     increments = []
     unwrapped_phase = []
+    phase_trace = []
+    target_trace = []
+    running_trace = []
+    harmonic_output = []
     pulse_ticks = []
     converged_anchor = None
+    accepted_anchor_tick = anchor_ticks[0]
+    run_start_tick = accepted_anchor_tick + 1
+    running = False
 
     for tick in range(anchor_ticks[-1] + period_clocks):
+        anchor = anchor_at_tick.get(tick)
+        if not running:
+            corrections.append(0)
+            increments.append(0)
+            unwrapped_phase.append(continuous_phase)
+            phase_trace.append(phase)
+            target_trace.append(target)
+            running_trace.append(False)
+            harmonic_output.append(False)
+            if anchor is not None:
+                running = True
+            continue
+
         correction = 0
         if shift is not None and pending_residual:
             correction = max(-correction_limit,
                              min(correction_limit, pending_residual))
             pending_residual -= correction
 
-        increment = step_base + correction
+        increment = phase_step + correction
         if phase + increment >= PHASE_WRAP:
             pulse_ticks.append(tick)
         next_phase = (phase + increment) % PHASE_WRAP
+        target_next = (target + phase_step_offset) % PHASE_WRAP
         continuous_phase += increment
         corrections.append(correction)
         increments.append(increment)
         unwrapped_phase.append(continuous_phase)
 
-        anchor = anchor_at_tick.get(tick)
         if anchor is not None:
-            pending_residual = _shortest_signed_modular_error(0, next_phase)
+            pending_residual = _shortest_signed_modular_error(target_next,
+                                                              next_phase)
             if shift is None:
                 adjustments[anchor] = pending_residual
                 next_phase = (next_phase + pending_residual) % PHASE_WRAP
@@ -243,17 +272,32 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
                     converged_anchor is None:
                 converged_anchor = anchor
         phase = next_phase
+        target = target_next
+        phase_trace.append(phase)
+        target_trace.append(target)
+        running_trace.append(True)
+        harmonic_output.append(bool(phase & (PHASE_WRAP // 2)))
 
     return {
         "response": response,
         "step_base": step_base,
+        "phase_step": phase_step,
+        "harmonic_n": harmonic_n,
+        "phase_step_offset": phase_step_offset,
         "quantization_band": quantization_band,
         "correction_limit": correction_limit,
+        "anchor_ticks": anchor_ticks,
+        "accepted_anchor_tick": accepted_anchor_tick,
+        "run_start_tick": run_start_tick,
         "anchor_adjustments": adjustments,
         "reference_displacements": reference_displacements,
         "corrections": corrections,
         "increments": increments,
         "unwrapped_phase": unwrapped_phase,
+        "phase_trace": phase_trace,
+        "target_trace": target_trace,
+        "running": running_trace,
+        "harmonic_output": harmonic_output,
         "continuous_wraps": continuous_phase // PHASE_WRAP,
         "pulse_ticks": pulse_ticks,
         "converged_anchor": converged_anchor,
@@ -272,7 +316,8 @@ def check_edge_lock_responses() -> bool:
     gradual_ok = all(
         all(abs(correction) <= result["correction_limit"]
             for correction in result["corrections"]) and
-        all(increment > 0 for increment in result["increments"]) and
+        all(increment > 0 for increment in
+            result["increments"][result["run_start_tick"]:]) and
         len(result["pulse_ticks"]) == result["continuous_wraps"] and
         len(result["pulse_ticks"]) == len(set(result["pulse_ticks"]))
         for name, result in results.items() if name != "hard")
