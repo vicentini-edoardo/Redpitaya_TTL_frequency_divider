@@ -88,6 +88,7 @@ module pulse_gen
   input  logic        harmonic_mode,
   input  logic        osc_mode,
   input  logic        edge_lock,       // anchor NCO phase to input edges (pulse/harmonic)
+  input  logic [1:0]  edge_lock_response,
   input  logic [31:0] width_n,         // pulse_width cycles (pulse) or mult_n[2:0] (harmonic)
   input  logic [31:0] meas_time_us,
 

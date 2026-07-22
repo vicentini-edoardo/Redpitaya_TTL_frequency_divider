@@ -8,7 +8,9 @@
 //   0x00 RW  control:  [0] enable, [1] soft_reset (self-clearing, reads 0),
 //                      [2] force_high (output forced to 1), [3] harmonic_mode,
 //                      [4] osc_mode (stepped strobe scan),
-//                      [5] edge_lock (anchor NCO phase to input edges)
+//                      [5] edge_lock (anchor NCO phase to input edges),
+//                      [7:6] edge_lock_response: 00 Hard, 01 Fast,
+//                      10 Balanced, 11 Smooth
 //   0x04 RW  trig_phase_step_lo: bits [31:0] of DIO2 48-bit NCO step (0=off)
 //   0x08 RW  width_n:  pulse width in clock cycles (pulse mode) OR
 //                      harmonic multiplier 1..5 in bits [2:0] (harmonic mode)
@@ -83,6 +85,7 @@ module axi4lite_pulse_regs
   output logic        harmonic_mode,
   output logic        osc_mode,
   output logic        edge_lock,
+  output logic [1:0]  edge_lock_response,
   output logic [47:0] trig_phase_step,   // DIO2 48-bit NCO step (0=off)
   output logic [31:0] width_n,           // pulse_width (pulse mode) or mult_n[2:0] (harmonic mode)
   output logic [31:0] meas_time_us,
@@ -145,6 +148,7 @@ module axi4lite_pulse_regs
   assign harmonic_mode     = reg_control[3];
   assign osc_mode          = reg_control[4];
   assign edge_lock         = reg_control[5];
+  assign edge_lock_response = reg_control[7:6];
   assign trig_phase_step   = trig_phase_step_q;
   assign width_n           = reg_width_n;
   assign meas_time_us      = reg_meas_time_us;
@@ -155,7 +159,7 @@ module axi4lite_pulse_regs
 
   always_ff @(posedge clk) begin
     if (!rstn) begin
-      reg_control               <= 32'h00000001;
+      reg_control               <= 32'h00000081;
       reg_trig_phase_step_lo    <= 32'h00000000;  // trig_phase_step=0 -> DIO2 off at boot
       reg_width_n               <= 32'h00000001;
       reg_trig_phase_step_hi    <= 16'h0000;
@@ -222,6 +226,7 @@ module axi4lite_pulse_regs
               reg_control[3] <= wdata_latched[3];   // harmonic_mode
               reg_control[4] <= wdata_latched[4];   // osc_mode
               reg_control[5] <= wdata_latched[5];   // edge_lock
+              reg_control[7:6] <= wdata_latched[7:6]; // edge_lock_response
               if (wdata_latched[1])
                 pulse_soft_reset <= 1'b1;           // soft_reset strobe
             end

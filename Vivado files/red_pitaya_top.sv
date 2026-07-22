@@ -95,6 +95,7 @@ logic        force_high;
 logic        harmonic_mode;
 logic        osc_mode;
 logic        edge_lock;
+logic [1:0]  edge_lock_response;
 logic [31:0] dwell_cycles;
 logic [47:0] osc_phase_preload;
 logic [31:0] n_steps;
@@ -206,6 +207,7 @@ pulse_gen pulse_gen_i
   .harmonic_mode     (harmonic_mode),
   .osc_mode          (osc_mode),
   .edge_lock         (edge_lock),
+  .edge_lock_response(edge_lock_response),
 
   .trig_in           (exp_p_io[0]),
 
@@ -271,6 +273,7 @@ axi4lite_pulse_regs regs_i
   .harmonic_mode       (harmonic_mode),
   .osc_mode            (osc_mode),
   .edge_lock           (edge_lock),
+  .edge_lock_response  (edge_lock_response),
   .trig_phase_step     (trig_phase_step),
   .width_n             (width_n),
   .meas_time_us        (meas_time_us),
