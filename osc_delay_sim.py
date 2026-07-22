@@ -196,7 +196,7 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
     shift = EDGE_LOCK_RESPONSE_SHIFTS[response]
     step_base = PHASE_WRAP // period_clocks
     correction_limit = 0 if shift is None else step_base >> shift
-    anchor_ticks = [anchor * period_clocks +
+    anchor_ticks = [(anchor + 1) * period_clocks - 1 +
                     (phase_jump_clocks if anchor >= jump_anchor else 0)
                     for anchor in range(anchor_count)]
     anchor_at_tick = {tick: anchor for anchor, tick in enumerate(anchor_ticks)}
@@ -215,17 +215,6 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
     converged_anchor = None
 
     for tick in range(anchor_ticks[-1] + period_clocks):
-        anchor = anchor_at_tick.get(tick)
-        if anchor is not None:
-            pending_residual = _shortest_signed_modular_error(0, phase)
-            if shift is None:
-                adjustments[anchor] = pending_residual
-                phase = (phase + pending_residual) % PHASE_WRAP
-                pending_residual = 0
-            elif anchor >= jump_anchor and pending_residual == 0 and \
-                    converged_anchor is None:
-                converged_anchor = anchor
-
         correction = 0
         if shift is not None and pending_residual:
             correction = max(-correction_limit,
@@ -235,11 +224,23 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
         increment = step_base + correction
         if phase + increment >= PHASE_WRAP:
             pulse_ticks.append(tick)
-        phase = (phase + increment) % PHASE_WRAP
+        next_phase = (phase + increment) % PHASE_WRAP
         continuous_phase += increment
         corrections.append(correction)
         increments.append(increment)
         unwrapped_phase.append(continuous_phase)
+
+        anchor = anchor_at_tick.get(tick)
+        if anchor is not None:
+            pending_residual = _shortest_signed_modular_error(0, next_phase)
+            if shift is None:
+                adjustments[anchor] = pending_residual
+                next_phase = (next_phase + pending_residual) % PHASE_WRAP
+                pending_residual = 0
+            elif anchor >= jump_anchor and pending_residual == 0 and \
+                    converged_anchor is None:
+                converged_anchor = anchor
+        phase = next_phase
 
     return {
         "response": response,

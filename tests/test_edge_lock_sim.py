@@ -13,11 +13,14 @@ class TestEdgeLockResponseSimulation(unittest.TestCase):
     def test_hard_snaps_once_to_the_persistent_delayed_reference(self):
         result = simulate_edge_lock_response("hard")
 
-        self.assertNotEqual(result["anchor_adjustments"][8], 0)
+        phase_jump_words = 32 * result["step_base"]
+        self.assertEqual(result["anchor_adjustments"][8], -phase_jump_words)
         self.assertTrue(all(adjustment == 0
                             for adjustment in result["anchor_adjustments"][9:]))
         self.assertEqual(result["reference_displacements"][8:],
                          [result["reference_displacements"][8]] * 72)
+        self.assertEqual(result["pulse_ticks"][0], 127)
+        self.assertEqual(result["pulse_ticks"][8], 1151)
 
     def test_gradual_responses_stay_bounded_and_monotonic(self):
         for response in ("fast", "balanced", "smooth"):
