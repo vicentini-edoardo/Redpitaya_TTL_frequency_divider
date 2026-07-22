@@ -100,6 +100,14 @@ class TestEdgeLockResponseSimulation(unittest.TestCase):
         self.assertTrue(result["harmonic_output"][running])
         self.assertEqual(result["increments"][running], result["phase_step"])
 
+    def test_harmonic_output_observes_the_pre_step_phase(self):
+        result = simulate_edge_lock_response(
+            "hard", preload=2**47 - 1, anchor_count=2)
+        running = result["run_start_tick"]
+
+        self.assertFalse(result["harmonic_output"][running])
+        self.assertGreaterEqual(result["phase_trace"][running], 2**47)
+
     def test_gradual_responses_converge_with_a_quantized_period(self):
         converged = {
             response: simulate_edge_lock_response(response, period_clocks=127)[

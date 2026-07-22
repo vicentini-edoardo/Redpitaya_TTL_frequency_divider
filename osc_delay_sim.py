@@ -271,12 +271,13 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
                     abs(pending_residual) <= quantization_band and \
                     converged_anchor is None:
                 converged_anchor = anchor
+        harmonic_high = bool(phase & (PHASE_WRAP // 2))
         phase = next_phase
         target = target_next
         phase_trace.append(phase)
         target_trace.append(target)
         running_trace.append(True)
-        harmonic_output.append(bool(phase & (PHASE_WRAP // 2)))
+        harmonic_output.append(harmonic_high)
 
     return {
         "response": response,
