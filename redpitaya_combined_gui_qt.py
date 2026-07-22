@@ -1360,7 +1360,8 @@ class _NcoPanel(QWidget):
         # Sync output mode from FPGA control register
         ctrl = int(d.get("control") or 0)
         response_index = self._edge_response.findData(ctrl & CTRL_EDGE_RESPONSE_MASK)
-        if response_index >= 0 and response_index != self._edge_response.currentIndex():
+        if (not self._debounce.isActive() and response_index >= 0
+                and response_index != self._edge_response.currentIndex()):
             self._edge_response.blockSignals(True)
             self._edge_response.setCurrentIndex(response_index)
             self._edge_response.blockSignals(False)

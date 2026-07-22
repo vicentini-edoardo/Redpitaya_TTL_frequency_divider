@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import QObject, Signal  # noqa: E402
-from PySide6.QtTest import QSignalSpy  # noqa: E402
+from PySide6.QtTest import QSignalSpy, QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QWidget  # noqa: E402
 
 import redpitaya_combined_gui_qt as gui  # noqa: E402
@@ -328,6 +328,29 @@ class TestEdgeLockResponseSelector(unittest.TestCase):
             gui.CTRL_EDGE_RESPONSE_SMOOTH,
         )
         self.assertEqual(changed.count(), 0)
+
+    def test_stale_readback_does_not_replace_pending_response(self):
+        self.panel._edge_response.setCurrentIndex(
+            self.panel._edge_response.findData(gui.CTRL_EDGE_RESPONSE_FAST)
+        )
+        self.assertTrue(self.panel._debounce.isActive())
+
+        self.panel._on_status({
+            "harmonic_mode": 0,
+            "control": gui.CTRL_ENABLE | gui.CTRL_EDGE_RESPONSE_BALANCED,
+            "phase_step_base": 0,
+        })
+
+        self.assertEqual(
+            self.panel._edge_response.currentData(),
+            gui.CTRL_EDGE_RESPONSE_FAST,
+        )
+        self.assertTrue(self.panel._debounce.isActive())
+        QTest.qWait(350)
+        self.assertEqual(
+            self.backend.pulse_calls[-1][1]["edge_response"],
+            gui.CTRL_EDGE_RESPONSE_FAST,
+        )
 
 
 class TestGitUpdateHelpers(unittest.TestCase):
