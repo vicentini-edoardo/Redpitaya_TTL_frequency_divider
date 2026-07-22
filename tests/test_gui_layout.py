@@ -4,6 +4,7 @@ import os
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -445,6 +446,43 @@ class TestSshBackendResponseShadow(unittest.TestCase):
             self.commands[-1].endswith(
                 f" {gui.CTRL_ENABLE | gui.CTRL_EDGE_RESPONSE_SMOOTH}"
             )
+        )
+
+    def test_in_flight_poll_cannot_replace_newer_requested_response(self):
+        read_started = threading.Event()
+        release_read = threading.Event()
+        read_results = []
+
+        def blocked_exec(command: str, timeout: float = 10.0) -> str:
+            if command.endswith(" read"):
+                read_started.set()
+                release_read.wait(1.0)
+                return json.dumps({
+                    "control": gui.CTRL_ENABLE | gui.CTRL_EDGE_RESPONSE_BALANCED,
+                })
+            return "{}"
+
+        self.backend._exec = blocked_exec
+        reader = threading.Thread(
+            target=lambda: read_results.append(self.backend._do_read())
+        )
+        reader.start()
+        self.assertTrue(read_started.wait(1.0))
+
+        self.backend.apply_pulse(
+            10, 0, edge_response=gui.CTRL_EDGE_RESPONSE_SMOOTH
+        )
+        release_read.set()
+        reader.join(1.0)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(len(read_results), 1)
+
+        self.backend._do_apply_osc = lambda *args: self.commands.append(args) or {}
+        self.backend.apply_osc(10, 20, 30, 40, 5)
+
+        self.assertEqual(
+            self.commands[-1][-1],
+            gui.CTRL_ENABLE | gui.CTRL_OSC_MODE | gui.CTRL_EDGE_RESPONSE_SMOOTH,
         )
 
 

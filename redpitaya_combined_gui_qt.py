@@ -324,6 +324,8 @@ class SshBackend(QObject):
         self._base  = DEFAULT_BASE
         self._mode  = "pulse"
         self._edge_response = DEFAULT_EDGE_LOCK_RESPONSE
+        self._edge_response_lock = threading.Lock()
+        self._edge_response_request_generation = 0
         self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
         self._upload_pending: Optional[tuple] = None   # (mode, c_src, bit_src)
         self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
@@ -354,7 +356,7 @@ class SshBackend(QObject):
         if self._live:
             ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
             ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
-            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
+            self._remember_requested_response(ctrl)
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_pulse_locked(
@@ -376,7 +378,7 @@ class SshBackend(QObject):
         if self._live:
             ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
             ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
-            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
+            self._remember_requested_response(ctrl)
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_harmonic_locked(
@@ -390,7 +392,7 @@ class SshBackend(QObject):
     def set_control_pulse(self, ctrl: int):
         """Set control register via the pulse helper (keeps harmonic_mode=0)."""
         if self._live:
-            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
+            self._remember_requested_response(ctrl)
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_pulse(ctrl),
                           self.sig_status.emit)
@@ -398,7 +400,7 @@ class SshBackend(QObject):
     def set_control_harmonic(self, ctrl: int):
         """Set control register via the harmonic helper (keeps harmonic_mode=1)."""
         if self._live:
-            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
+            self._remember_requested_response(ctrl)
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_harmonic(ctrl),
                           self.sig_status.emit)
@@ -424,7 +426,7 @@ class SshBackend(QObject):
                   step_word: int, n_steps: int):
         """Set strobe registers then write to arm (osc_mode + enable bits)."""
         if self._live:
-            ctrl = CTRL_ENABLE | CTRL_OSC_MODE | self._edge_response
+            ctrl = CTRL_ENABLE | CTRL_OSC_MODE | self._current_edge_response()
             self._enqueue(self.P_USER,
                           lambda: self._do_apply_osc(width_cycles, dwell_cycles,
                                                      preload, step_word, n_steps, ctrl),
@@ -433,7 +435,7 @@ class SshBackend(QObject):
     def disable_osc(self):
         """Clear osc_mode bit, keep enable."""
         if self._live:
-            ctrl = CTRL_ENABLE | self._edge_response
+            ctrl = CTRL_ENABLE | self._current_edge_response()
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_pulse(ctrl),
                           self.sig_status.emit)
@@ -501,6 +503,15 @@ class SshBackend(QObject):
         binary = "rp_pulse_ctl" if self._mode == "pulse" else "rp_harmonic_ctl"
         return f"/root/{binary} 0x{self._base:08X}"
 
+    def _remember_requested_response(self, ctrl: int):
+        with self._edge_response_lock:
+            self._edge_response_request_generation += 1
+            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
+
+    def _current_edge_response(self) -> int:
+        with self._edge_response_lock:
+            return self._edge_response
+
     # ── SSH operations (worker thread) ─────────────────────────────────────────
 
     def _do_connect(self, host: str, port: int, user: str, key: Optional[str]):
@@ -549,9 +560,15 @@ class SshBackend(QObject):
         self.sig_disconnected.emit("user request")
 
     def _do_read(self) -> dict:
+        with self._edge_response_lock:
+            request_generation = self._edge_response_request_generation
         result = json.loads(self._exec(f"{self._active_cmd()} read"))
         if "control" in result:
-            self._edge_response = int(result["control"]) & CTRL_EDGE_RESPONSE_MASK
+            with self._edge_response_lock:
+                if request_generation == self._edge_response_request_generation:
+                    self._edge_response = (
+                        int(result["control"]) & CTRL_EDGE_RESPONSE_MASK
+                    )
         return result
 
     def _do_apply_osc(self, wc: int, dwell: int, preload: int,
