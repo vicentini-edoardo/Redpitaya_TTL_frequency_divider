@@ -20,9 +20,29 @@ from rp_math import (  # noqa: E402
     strobe_step_word, dwell_s_to_cycles,
     phase_offset_to_preload, preload_to_phase_offset,
     harmonic_phase_offset_to_preload, harmonic_preload_to_phase_offset,
+    CTRL_EDGE_RESPONSE_MASK, CTRL_EDGE_RESPONSE_HARD, CTRL_EDGE_RESPONSE_FAST,
+    CTRL_EDGE_RESPONSE_BALANCED, CTRL_EDGE_RESPONSE_SMOOTH,
+    DEFAULT_EDGE_LOCK_RESPONSE, EDGE_LOCK_RESPONSES,
 )
 
 _PHASE_MAX = 2 ** (PHASE_BITS - 1)
+
+
+class TestEdgeLockResponseBits(unittest.TestCase):
+    def test_response_values_are_control_bits_7_through_6(self):
+        self.assertEqual(CTRL_EDGE_RESPONSE_MASK, 0xC0)
+        self.assertEqual(
+            (CTRL_EDGE_RESPONSE_HARD, CTRL_EDGE_RESPONSE_FAST,
+             CTRL_EDGE_RESPONSE_BALANCED, CTRL_EDGE_RESPONSE_SMOOTH),
+            (0x00, 0x40, 0x80, 0xC0),
+        )
+        self.assertEqual(DEFAULT_EDGE_LOCK_RESPONSE, CTRL_EDGE_RESPONSE_BALANCED)
+        self.assertEqual(EDGE_LOCK_RESPONSES, (
+            CTRL_EDGE_RESPONSE_HARD,
+            CTRL_EDGE_RESPONSE_FAST,
+            CTRL_EDGE_RESPONSE_BALANCED,
+            CTRL_EDGE_RESPONSE_SMOOTH,
+        ))
 
 
 class TestPhaseConversion(unittest.TestCase):

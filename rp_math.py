@@ -21,6 +21,18 @@ CTRL_ENABLE     = 0x01   # bit 0 — enable output + NCO
 CTRL_FORCE_HIGH = 0x04   # bit 2 — force output HIGH (constant 1)
 CTRL_OSC_MODE   = 0x10   # bit 4 — stepped strobe scan
 CTRL_EDGE_LOCK  = 0x20   # bit 5 — anchor NCO phase to input edges
+CTRL_EDGE_RESPONSE_MASK     = 0xC0  # bits 7:6 — edge-lock response
+CTRL_EDGE_RESPONSE_HARD     = 0x00
+CTRL_EDGE_RESPONSE_FAST     = 0x40
+CTRL_EDGE_RESPONSE_BALANCED = 0x80
+CTRL_EDGE_RESPONSE_SMOOTH   = 0xC0
+DEFAULT_EDGE_LOCK_RESPONSE  = CTRL_EDGE_RESPONSE_BALANCED
+EDGE_LOCK_RESPONSES = (
+    CTRL_EDGE_RESPONSE_HARD,
+    CTRL_EDGE_RESPONSE_FAST,
+    CTRL_EDGE_RESPONSE_BALANCED,
+    CTRL_EDGE_RESPONSE_SMOOTH,
+)
 # bit 3 (harmonic_mode) is enforced by the respective C helper
 
 _PHASE_MAX    = 2 ** (PHASE_BITS - 1)
