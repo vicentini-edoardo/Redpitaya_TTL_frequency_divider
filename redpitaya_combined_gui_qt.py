@@ -343,7 +343,13 @@ class SshBackend(QObject):
 
     def poll(self):
         if self._live:
-            self._enqueue(self.P_POLL, self._do_read, self.sig_status.emit)
+            with self._edge_response_lock:
+                request_generation = self._edge_response_request_generation
+            self._enqueue(
+                self.P_POLL,
+                lambda: self._do_read(request_generation),
+                self.sig_status.emit,
+            )
 
     def apply_pulse(self, width_cycles: int, offset_word: int,
                     edge_lock: bool = False, preload: Optional[int] = None,
@@ -559,9 +565,10 @@ class SshBackend(QObject):
         self._sftp = self._ssh = None
         self.sig_disconnected.emit("user request")
 
-    def _do_read(self) -> dict:
-        with self._edge_response_lock:
-            request_generation = self._edge_response_request_generation
+    def _do_read(self, request_generation: Optional[int] = None) -> dict:
+        if request_generation is None:
+            with self._edge_response_lock:
+                request_generation = self._edge_response_request_generation
         result = json.loads(self._exec(f"{self._active_cmd()} read"))
         if "control" in result:
             with self._edge_response_lock:
