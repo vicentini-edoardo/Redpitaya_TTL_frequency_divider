@@ -323,6 +323,7 @@ class SshBackend(QObject):
         self._live  = False
         self._base  = DEFAULT_BASE
         self._mode  = "pulse"
+        self._edge_response = DEFAULT_EDGE_LOCK_RESPONSE
         self._q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
         self._upload_pending: Optional[tuple] = None   # (mode, c_src, bit_src)
         self._thread = threading.Thread(target=self._loop, name="rp-ssh", daemon=True)
@@ -353,6 +354,7 @@ class SshBackend(QObject):
         if self._live:
             ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
             ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
+            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_pulse_locked(
@@ -374,6 +376,7 @@ class SshBackend(QObject):
         if self._live:
             ctrl = CTRL_ENABLE | (edge_response & CTRL_EDGE_RESPONSE_MASK)
             ctrl |= CTRL_EDGE_LOCK if edge_lock else 0
+            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
             if edge_lock and preload is not None:
                 self._enqueue(self.P_USER,
                               lambda: self._do_apply_harmonic_locked(
@@ -387,6 +390,7 @@ class SshBackend(QObject):
     def set_control_pulse(self, ctrl: int):
         """Set control register via the pulse helper (keeps harmonic_mode=0)."""
         if self._live:
+            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_pulse(ctrl),
                           self.sig_status.emit)
@@ -394,6 +398,7 @@ class SshBackend(QObject):
     def set_control_harmonic(self, ctrl: int):
         """Set control register via the harmonic helper (keeps harmonic_mode=1)."""
         if self._live:
+            self._edge_response = ctrl & CTRL_EDGE_RESPONSE_MASK
             self._enqueue(self.P_USER,
                           lambda: self._do_set_control_harmonic(ctrl),
                           self.sig_status.emit)
@@ -419,7 +424,7 @@ class SshBackend(QObject):
                   step_word: int, n_steps: int):
         """Set strobe registers then write to arm (osc_mode + enable bits)."""
         if self._live:
-            ctrl = CTRL_ENABLE | CTRL_OSC_MODE
+            ctrl = CTRL_ENABLE | CTRL_OSC_MODE | self._edge_response
             self._enqueue(self.P_USER,
                           lambda: self._do_apply_osc(width_cycles, dwell_cycles,
                                                      preload, step_word, n_steps, ctrl),
@@ -428,8 +433,9 @@ class SshBackend(QObject):
     def disable_osc(self):
         """Clear osc_mode bit, keep enable."""
         if self._live:
+            ctrl = CTRL_ENABLE | self._edge_response
             self._enqueue(self.P_USER,
-                          lambda: self._do_set_control_pulse(CTRL_ENABLE),
+                          lambda: self._do_set_control_pulse(ctrl),
                           self.sig_status.emit)
 
     def upload_pulse(self, c_src: str, bit_src: Optional[str]):
@@ -543,7 +549,10 @@ class SshBackend(QObject):
         self.sig_disconnected.emit("user request")
 
     def _do_read(self) -> dict:
-        return json.loads(self._exec(f"{self._active_cmd()} read"))
+        result = json.loads(self._exec(f"{self._active_cmd()} read"))
+        if "control" in result:
+            self._edge_response = int(result["control"]) & CTRL_EDGE_RESPONSE_MASK
+        return result
 
     def _do_apply_osc(self, wc: int, dwell: int, preload: int,
                       step_word: int, n_steps: int, ctrl: int) -> dict:
@@ -555,7 +564,7 @@ class SshBackend(QObject):
         # is already running needs an explicit off→on toggle. The output and
         # the frequency measurement keep running throughout.
         self._exec(
-            f"/root/rp_pulse_ctl 0x{self._base:08X} control {CTRL_ENABLE}"
+            f"/root/rp_pulse_ctl 0x{self._base:08X} control {ctrl & ~CTRL_OSC_MODE}"
         )
         return json.loads(self._exec(
             f"/root/rp_pulse_ctl 0x{self._base:08X} write {wc} {step_word} {ctrl}"
@@ -996,6 +1005,7 @@ class _NcoPanel(QWidget):
         self._tag = self.MODE.capitalize()
         self._harmonic_json = 1 if self.MODE == "harmonic" else 0
         self._sp_phase = None   # edge-lock phase-offset spin (pulse mode only)
+        self._edge_response_dirty = False
         self._window_ms = 100
 
         self._debounce = QTimer(self)
@@ -1230,7 +1240,9 @@ class _NcoPanel(QWidget):
             "apply progressively smaller continuous phase corrections."
         )
         self._edge_response.setStyleSheet(_spin_style())
-        self._edge_response.currentIndexChanged.connect(self._param_changed)
+        self._edge_response.currentIndexChanged.connect(
+            self._on_edge_response_changed
+        )
         auto_row.addWidget(self._edge_response)
         self._build_lock_extras(auto_row)
         auto_row.addStretch()
@@ -1327,6 +1339,10 @@ class _NcoPanel(QWidget):
     def _edge_response_bits(self) -> int:
         return int(self._edge_response.currentData()) & CTRL_EDGE_RESPONSE_MASK
 
+    def _on_edge_response_changed(self, *_):
+        self._edge_response_dirty = True
+        self._param_changed()
+
     # ── backend signal handlers ────────────────────────────────────────────────
 
     @Slot()
@@ -1360,8 +1376,10 @@ class _NcoPanel(QWidget):
         # Sync output mode from FPGA control register
         ctrl = int(d.get("control") or 0)
         response_index = self._edge_response.findData(ctrl & CTRL_EDGE_RESPONSE_MASK)
-        if (not self._debounce.isActive() and response_index >= 0
-                and response_index != self._edge_response.currentIndex()):
+        if self._edge_response_dirty:
+            if response_index == self._edge_response.currentIndex():
+                self._edge_response_dirty = False
+        elif response_index >= 0 and response_index != self._edge_response.currentIndex():
             self._edge_response.blockSignals(True)
             self._edge_response.setCurrentIndex(response_index)
             self._edge_response.blockSignals(False)

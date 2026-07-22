@@ -352,6 +352,101 @@ class TestEdgeLockResponseSelector(unittest.TestCase):
             gui.CTRL_EDGE_RESPONSE_FAST,
         )
 
+    def test_auto_apply_off_keeps_response_pending_until_matching_readback(self):
+        self.panel._cb_auto.setChecked(False)
+        self.panel._edge_response.setCurrentIndex(
+            self.panel._edge_response.findData(gui.CTRL_EDGE_RESPONSE_FAST)
+        )
+        self.assertFalse(self.panel._debounce.isActive())
+
+        for response in (
+            gui.CTRL_EDGE_RESPONSE_BALANCED,
+            gui.CTRL_EDGE_RESPONSE_FAST,
+            gui.CTRL_EDGE_RESPONSE_SMOOTH,
+        ):
+            self.panel._on_status({
+                "harmonic_mode": 0,
+                "control": gui.CTRL_ENABLE | response,
+                "phase_step_base": 0,
+            })
+            expected = (
+                gui.CTRL_EDGE_RESPONSE_FAST
+                if response != gui.CTRL_EDGE_RESPONSE_SMOOTH
+                else gui.CTRL_EDGE_RESPONSE_SMOOTH
+            )
+            self.assertEqual(self.panel._edge_response.currentData(), expected)
+
+
+class TestSshBackendResponseShadow(unittest.TestCase):
+    def setUp(self):
+        self.backend = gui.SshBackend()
+        self.backend._live = True
+        self.commands = []
+        self.backend._exec = self._exec
+        self.backend._enqueue = lambda _priority, fn, _callback=None: fn()
+
+    def _exec(self, command: str, timeout: float = 10.0) -> str:
+        self.commands.append(command)
+        return "{}"
+
+    def test_strobe_rearm_and_disable_preserve_requested_smooth_response(self):
+        self.backend.apply_pulse(
+            10, 0, edge_response=gui.CTRL_EDGE_RESPONSE_SMOOTH
+        )
+        self.commands.clear()
+
+        self.backend.apply_osc(10, 20, 30, 40, 5)
+
+        response = gui.CTRL_EDGE_RESPONSE_SMOOTH
+        self.assertEqual(
+            self.commands[1],
+            f"/root/rp_pulse_ctl 0x{gui.DEFAULT_BASE:08X} control "
+            f"{gui.CTRL_ENABLE | response}",
+        )
+        self.assertTrue(
+            self.commands[2].endswith(
+                f" {gui.CTRL_ENABLE | gui.CTRL_OSC_MODE | response}"
+            )
+        )
+
+        self.commands.clear()
+        self.backend.disable_osc()
+        self.assertEqual(
+            self.commands[-1],
+            f"/root/rp_pulse_ctl 0x{gui.DEFAULT_BASE:08X} control "
+            f"{gui.CTRL_ENABLE | response}",
+        )
+
+    def test_readback_refreshes_response_shadow(self):
+        response = gui.CTRL_EDGE_RESPONSE_FAST
+        self.backend._exec = lambda _command: json.dumps({
+            "control": gui.CTRL_ENABLE | response,
+        })
+        self.backend._do_read()
+        self.backend._do_apply_osc = lambda *args: self.commands.append(args) or {}
+
+        self.backend.apply_osc(10, 20, 30, 40, 5)
+
+        self.assertEqual(
+            self.commands[-1][-1],
+            gui.CTRL_ENABLE | gui.CTRL_OSC_MODE | response,
+        )
+
+    def test_disable_osc_captures_response_when_queued(self):
+        pending = []
+        self.backend._edge_response = gui.CTRL_EDGE_RESPONSE_SMOOTH
+        self.backend._enqueue = lambda _priority, fn, _callback=None: pending.append(fn)
+
+        self.backend.disable_osc()
+        self.backend._edge_response = gui.CTRL_EDGE_RESPONSE_FAST
+        pending.pop()()
+
+        self.assertTrue(
+            self.commands[-1].endswith(
+                f" {gui.CTRL_ENABLE | gui.CTRL_EDGE_RESPONSE_SMOOTH}"
+            )
+        )
+
 
 class TestGitUpdateHelpers(unittest.TestCase):
     def test_parse_remote_branches_filters_head_pointer(self):
