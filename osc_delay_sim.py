@@ -195,6 +195,7 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
 
     shift = EDGE_LOCK_RESPONSE_SHIFTS[response]
     step_base = PHASE_WRAP // period_clocks
+    quantization_band = PHASE_WRAP - period_clocks * step_base
     correction_limit = 0 if shift is None else step_base >> shift
     anchor_ticks = [(anchor + 1) * period_clocks - 1 +
                     (phase_jump_clocks if anchor >= jump_anchor else 0)
@@ -237,7 +238,8 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
                 adjustments[anchor] = pending_residual
                 next_phase = (next_phase + pending_residual) % PHASE_WRAP
                 pending_residual = 0
-            elif anchor >= jump_anchor and pending_residual == 0 and \
+            elif anchor >= jump_anchor and \
+                    abs(pending_residual) <= quantization_band and \
                     converged_anchor is None:
                 converged_anchor = anchor
         phase = next_phase
@@ -245,6 +247,7 @@ def simulate_edge_lock_response(response: str, *, period_clocks: int = 128,
     return {
         "response": response,
         "step_base": step_base,
+        "quantization_band": quantization_band,
         "correction_limit": correction_limit,
         "anchor_adjustments": adjustments,
         "reference_displacements": reference_displacements,

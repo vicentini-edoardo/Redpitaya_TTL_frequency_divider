@@ -51,6 +51,17 @@ class TestEdgeLockResponseSimulation(unittest.TestCase):
         self.assertLess(converged["fast"], converged["balanced"])
         self.assertLess(converged["balanced"], converged["smooth"])
 
+    def test_gradual_responses_converge_with_a_quantized_period(self):
+        converged = {
+            response: simulate_edge_lock_response(response, period_clocks=127)[
+                "converged_anchor"]
+            for response in ("fast", "balanced", "smooth")
+        }
+
+        self.assertTrue(all(anchor is not None for anchor in converged.values()))
+        self.assertLess(converged["fast"], converged["balanced"])
+        self.assertLess(converged["balanced"], converged["smooth"])
+
 
 if __name__ == "__main__":
     unittest.main()
