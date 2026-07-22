@@ -161,6 +161,7 @@ def _confirmed_state(
         "phase_step_base": base_step,
         "phase_step": live_step,
         "dwell_cycles": dwell,
+        "osc_half_period": dwell,
         "osc_phase_preload": int(d.get("osc_phase_preload") or 0),
         "n_steps": int(d.get("n_steps") or 0),
         "step_index": int(d.get("step_index") or 0),
