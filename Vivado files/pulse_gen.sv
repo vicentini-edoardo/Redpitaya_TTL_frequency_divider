@@ -41,14 +41,11 @@
 //       f_out = mult_n * f_in + phase_step_offset * f_clk / 2^48
 //
 //     Edge-locked option (edge_lock = 1, pulse or harmonic mode):
-//       Same NCO, but the phase is re-anchored to the input on every
-//       accepted rising edge (see anchor gating below): a target register
-//       integrates only phase_step_offset, and phase_acc snaps to it at
-//       each anchor edge. The output-to-input frequency shift is then
-//       exactly f_shift with the beat phase coherent indefinitely —
-//       measurement error no longer integrates into phase drift. Cost:
-//       each output pulse inherits the timing of one input edge (source
-//       jitter + one-clock synchronizer quantization).
+//       Hard response re-anchors phase_acc to the offset target at every
+//       accepted input edge. Fast, Balanced, and Smooth instead retain the
+//       shortest signed target error and apply a bounded correction each
+//       clock (base step >> 4, >> 6, or >> 8), capped to keep the NCO moving
+//       forward. Pulse carry uses that corrected continuous accumulator.
 //
 //     Stepped strobe mode (osc_mode = 1, pulse mode only):
 //       Single-shot stepped delay scan for stroboscopic sampling of a
@@ -128,6 +125,10 @@ module pulse_gen
   // no hardcoded clock assumption in the NCO path.
   localparam logic [31:0] CLK_HZ                = 32'd124_999_999;
   localparam logic [31:0] CLK_PER_US            = 32'd125;
+  localparam logic [1:0] EDGE_RESPONSE_HARD     = 2'b00;
+  localparam logic [1:0] EDGE_RESPONSE_FAST     = 2'b01;
+  localparam logic [1:0] EDGE_RESPONSE_BALANCED = 2'b10;
+  localparam logic [1:0] EDGE_RESPONSE_SMOOTH   = 2'b11;
 
   // Measurement window in clock cycles: meas_time_us * CLK_PER_US.
   // Minimum enforced at 1 ms (125,000 cycles) to avoid division issues.
@@ -387,22 +388,63 @@ module pulse_gen
 
   logic [47:0] phase_acc;
   logic [48:0] acc_sum;
+  logic [48:0] corrected_acc_sum;
+  logic signed [47:0] phase_error;
+  logic [47:0] correction_limit_raw;
+  logic [47:0] correction_limit;
+  logic [47:0] correction_magnitude;
+  logic signed [47:0] phase_correction;
+  logic signed [48:0] corrected_phase_step;
+  logic gradual_lock;
 
   assign acc_sum = {1'b0, phase_acc} + {1'b0, phase_step[47:0]};
+  assign gradual_lock = edge_lock && !osc_mode &&
+                        edge_lock_response != EDGE_RESPONSE_HARD;
+
+  always_comb begin
+    case (edge_lock_response)
+      EDGE_RESPONSE_FAST:     correction_limit_raw = phase_step_base[47:0] >> 4;
+      EDGE_RESPONSE_BALANCED: correction_limit_raw = phase_step_base[47:0] >> 6;
+      EDGE_RESPONSE_SMOOTH:   correction_limit_raw = phase_step_base[47:0] >> 8;
+      default:                correction_limit_raw = 48'd0;
+    endcase
+
+    // A negative correction may not stop or reverse a positive nominal NCO.
+    if (phase_step <= 48'sd1)
+      correction_limit = 48'd0;
+    else if (correction_limit_raw >= phase_step[47:0])
+      correction_limit = phase_step[47:0] - 48'd1;
+    else
+      correction_limit = correction_limit_raw;
+
+    correction_magnitude = phase_error[47]
+        ? (~phase_error[47:0] + 48'd1) : phase_error[47:0];
+    if (correction_magnitude > correction_limit)
+      correction_magnitude = correction_limit;
+    phase_correction = phase_error[47]
+        ? -$signed(correction_magnitude) : $signed(correction_magnitude);
+  end
+
+  assign corrected_phase_step = $signed({phase_step[47], phase_step}) +
+                                $signed({phase_correction[47], phase_correction});
+  assign corrected_acc_sum = {1'b0, phase_acc} +
+                             {1'b0, corrected_phase_step[47:0]};
 
   // ----------------------------------------------------------------
   // Freerun state + NCO accumulator
   //
   // Edge-locked operation (lock_en = osc_mode | edge_lock):
   //   osc_target integrates only the phase_step_offset part of the step
-  //   (zero in osc mode — constant phase between strobe steps). On every
-  //   accepted input rising edge (anchor_rise) phase_acc is re-anchored
-  //   to osc_target, so the output phase is referenced to the physical
-  //   input edge and the measured-vs-actual f_in mismatch is cleared
-  //   once per input period instead of accumulating forever. The offset
-  //   part is exact by construction: f_out - [N·]f_in = f_shift, with
-  //   the beat coherent indefinitely.
-  //   Between edges (or if the input stops) the NCO freeruns as before.
+  //   (zero in osc mode — constant phase between strobe steps). Hard and
+  //   osc/strobe modes re-anchor phase_acc to osc_target at every accepted
+  //   input edge; gradual modes retain the signed target difference instead.
+  //   The offset part is exact by construction: f_out - [N·]f_in = f_shift,
+  //   with the beat coherent indefinitely.
+  //   Gradual edge-lock responses advance continuously, using phase_error
+  //   toward the target at the configured bounded rate; an accepted edge
+  //   replaces that residual after the corrected step. Hard and osc/strobe
+  //   modes retain the exact legacy target snap. Between edges (or if the
+  //   input stops) the NCO freeruns as before.
   //   This works identically in harmonic mode because the base part of
   //   the step advances exactly mult_n whole wraps per input period.
   //
@@ -439,6 +481,7 @@ module pulse_gen
       osc_mode_prev  <= 1'b0;
       osc_run        <= 1'b0;
       osc_target     <= 48'd0;
+      phase_error    <= 48'sd0;
     end else begin
       lock_en_prev  <= lock_en;
       osc_mode_prev <= osc_mode;
@@ -450,7 +493,9 @@ module pulse_gen
         strobe_done    <= 1'b0;
         osc_run        <= 1'b0;
         osc_target     <= 48'd0;
+        phase_error    <= 48'sd0;
       end else if (!freerun_active) begin
+        phase_error <= 48'sd0;
         if (period_stable && div_base_valid && !div_active) begin
           freerun_active <= 1'b1;
           if (lock_en) begin
@@ -460,6 +505,7 @@ module pulse_gen
             step_index  <= 32'd0;
             strobe_done <= 1'b0;
             osc_run     <= 1'b0;
+            phase_error <= 48'sd0;
           end
         end
       end else begin
@@ -473,6 +519,7 @@ module pulse_gen
           step_index  <= 32'd0;
           strobe_done <= 1'b0;
           osc_run     <= 1'b0;
+          phase_error <= 48'sd0;
         end else if (lock_en && !osc_run) begin
           // armed: hold the preload until the first accepted input rising
           // edge so the phase trajectory starts anchored to the input
@@ -481,13 +528,26 @@ module pulse_gen
           dwell_cnt   <= 32'd0;
           step_index  <= 32'd0;
           strobe_done <= 1'b0;
+          phase_error <= 48'sd0;
           if (anchor_rise)
             osc_run <= 1'b1;
         end else begin
-          // Re-anchor to the input on every accepted rising edge;
-          // nco_tick still evaluates the pre-snap acc_sum this tick.
-          phase_acc <= (lock_en && anchor_rise) ? osc_target_next
-                                                : acc_sum[47:0];
+          if (lock_en && anchor_rise && !gradual_lock) begin
+            // Hard response and osc/strobe retain exact per-edge placement.
+            phase_acc   <= osc_target_next;
+            phase_error <= 48'sd0;
+          end else if (gradual_lock) begin
+            // Advance on every tick; an anchor replaces the residual after
+            // this corrected step with the shortest signed modulo-2^48 error.
+            phase_acc <= corrected_acc_sum[47:0];
+            if (anchor_rise)
+              phase_error <= $signed(osc_target_next - corrected_acc_sum[47:0]);
+            else
+              phase_error <= phase_error - phase_correction;
+          end else begin
+            phase_acc   <= acc_sum[47:0];
+            phase_error <= 48'sd0;
+          end
           if (lock_en) begin
             if (osc_mode) begin
               // stepped strobe: hold phase for dwell_cycles, then step
@@ -514,6 +574,7 @@ module pulse_gen
             strobe_done <= 1'b0;
             osc_run     <= 1'b0;
             osc_target  <= 48'd0;
+            phase_error <= 48'sd0;
           end
         end
       end
@@ -524,14 +585,16 @@ module pulse_gen
   // Output generation
   //
   // Harmonic mode: phase_acc[47] gives exact 50% duty square wave.
-  // Pulse mode:    NCO carry-out (acc_sum[48]) triggers width_n-cycle pulse.
+  // Pulse mode:    NCO carry-out triggers width_n-cycle pulse; gradual
+  //                edge-lock responses use the corrected continuous sum.
   // ----------------------------------------------------------------
   logic [31:0] width_cnt;
   logic        nco_tick;
 
   // In locked modes no pulses are emitted until the first input edge has
   // anchored the phase trajectory (osc_run).
-  assign nco_tick = acc_sum[48] & freerun_active & (~lock_en | osc_run);
+  assign nco_tick = (gradual_lock ? corrected_acc_sum[48] : acc_sum[48]) &
+                    freerun_active & (~lock_en | osc_run);
   assign busy     = freerun_active;
 
   always_ff @(posedge clk) begin
